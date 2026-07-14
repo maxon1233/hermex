@@ -21,6 +21,11 @@ Read by every agent (Codex, Claude Code, …); keep it tool-agnostic.
   `chore/` or `fix/`). Issue/triage/domain conventions live in `docs/agents/`.
 - `master` is the protected release-candidate branch (the source for internal
   TestFlight builds): keep it buildable, never do feature work on it.
+- **Publishing boundary:** the `upstream` Git remote is strictly read-only. Never
+  push to it, open or update pull requests against it, or otherwise mutate it.
+  Push branches only to `origin` (`maxon1233/hermex`) and target this fork's
+  `personal/main` branch for pull requests. Before creating a PR, verify both the
+  repository owner and base branch; stop if either points upstream.
 - Pushing a branch, opening/updating a PR, or merging needs explicit human approval.
   Triage bot/review comments before accepting them.
 

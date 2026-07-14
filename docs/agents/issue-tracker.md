@@ -29,6 +29,8 @@ GitHub Issues are the work queue; pull requests are the review and merge record.
 - `ready-for-agent` issues default to express mode (autonomous from approved plan to review-addressed PR). An issue also labeled `needs-manual-validation` forces staged mode, where the owner manually tests before the PR publishes. See `docs/agents/triage-labels.md`.
 - Create a short `issue/<n>-slug` branch for one issue or narrow slice (no-issue branches use `chore/`/`fix/`).
 - Commit completed, validated work locally with the matching handoff updates.
+- Treat the `upstream` Git remote as strictly read-only: never push to it, open or update pull requests against it, or otherwise mutate it. Fetching or branching from upstream is allowed only as a read-only source operation.
+- Publish branches only to `origin` (`maxon1233/hermex`). Pull requests must stay inside that fork and target `personal/main`; verify the repository owner and base branch before creating a PR, and stop if either points upstream.
 - Push feature branches and open draft PRs only when the human asks to publish/open a PR.
 - Use the PR for review: GitHub/Copilot review, CI, external agent review, and human comments should live there when possible.
 - Address PR review comments by triaging them first; do not blindly accept automated review feedback.
