@@ -362,9 +362,8 @@ private enum SessionRelativeDateFormatter {
 enum SessionRowDisplaySettings {
     static let showMessageCountKey = "sessionRow.showMessageCount"
     static let showWorkspaceKey = "sessionRow.showWorkspace"
-    // Cron and CLI sessions default to shown; delegated subagents default to
-    // hidden. Each kind has an independent visibility control.
-    static let showCronSessionsKey = "sessionRow.showCronSessions"
+    // CLI sessions default to shown; delegated subagents default to hidden.
+    // Cron executions are always routed to Tasks instead of Sessions.
     static let showSubagentSessionsKey = "sessionRow.showSubagentSessions"
     static let defaultShowsSubagentSessions = false
     // Legacy global CLI-sessions key. Since #19 the CLI toggle is stored
@@ -420,10 +419,8 @@ enum SessionRowDisplaySettings {
 enum SessionSidebarDisclosureSettings {
     static let profilesAreExpandedKey = "sessionSidebar.profilesAreExpanded"
     static let projectsAreExpandedKey = "sessionSidebar.projectsAreExpanded"
-    static let scheduledSessionsAreExpandedKey = "sessionSidebar.scheduledSessionsAreExpanded"
     static let defaultProfilesAreExpanded = false
     static let defaultProjectsAreExpanded = false
-    static let defaultScheduledSessionsAreExpanded = false
 
     static func profilesAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
         guard let value = defaults.object(forKey: profilesAreExpandedKey) as? Bool else {
@@ -441,13 +438,6 @@ enum SessionSidebarDisclosureSettings {
         return value
     }
 
-    static func scheduledSessionsAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
-        guard let value = defaults.object(forKey: scheduledSessionsAreExpandedKey) as? Bool else {
-            return defaultScheduledSessionsAreExpanded
-        }
-
-        return value
-    }
 }
 
 enum SessionIdentitySettings {

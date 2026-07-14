@@ -64,7 +64,6 @@ struct SettingsView: View {
     @AppStorage(AgentRunLiveActivityPrivacy.showsResponseExcerptsKey) private var showsLiveActivityResponseExcerpts = false
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
-    @AppStorage(SessionRowDisplaySettings.showCronSessionsKey) private var showsCronSessions = true
     @AppStorage(SessionRowDisplaySettings.showSubagentSessionsKey)
     private var showsSubagentSessions = SessionRowDisplaySettings.defaultShowsSubagentSessions
     @State private var cliSessionsSync: CliSessionsSyncModel
@@ -286,14 +285,6 @@ struct SettingsView: View {
                         title: String(localized: "Workspace"),
                         systemImage: "folder",
                         isOn: $showsSessionWorkspace
-                    )
-
-                    SettingsDivider()
-
-                    SettingsToggleRow(
-                        title: String(localized: "Cron Sessions"),
-                        systemImage: "clock.arrow.2.circlepath",
-                        isOn: $showsCronSessions
                     )
 
                     SettingsDivider()

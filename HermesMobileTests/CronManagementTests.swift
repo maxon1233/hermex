@@ -236,6 +236,25 @@ final class CronManagementViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testTasksViewModelUpsertKeepsOneStableRowPerCronJob() throws {
+        let viewModel = TasksViewModel(server: try XCTUnwrap(URL(string: "https://example.test")))
+        let original = try decodeCronJob(
+            #"{"id":"job123","name":"Digest","last_status":"ok","last_run_at":100}"#
+        )
+        let refreshed = try decodeCronJob(
+            #"{"id":"job123","name":"Digest","last_status":"error","last_run_at":200}"#
+        )
+
+        viewModel.apply(.upsert(original))
+        viewModel.apply(.upsert(refreshed))
+
+        XCTAssertEqual(viewModel.jobs.count, 1)
+        XCTAssertEqual(viewModel.jobs.first?.jobId, "job123")
+        XCTAssertEqual(viewModel.jobs.first?.lastStatus, "error")
+        XCTAssertEqual(viewModel.jobs.first?.lastRunAt?.date.timeIntervalSince1970, 200)
+    }
+
+    @MainActor
     func testTasksViewModelLoadPopulatesDeliveryOptions() async throws {
         let client = makeClient { request in
             switch request.url?.path {
