@@ -42,7 +42,7 @@ final class TaskDetailViewModel {
         async let deliveryOptionsResponse = try? client.cronDeliveryOptions()
 
         do {
-            let response = try await client.cronOutput(jobID: jobID, limit: 5)
+            let response = try await client.cronOutput(jobID: jobID, limit: 500)
             outputs = response.outputs ?? []
         } catch {
             lastError = error

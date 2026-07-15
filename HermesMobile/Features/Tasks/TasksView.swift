@@ -3,13 +3,25 @@ import SwiftUI
 struct TasksView: View {
     let server: URL
     let onAPIError: (Error) -> Void
+    let sessions: [SessionSummary]
+    let onOpenSession: (SessionSummary) -> Void
+    let onStartSession: (String) -> Void
 
     @State private var viewModel: TasksViewModel
     @State private var isPresentingCreateTask = false
 
-    init(server: URL, onAPIError: @escaping (Error) -> Void) {
+    init(
+        server: URL,
+        onAPIError: @escaping (Error) -> Void,
+        sessions: [SessionSummary] = [],
+        onOpenSession: @escaping (SessionSummary) -> Void = { _ in },
+        onStartSession: @escaping (String) -> Void = { _ in }
+    ) {
         self.server = server
         self.onAPIError = onAPIError
+        self.sessions = sessions
+        self.onOpenSession = onOpenSession
+        self.onStartSession = onStartSession
         _viewModel = State(initialValue: TasksViewModel(server: server))
     }
 
@@ -100,7 +112,10 @@ struct TasksView: View {
                                 onAPIError: onAPIError,
                                 onMutation: { mutation in
                                     viewModel.apply(mutation)
-                                }
+                                },
+                                sessions: sessions,
+                                onOpenSession: onOpenSession,
+                                onStartSession: onStartSession
                             )
                         } label: {
                             CronJobRowView(
@@ -155,7 +170,7 @@ private struct CronJobRowView: View {
             VStack(alignment: .leading, spacing: 6) {
                 CronJobMetadataRow(
                     title: String(localized: "Schedule"),
-                    value: job.scheduleText ?? String(localized: "Not available")
+                    value: job.readableScheduleText ?? String(localized: "Not available")
                 )
 
                 CronJobMetadataRow(
@@ -173,27 +188,6 @@ private struct CronJobRowView: View {
                         title: String(localized: "Elapsed"),
                         value: Self.elapsedText(runningElapsed)
                     )
-                }
-
-                CronJobMetadataRow(
-                    title: String(localized: "Deliver"),
-                    value: job.deliver ?? "local"
-                )
-
-                if let model = job.model, !model.isEmpty {
-                    CronJobMetadataRow(title: String(localized: "Model"), value: model)
-                }
-
-                if let provider = job.provider, !provider.isEmpty {
-                    CronJobMetadataRow(title: String(localized: "Provider"), value: provider)
-                }
-
-                if let profile = job.profile, !profile.isEmpty {
-                    CronJobMetadataRow(title: String(localized: "Profile"), value: profile)
-                }
-
-                if let skills = job.skills, !skills.isEmpty {
-                    CronJobMetadataRow(title: String(localized: "Skills"), value: skills.joined(separator: ", "))
                 }
 
                 if let error = job.lastError ?? job.lastDeliveryError, !error.isEmpty {

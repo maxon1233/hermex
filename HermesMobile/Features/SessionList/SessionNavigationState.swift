@@ -51,6 +51,17 @@ struct SessionNavigationState: Equatable {
         destination = .utility(utility)
     }
 
+    mutating func select(_ newDestination: SessionNavigationDestination) {
+        switch newDestination {
+        case .session(let session):
+            select(session)
+        case .newChat(let route):
+            select(route)
+        case .utility(let utility):
+            select(utility)
+        }
+    }
+
     mutating func remember(_ session: SessionSummary) {
         guard let sessionID = Self.normalized(session.sessionId) else { return }
         lastSelectedSessionID = sessionID
@@ -124,5 +135,14 @@ enum SessionNavigationPersistence {
         } else {
             defaults.removeObject(forKey: key)
         }
+    }
+}
+
+enum SessionNavigationTransition {
+    static func requiresDismissalBeforeReplacingDestination(
+        hasCurrentDestination: Bool,
+        usesRegularWidthNavigation: Bool
+    ) -> Bool {
+        hasCurrentDestination && !usesRegularWidthNavigation
     }
 }
