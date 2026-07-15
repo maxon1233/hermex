@@ -136,6 +136,27 @@ final class SessionNavigationStateTests: XCTestCase {
         XCTAssertGreaterThan(state.rootRevision, firstRevision)
     }
 
+    func testCompactNavigationDismissesCurrentDestinationBeforeReplacingIt() {
+        XCTAssertTrue(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: true,
+                usesRegularWidthNavigation: false
+            )
+        )
+        XCTAssertFalse(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: false,
+                usesRegularWidthNavigation: false
+            )
+        )
+        XCTAssertFalse(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: true,
+                usesRegularWidthNavigation: true
+            )
+        )
+    }
+
     func testReadableContentWidthsKeepSecondaryAndWorkspaceSurfacesDistinct() {
         XCTAssertEqual(AdaptiveReadableContentWidth.secondaryDestination, 800)
         XCTAssertEqual(AdaptiveReadableContentWidth.workspace, 1_000)

@@ -35,6 +35,7 @@ struct SessionListView: View {
     @State private var selectedProjectID: String?
     @State private var sidebarScrollPosition: String?
     @State private var didCompleteInitialLoad = false
+    @State private var pendingDestinationAfterDismissal: SessionNavigationDestination?
     @FocusState private var searchFieldIsFocused: Bool
     @AppStorage(SessionSidebarDisclosureSettings.profilesAreExpandedKey)
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
@@ -214,6 +215,18 @@ struct SessionListView: View {
                 openRequestedNewChatIfNeeded()
             }
             .onChange(of: navigationState.destination) { oldValue, newValue in
+                if newValue == nil,
+                   let pendingDestination = pendingDestinationAfterDismissal {
+                    pendingDestinationAfterDismissal = nil
+                    Task { @MainActor in
+                        // Compact navigation must finish popping the utility
+                        // destination before it can push a different root.
+                        await Task.yield()
+                        guard navigationState.destination == nil else { return }
+                        selectRootDestination(pendingDestination)
+                    }
+                }
+
                 if case .newChat = oldValue,
                    case .newChat = newValue {
                     return
@@ -291,7 +304,9 @@ struct SessionListView: View {
             } description: {
                 Text("Choose a session from the sidebar or start a new chat.")
             } actions: {
-                Button("New Chat", action: openNewChat)
+                Button("New Chat") {
+                    openNewChat()
+                }
                     .buttonStyle(.borderedProminent)
             }
         }
@@ -327,7 +342,14 @@ struct SessionListView: View {
             case .settings(let scrollTo):
                 SettingsView(authManager: authManager, server: server, initialScrollTarget: scrollTo)
             case .tasks:
-                TasksView(server: server, onAPIError: authManager.handleAPIError)
+                TasksView(
+                    server: server,
+                    onAPIError: authManager.handleAPIError,
+                    sessions: viewModel.sessions,
+                    onStartSession: { context in
+                        openNewChat(initialDraft: context)
+                    }
+                )
             case .skills:
                 SkillsView(server: server, onAPIError: authManager.handleAPIError)
             case .memory:
@@ -1101,8 +1123,29 @@ struct SessionListView: View {
         )
     }
 
-    private func openNewChat() {
-        navigationState.select(PendingNewChatRoute())
+    private func openNewChat(initialDraft: String = "") {
+        let route = PendingNewChatRoute(initialDraft: initialDraft)
+        openRootDestination(.newChat(route))
+    }
+
+    private func openRootDestination(_ destination: SessionNavigationDestination) {
+        if SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+            hasCurrentDestination: navigationState.destination != nil,
+            usesRegularWidthNavigation: horizontalSizeClass == .regular
+        ) {
+            pendingDestinationAfterDismissal = destination
+            navigationState.clearDestination()
+            return
+        }
+
+        selectRootDestination(destination)
+    }
+
+    private func selectRootDestination(_ destination: SessionNavigationDestination) {
+        navigationState.select(destination)
+        if case .session = destination {
+            persistLastSelectedSession()
+        }
     }
 
     private func selectSession(_ session: SessionSummary) {
