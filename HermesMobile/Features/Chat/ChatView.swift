@@ -2230,6 +2230,13 @@ struct ChatToolbarTitleLabel: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .multilineTextAlignment(.leading)
+        // The transcript intentionally scrolls beneath the Liquid Glass bar.
+        // Anchor this scrim to the toolbar title itself so the darkest point
+        // stays behind the session name instead of starting at the transcript's
+        // lower safe-area boundary.
+        .background {
+            ChatNavigationChromeFade()
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -2241,6 +2248,26 @@ struct ChatToolbarTitleLabel: View {
     private var accessibilityLabel: String {
         guard let subtitle else { return title }
         return "\(title), \(subtitle)"
+    }
+}
+
+private struct ChatNavigationChromeFade: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(.systemBackground).opacity(0.98), location: 0),
+                .init(color: Color(.systemBackground).opacity(0.90), location: 0.48),
+                .init(color: Color(.systemBackground).opacity(0.58), location: 0.72),
+                .init(color: Color(.systemBackground).opacity(0), location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        // Centering this tall background on the inline toolbar title places its
+        // top at the physical screen edge and its tail just below the bar.
+        .frame(width: 1_000, height: 190)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
