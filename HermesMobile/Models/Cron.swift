@@ -119,8 +119,37 @@ struct CronJob: Decodable, Equatable, Identifiable {
         return String(localized: "Untitled Task")
     }
 
+    var descriptionSummary: String? {
+        guard let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let paragraphs = prompt.components(separatedBy: "\n\n")
+        var summary = paragraphs.first(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) ?? prompt
+
+        for marker in [" Run this ", " Execute this ", " Run the following ", " Use this command "] {
+            if let range = summary.range(of: marker, options: .caseInsensitive),
+               summary.distance(from: summary.startIndex, to: range.lowerBound) >= 24 {
+                summary = String(summary[..<range.lowerBound])
+                break
+            }
+        }
+
+        return CronTextSummary.make(from: summary, maximumLength: 280)
+    }
+
     var scheduleText: String? {
         scheduleDisplay ?? schedule?.displayText
+    }
+
+    var readableScheduleText: String? {
+        guard let scheduleText else { return nil }
+        return CronScheduleFormatter.readableText(
+            for: scheduleText,
+            nextRunAt: nextRunAt?.date
+        ) ?? scheduleText
     }
 
     var editableScheduleText: String? {
@@ -201,6 +230,230 @@ struct CronSchedule: Decodable, Equatable {
     }
 }
 
+enum CronScheduleFormatter {
+    static func readableText(
+        for expression: String,
+        nextRunAt: Date? = nil,
+        locale: Locale = .current,
+        timeZone: TimeZone = .current
+    ) -> String? {
+        let trimmed = expression.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let interval = intervalText(trimmed) {
+            return interval
+        }
+
+        switch trimmed.lowercased() {
+        case "@hourly":
+            return String(localized: "Every hour")
+        case "@daily", "@midnight":
+            return String(localized: "Every day at midnight")
+        case "@weekly":
+            return String(localized: "Every Sunday at midnight")
+        case "@monthly":
+            return String(localized: "On the first day of every month at midnight")
+        case "@yearly", "@annually":
+            return String(localized: "Every January 1 at midnight")
+        default:
+            break
+        }
+
+        let fields = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard fields.count == 5 else { return nil }
+
+        let minute = fields[0]
+        let hour = fields[1]
+        let dayOfMonth = fields[2]
+        let month = fields[3]
+        let dayOfWeek = fields[4]
+
+        if fields.allSatisfy({ $0 == "*" }) {
+            return String(localized: "Every minute")
+        }
+
+        if hour == "*", dayOfMonth == "*", month == "*", dayOfWeek == "*" {
+            if let interval = stepValue(minute) {
+                return String(localized: "Every \(interval) minutes")
+            }
+
+            if let minuteValue = integer(minute, range: 0...59) {
+                return minuteValue == 0
+                    ? String(localized: "Every hour")
+                    : String(localized: "Every hour at \(minuteValue) minutes past")
+            }
+        }
+
+        if let hourInterval = stepValue(hour),
+           let minuteValue = integer(minute, range: 0...59),
+           dayOfMonth == "*", month == "*", dayOfWeek == "*" {
+            if minuteValue == 0 {
+                return String(localized: "Every \(hourInterval) hours")
+            }
+            return String(localized: "Every \(hourInterval) hours at \(minuteValue) minutes past")
+        }
+
+        guard let minuteValue = integer(minute, range: 0...59),
+              let hourValue = integer(hour, range: 0...23),
+              month == "*" else {
+            return nil
+        }
+
+        let time = timeText(
+            hour: hourValue,
+            minute: minuteValue,
+            nextRunAt: nextRunAt,
+            locale: locale,
+            timeZone: timeZone
+        )
+
+        if dayOfMonth == "*", dayOfWeek == "*" {
+            return String(localized: "Every day at \(time)")
+        }
+
+        if dayOfMonth == "*", dayOfWeek == "1-5" {
+            return String(localized: "Weekdays at \(time)")
+        }
+
+        if dayOfMonth == "*", let weekdays = weekdayNames(dayOfWeek) {
+            return String(localized: "Every \(weekdays) at \(time)")
+        }
+
+        if dayOfWeek == "*", let day = integer(dayOfMonth, range: 1...31) {
+            return String(localized: "On day \(day) of every month at \(time)")
+        }
+
+        return nil
+    }
+
+    private static func integer(_ value: String, range: ClosedRange<Int>) -> Int? {
+        guard let parsed = Int(value), range.contains(parsed) else { return nil }
+        return parsed
+    }
+
+    private static func intervalText(_ expression: String) -> String? {
+        var value = expression.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("every ") {
+            value = String(value.dropFirst("every ".count)).trimmingCharacters(in: .whitespaces)
+        }
+
+        let components = value.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let count: Int
+        let unit: String
+
+        if components.count == 2, let parsed = Int(components[0]) {
+            count = parsed
+            unit = components[1]
+        } else if components.count == 1 {
+            let token = components[0]
+            let digits = token.prefix(while: { $0.isNumber })
+            guard !digits.isEmpty, let parsed = Int(digits) else { return nil }
+            count = parsed
+            unit = String(token.dropFirst(digits.count))
+        } else {
+            return nil
+        }
+
+        guard count > 0 else { return nil }
+        switch unit {
+        case "s", "sec", "secs", "second", "seconds":
+            return normalizedIntervalText(count: count, unit: "seconds")
+        case "m", "min", "mins", "minute", "minutes":
+            return normalizedIntervalText(count: count, unit: "minutes")
+        case "h", "hr", "hrs", "hour", "hours":
+            return normalizedIntervalText(count: count, unit: "hours")
+        case "d", "day", "days":
+            return normalizedIntervalText(count: count, unit: "days")
+        case "w", "wk", "wks", "week", "weeks":
+            return normalizedIntervalText(count: count, unit: "weeks")
+        default:
+            return nil
+        }
+    }
+
+    private static func normalizedIntervalText(count: Int, unit: String) -> String {
+        switch unit {
+        case "seconds":
+            if count.isMultiple(of: 60) {
+                return normalizedIntervalText(count: count / 60, unit: "minutes")
+            }
+            return count == 1 ? String(localized: "Every second") : String(localized: "Every \(count) seconds")
+        case "minutes":
+            if count.isMultiple(of: 60) {
+                return normalizedIntervalText(count: count / 60, unit: "hours")
+            }
+            return count == 1 ? String(localized: "Every minute") : String(localized: "Every \(count) minutes")
+        case "hours":
+            if count.isMultiple(of: 24) {
+                return normalizedIntervalText(count: count / 24, unit: "days")
+            }
+            return count == 1 ? String(localized: "Every hour") : String(localized: "Every \(count) hours")
+        case "days":
+            if count.isMultiple(of: 7) {
+                return normalizedIntervalText(count: count / 7, unit: "weeks")
+            }
+            return count == 1 ? String(localized: "Every day") : String(localized: "Every \(count) days")
+        default:
+            return count == 1 ? String(localized: "Every week") : String(localized: "Every \(count) weeks")
+        }
+    }
+
+    private static func stepValue(_ value: String) -> Int? {
+        guard value.hasPrefix("*/"),
+              let parsed = Int(value.dropFirst(2)),
+              parsed > 1 else {
+            return nil
+        }
+        return parsed
+    }
+
+    private static func weekdayNames(_ field: String) -> String? {
+        let names = [
+            0: String(localized: "Sunday"),
+            1: String(localized: "Monday"),
+            2: String(localized: "Tuesday"),
+            3: String(localized: "Wednesday"),
+            4: String(localized: "Thursday"),
+            5: String(localized: "Friday"),
+            6: String(localized: "Saturday"),
+            7: String(localized: "Sunday")
+        ]
+        let values = field.split(separator: ",").compactMap { Int($0) }
+        guard !values.isEmpty,
+              values.count == field.split(separator: ",").count,
+              values.allSatisfy({ names[$0] != nil }) else {
+            return nil
+        }
+        return values.compactMap { names[$0] }.joined(separator: String(localized: ", "))
+    }
+
+    private static func timeText(
+        hour: Int,
+        minute: Int,
+        nextRunAt: Date?,
+        locale: Locale,
+        timeZone: TimeZone
+    ) -> String {
+        if let nextRunAt {
+            let formatter = DateFormatter()
+            formatter.locale = locale
+            formatter.timeZone = timeZone
+            formatter.dateStyle = .none
+            formatter.timeStyle = .short
+            return formatter.string(from: nextRunAt)
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = calendar.date(from: DateComponents(year: 2000, month: 1, day: 1, hour: hour, minute: minute))!
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.timeZone = calendar.timeZone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
 struct CronRepeat: Decodable, Equatable {
     let times: Int?
     let completed: Int?
@@ -237,6 +490,314 @@ struct CronOutputItem: Decodable, Equatable, Identifiable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         filename = try container.decodeIfPresent(String.self, forKey: .filename)
         content = try container.decodeIfPresent(String.self, forKey: .content)
+    }
+
+    var resultText: String? {
+        guard let content else { return nil }
+        let lines = content.components(separatedBy: .newlines)
+        let responseIndex = lines.firstIndex { line in
+            let heading = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return heading == "## Response" || heading == "# Response"
+        }
+
+        if let responseIndex {
+            return Self.normalizedResult(lines.dropFirst(responseIndex + 1).joined(separator: "\n"))
+        }
+
+        if Self.isScriptOutputDocument(lines) {
+            return Self.scriptResult(from: lines)
+        }
+
+        return Self.normalizedResult(content)
+    }
+
+    private static func normalizedResult(_ result: String) -> String? {
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if isSilenceResponse(trimmed) {
+            return String(localized: "No new update.")
+        }
+        return trimmed
+    }
+
+    private static func isSilenceResponse(_ result: String) -> Bool {
+        let tokens = Set(["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"])
+        let normalized = result.uppercased()
+        if tokens.contains(normalized) || normalized.hasPrefix("[SILENT]") {
+            return true
+        }
+
+        let nonEmptyLines = normalized.components(separatedBy: .newlines).filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard let first = nonEmptyLines.first, let last = nonEmptyLines.last else { return false }
+        return tokens.contains(first.trimmingCharacters(in: .whitespacesAndNewlines))
+            || tokens.contains(last.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func isScriptOutputDocument(_ lines: [String]) -> Bool {
+        lines.contains { line in
+            let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized.hasPrefix("**mode:**") && normalized.contains("no_agent")
+        }
+    }
+
+    private static func scriptResult(from lines: [String]) -> String? {
+        if let statusLine = lines.first(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("**status:**")
+        }) {
+            let status = statusLine.lowercased()
+            if status.contains("silent") {
+                return String(localized: "No new update.")
+            }
+        }
+
+        if let separatorIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines) == "---"
+        }) {
+            return normalizedResult(lines.dropFirst(separatorIndex + 1).joined(separator: "\n"))
+        }
+
+        let metadataEnd = lines.lastIndex(where: isScriptMetadataLine)
+        if let metadataEnd,
+           let body = normalizedResult(lines.dropFirst(metadataEnd + 1).joined(separator: "\n")) {
+            return body
+        }
+
+        let failed = lines.contains {
+            let normalized = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized.hasPrefix("**status:**") && normalized.contains("failed")
+        }
+        return failed ? String(localized: "Script failed.") : nil
+    }
+
+    private static func isScriptMetadataLine(_ line: String) -> Bool {
+        let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.hasPrefix("# cron job:")
+            || normalized.hasPrefix("**job id:**")
+            || normalized.hasPrefix("**run time:**")
+            || normalized.hasPrefix("**mode:**")
+            || normalized.hasPrefix("**status:**")
+            || normalized == "---"
+    }
+
+    var runDate: Date? {
+        guard let filename else { return nil }
+        let sourceFormatter = DateFormatter()
+        sourceFormatter.locale = Locale(identifier: "en_US_POSIX")
+        sourceFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        sourceFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss'.md'"
+        return sourceFormatter.date(from: filename)
+    }
+
+    var formattedRunTime: String? {
+        guard let date = runDate else { return nil }
+
+        let displayFormatter = DateFormatter()
+        displayFormatter.dateStyle = .medium
+        displayFormatter.timeStyle = .short
+        return displayFormatter.string(from: date)
+    }
+
+    var summaryText: String {
+        guard let resultText else { return String(localized: "No update recorded.") }
+        return CronTextSummary.make(from: resultText, maximumLength: 220)
+    }
+
+    var representsNoUpdate: Bool {
+        resultText == String(localized: "No new update.")
+    }
+
+    var createsAgentSession: Bool {
+        guard let content, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        let lines = content.components(separatedBy: .newlines)
+        if Self.isScriptOutputDocument(lines) {
+            return false
+        }
+
+        return !lines.contains { line in
+            let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized.hasPrefix("**status:**") && normalized.contains("blocked")
+        }
+    }
+}
+
+enum CronRunSessionResolver {
+    static func sessionsByOutputID(
+        job: CronJob,
+        outputs: [CronOutputItem],
+        sessions: [SessionSummary]
+    ) -> [String: SessionSummary] {
+        guard let jobID = normalized(job.jobId) else { return [:] }
+
+        let sessionPrefix = "cron_\(jobID)_"
+        let jobProfile = normalized(job.profile)
+        let candidateSessions = sessions.compactMap { session -> (SessionSummary, Date)? in
+            guard let sessionID = session.sessionId,
+                  sessionID.hasPrefix(sessionPrefix),
+                  let startedAt = sessionStartDate(sessionID: sessionID, prefix: sessionPrefix)
+            else {
+                return nil
+            }
+
+            if let jobProfile,
+               let sessionProfile = normalized(session.profile),
+               sessionProfile != jobProfile {
+                return nil
+            }
+            return (session, startedAt)
+        }
+        .sorted { $0.1 < $1.1 }
+
+        let chronologicalOutputs = outputs
+            .filter { $0.runDate != nil }
+            .sorted { ($0.runDate ?? .distantPast) < ($1.runDate ?? .distantPast) }
+
+        var previousOutputDate: Date?
+        var usedSessionIDs = Set<String>()
+        var resolved: [String: SessionSummary] = [:]
+
+        for output in chronologicalOutputs {
+            guard let outputDate = output.runDate else { continue }
+            defer { previousOutputDate = outputDate }
+            guard output.createsAgentSession else { continue }
+
+            let match = candidateSessions.last { session, startedAt in
+                guard let sessionID = session.sessionId,
+                      !usedSessionIDs.contains(sessionID),
+                      startedAt <= outputDate else {
+                    return false
+                }
+                if let previousOutputDate {
+                    return startedAt >= previousOutputDate
+                }
+                return true
+            }
+
+            guard let (session, _) = match, let sessionID = session.sessionId else { continue }
+            resolved[output.id] = session
+            usedSessionIDs.insert(sessionID)
+        }
+
+        return resolved
+    }
+
+    private static func sessionStartDate(sessionID: String, prefix: String) -> Date? {
+        let timestamp = String(sessionID.dropFirst(prefix.count))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        // Session IDs and output filenames both use the configured Hermes
+        // wall clock. A fixed zone preserves their relative ordering without
+        // pretending either identifier carries an absolute timezone.
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter.date(from: timestamp)
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+enum CronTaskHistory {
+    static func statusUpdates(from outputs: [CronOutputItem]) -> [CronOutputItem] {
+        var previousFingerprint: String?
+        var chronologicalUpdates: [CronOutputItem] = []
+
+        for output in outputs.reversed() {
+            guard output.resultText != nil, !output.representsNoUpdate else { continue }
+            let fingerprint = output.summaryText.lowercased()
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: " ")
+            guard fingerprint != previousFingerprint else { continue }
+            chronologicalUpdates.append(output)
+            previousFingerprint = fingerprint
+        }
+
+        return Array(chronologicalUpdates.reversed())
+    }
+}
+
+enum CronSessionContextBuilder {
+    static func draft(
+        job: CronJob,
+        outputs: [CronOutputItem],
+        selectedOutput: CronOutputItem?,
+        momentTitle: String
+    ) -> String {
+        let firstRunOutput = outputs
+            .filter { $0.runDate != nil }
+            .min { ($0.runDate ?? .distantFuture) < ($1.runDate ?? .distantFuture) }
+        let firstRun = firstRunOutput?.formattedRunTime ?? String(localized: "Not recorded")
+        let latestOutput = outputs.first
+        let updates = CronTaskHistory.statusUpdates(from: outputs)
+        let timeline = updates.prefix(50).map {
+            "- [\($0.formattedRunTime ?? String(localized: "Unknown time"))] \($0.summaryText)"
+        }.joined(separator: "\n")
+
+        var sections = [
+            String(localized: "I want to continue working on this scheduled task. Use the full task context below."),
+            "## Task\nName: \(job.displayName)\nStatus: \(job.status.label)\nSchedule: \(job.readableScheduleText ?? job.scheduleText ?? String(localized: "Not available"))\nNext run: \(job.nextRunAt?.formatted ?? String(localized: "Not available"))\nFirst recorded run: \(firstRun)",
+            "## Full task description\n\(job.prompt ?? String(localized: "No description provided."))",
+            "## Selected moment\n\(momentTitle)"
+        ]
+
+        if let selectedOutput {
+            sections.append(
+                "### Selected run — \(selectedOutput.formattedRunTime ?? String(localized: "Unknown time"))\n\(selectedOutput.resultText ?? String(localized: "No update recorded."))"
+            )
+        }
+
+        if let latestOutput, latestOutput.id != selectedOutput?.id {
+            sections.append(
+                "## Current status — \(latestOutput.formattedRunTime ?? String(localized: "Unknown time"))\n\(latestOutput.resultText ?? String(localized: "No update recorded."))"
+            )
+        }
+
+        if !timeline.isEmpty {
+            sections.append("## Update timeline\n\(timeline)")
+        }
+
+        sections.append(
+            String(localized: "## Next action\nHelp me decide or perform the next action for this task. If my desired outcome is unclear, ask me what I want to do.")
+        )
+        return sections.joined(separator: "\n\n")
+    }
+}
+
+private enum CronTextSummary {
+    static func make(from text: String, maximumLength: Int) -> String {
+        let paragraphs = text.components(separatedBy: "\n\n")
+        let paragraph = paragraphs.first(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) ?? text
+        var plain = paragraph
+            .replacingOccurrences(of: "\\[([^\\]]+)\\]\\([^\\)]+\\)", with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "__", with: "")
+            .replacingOccurrences(of: "`", with: "")
+
+        plain = plain.components(separatedBy: .newlines).map { line in
+            var value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            while let first = value.first, "#*-•>".contains(first) {
+                value.removeFirst()
+                value = value.trimmingCharacters(in: .whitespaces)
+            }
+            return value
+        }.filter { !$0.isEmpty }.joined(separator: " ")
+        plain = plain.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+
+        guard plain.count > maximumLength else { return plain }
+        let prefix = String(plain.prefix(maximumLength))
+        if let lastSpace = prefix.lastIndex(of: " ") {
+            return String(prefix[..<lastSpace]) + "…"
+        }
+        return prefix + "…"
     }
 }
 
