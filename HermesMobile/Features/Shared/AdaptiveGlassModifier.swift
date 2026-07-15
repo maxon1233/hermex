@@ -240,6 +240,21 @@ private struct AdaptiveSoftScrollEdgeModifier: ViewModifier {
     }
 }
 
+/// Fades scrolling content beneath the status and navigation bars.
+///
+/// Applying the soft edge at the navigation root gives every scrolling
+/// destination the same gradual blurred transition into the top chrome.
+private struct AdaptiveFadingTopScrollEdgeModifier: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content.scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            content
+        }
+    }
+}
+
 struct AdaptiveGlassContainer<Content: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage(GlassPreference.isEnabledKey) private var isGlassEnabled = GlassPreference.defaultIsEnabled
@@ -301,5 +316,9 @@ extension View {
 
     func adaptiveSoftScrollEdges(_ edges: Edge.Set = [.top, .bottom]) -> some View {
         modifier(AdaptiveSoftScrollEdgeModifier(edges: edges))
+    }
+
+    func adaptiveFadingTopScrollEdge() -> some View {
+        modifier(AdaptiveFadingTopScrollEdgeModifier())
     }
 }

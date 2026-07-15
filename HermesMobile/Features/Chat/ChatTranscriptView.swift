@@ -134,7 +134,9 @@ struct ChatTranscriptView: View {
                             .frame(height: transcriptBottomInsetHeight)
                             .accessibilityHidden(true)
                     }
-                    .adaptiveSoftScrollEdges()
+                    // The navigation root supplies a gradual soft top edge;
+                    // retain the softer fade only around the bottom composer.
+                    .adaptiveSoftScrollEdges(.bottom)
                     .simultaneousGesture(
                         TapGesture().onEnded {
                             guard clarificationPrompt == nil else { return }
