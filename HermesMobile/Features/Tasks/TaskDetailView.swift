@@ -5,13 +5,14 @@ struct TaskDetailView: View {
     let onAPIError: (Error) -> Void
     let onMutation: (CronJobListMutation) -> Void
     let sessions: [SessionSummary]
-    let onOpenSession: (SessionSummary) -> Void
     let onStartSession: (String) -> Void
 
     @State private var viewModel: TaskDetailViewModel
     @State private var isPresentingEditTask = false
     @State private var isConfirmingDelete = false
     @State private var isPresentingFullTask = false
+    @State private var sessionToOpen: SessionSummary?
+    @State private var sessionPendingFullTaskDismissal: SessionSummary?
     @State private var expandedRunIDs: Set<String> = []
     @Environment(\.dismiss) private var dismiss
 
@@ -22,14 +23,12 @@ struct TaskDetailView: View {
         onAPIError: @escaping (Error) -> Void,
         onMutation: @escaping (CronJobListMutation) -> Void = { _ in },
         sessions: [SessionSummary] = [],
-        onOpenSession: @escaping (SessionSummary) -> Void = { _ in },
         onStartSession: @escaping (String) -> Void = { _ in }
     ) {
         self.server = server
         self.onAPIError = onAPIError
         self.onMutation = onMutation
         self.sessions = sessions
-        self.onOpenSession = onOpenSession
         self.onStartSession = onStartSession
         _viewModel = State(initialValue: TaskDetailViewModel(job: job, runningElapsed: runningElapsed, server: server))
     }
@@ -47,6 +46,10 @@ struct TaskDetailView: View {
             .padding()
         }
         .navigationTitle(viewModel.job.displayName)
+        .navigationDestination(item: $sessionToOpen) { session in
+            ChatView(session: session, server: server, onAPIError: onAPIError)
+                .id(session.id)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button {
@@ -111,7 +114,7 @@ struct TaskDetailView: View {
                 return didUpdate
             }
         }
-        .sheet(isPresented: $isPresentingFullTask) {
+        .sheet(isPresented: $isPresentingFullTask, onDismiss: openPendingFullTaskSession) {
             fullTaskSheet
         }
         .alert("Delete Task?", isPresented: $isConfirmingDelete) {
@@ -391,11 +394,12 @@ struct TaskDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                     Button {
-                        isPresentingFullTask = false
                         if let latestOutput = viewModel.outputs.first,
                            let session = resolvedRunSessions[latestOutput.id] {
-                            onOpenSession(session)
+                            sessionPendingFullTaskDismissal = session
+                            isPresentingFullTask = false
                         } else {
+                            isPresentingFullTask = false
                             startSession(from: nil, momentTitle: String(localized: "Full task description"))
                         }
                     } label: {
@@ -453,7 +457,7 @@ struct TaskDetailView: View {
         let resolvedSession = session ?? output.flatMap { resolvedRunSessions[$0.id] }
         if let resolvedSession {
             Button {
-                onOpenSession(resolvedSession)
+                sessionToOpen = resolvedSession
             } label: {
                 Label("Open Session", systemImage: "bubble.left.and.bubble.right")
             }
@@ -464,6 +468,12 @@ struct TaskDetailView: View {
                 Label("Start Session", systemImage: "bubble.left.and.bubble.right")
             }
         }
+    }
+
+    private func openPendingFullTaskSession() {
+        guard let pendingSession = sessionPendingFullTaskDismissal else { return }
+        sessionPendingFullTaskDismissal = nil
+        sessionToOpen = pendingSession
     }
 
     private func startSession(from output: CronOutputItem?, momentTitle: String) {

@@ -346,9 +346,6 @@ struct SessionListView: View {
                     server: server,
                     onAPIError: authManager.handleAPIError,
                     sessions: viewModel.sessions,
-                    onOpenSession: { session in
-                        openRootDestination(.session(session))
-                    },
                     onStartSession: { context in
                         openNewChat(initialDraft: context)
                     }

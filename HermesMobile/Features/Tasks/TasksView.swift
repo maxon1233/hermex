@@ -4,7 +4,6 @@ struct TasksView: View {
     let server: URL
     let onAPIError: (Error) -> Void
     let sessions: [SessionSummary]
-    let onOpenSession: (SessionSummary) -> Void
     let onStartSession: (String) -> Void
 
     @State private var viewModel: TasksViewModel
@@ -14,13 +13,11 @@ struct TasksView: View {
         server: URL,
         onAPIError: @escaping (Error) -> Void,
         sessions: [SessionSummary] = [],
-        onOpenSession: @escaping (SessionSummary) -> Void = { _ in },
         onStartSession: @escaping (String) -> Void = { _ in }
     ) {
         self.server = server
         self.onAPIError = onAPIError
         self.sessions = sessions
-        self.onOpenSession = onOpenSession
         self.onStartSession = onStartSession
         _viewModel = State(initialValue: TasksViewModel(server: server))
     }
@@ -114,7 +111,6 @@ struct TasksView: View {
                                     viewModel.apply(mutation)
                                 },
                                 sessions: sessions,
-                                onOpenSession: onOpenSession,
                                 onStartSession: onStartSession
                             )
                         } label: {
