@@ -240,6 +240,9 @@ struct SessionListView: View {
                 )
             )
             .focusedSceneValue(\.hermexSceneActions, sceneActions)
+            // Configure every scroll view in the navigation hierarchy, including
+            // pushed destinations, with one gradual fade into the top chrome.
+            .adaptiveFadingTopScrollEdge()
     }
 
     @ViewBuilder
@@ -267,9 +270,6 @@ struct SessionListView: View {
 
     private var sessionListSurface: some View {
         ZStack(alignment: .bottomTrailing) {
-            Color(.systemBackground)
-                .ignoresSafeArea()
-
             content
 
             if !isSearchingSessions {
@@ -278,6 +278,12 @@ struct SessionListView: View {
                     .padding(.bottom, 22)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+        }
+        // Keep the layout itself inside the safe area. Extending a ZStack child
+        // made the List render underneath the status bar as it scrolled.
+        .background {
+            Color(.systemBackground)
+                .ignoresSafeArea()
         }
     }
 
@@ -416,6 +422,21 @@ struct SessionListView: View {
         .scrollContentBackground(.hidden)
         .scrollPosition(id: $sidebarScrollPosition)
         .background(Color(.systemBackground))
+        // Fade rows and the custom header before the List clips at the safe-area
+        // boundary instead of letting them collide with the status indicators.
+        .mask {
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [.clear, .black],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 28)
+
+                Rectangle()
+                    .fill(.black)
+            }
+        }
         .scrollDismissesKeyboard(.interactively)
         // Disclosure subrows are real List rows; drive their fold from the List
         // so insert/remove animates. Value-based so it works with @AppStorage.
