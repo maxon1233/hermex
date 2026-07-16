@@ -24,7 +24,7 @@ struct TasksView: View {
 
     var body: some View {
         content
-            .navigationTitle("Tasks")
+            .adaptiveNavigationChromeTitle(String(localized: "Tasks"))
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
@@ -338,8 +338,7 @@ struct CronJobEditorSheet: View {
                     }
                 }
             }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

@@ -722,8 +722,7 @@ struct TranscriptMediaPreviewView: View {
                     unavailableContent(String(localized: "Preview is not available for this media."))
                 }
             }
-            .navigationTitle(item.reference.displayName)
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(item.reference.displayName)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {

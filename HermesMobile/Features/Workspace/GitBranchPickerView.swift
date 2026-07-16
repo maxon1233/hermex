@@ -126,8 +126,7 @@ private struct GitBranchPickerSheet: View {
                 }
             }
             .listStyle(.insetGrouped)
-            .navigationTitle("Branches")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Branches"))
             .searchable(text: $searchText, prompt: "Search branches")
             .overlay {
                 if isLoading, branches == nil { ProgressView() }

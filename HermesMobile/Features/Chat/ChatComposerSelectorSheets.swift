@@ -39,8 +39,7 @@ struct ComposerModelPickerSheet: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            .navigationTitle("Choose Model")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Choose Model"))
             .searchable(
                 text: $searchText,
                 placement: .navigationBarDrawer(displayMode: .always),
@@ -468,8 +467,7 @@ struct ComposerWorkspacePickerSheet: View {
                     }
                 }
             }
-            .navigationTitle("Choose Workspace")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Choose Workspace"))
             .toolbar {
                 if managementServer != nil {
                     ToolbarItem(placement: .topBarLeading) {

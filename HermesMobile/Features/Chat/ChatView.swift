@@ -569,8 +569,7 @@ struct ChatView: View {
         .overlay(alignment: .top) {
             GitActionToastOverlay(state: gitToastState)
         }
-        .navigationTitle(displayTitle)
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(displayTitle, subtitle: headerSubtitle)
         .accessibilityIdentifier("chat-detail:\(viewModel.displayTitle)")
         .task {
             viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
@@ -646,13 +645,6 @@ struct ChatView: View {
                 handleResponseCompletionSideEffects()
             }
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    ChatToolbarTitleLabel(
-                        title: displayTitle,
-                        subtitle: headerSubtitle
-                    )
-                }
-
                 ToolbarItem(placement: .topBarTrailing) {
                     ChatToolbarActionCluster {
                         if viewModel.hasActivatedGoalCommand {
@@ -2203,71 +2195,6 @@ struct ChatView: View {
         }
 
         return max(0, transcriptMessages.count - 1 - index)
-    }
-}
-
-struct ChatToolbarTitleLabel: View {
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-
-    let title: String
-    let subtitle: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-
-            if showsSubtitle, let subtitle {
-                Text(subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .multilineTextAlignment(.leading)
-        // The transcript intentionally scrolls beneath the Liquid Glass bar.
-        // Anchor this scrim to the toolbar title itself so the darkest point
-        // stays behind the session name instead of starting at the transcript's
-        // lower safe-area boundary.
-        .background {
-            ChatNavigationChromeFade()
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
-    }
-
-    private var showsSubtitle: Bool {
-        !dynamicTypeSize.isAccessibilitySize
-    }
-
-    private var accessibilityLabel: String {
-        guard let subtitle else { return title }
-        return "\(title), \(subtitle)"
-    }
-}
-
-private struct ChatNavigationChromeFade: View {
-    var body: some View {
-        LinearGradient(
-            stops: [
-                .init(color: Color(.systemBackground).opacity(0.98), location: 0),
-                .init(color: Color(.systemBackground).opacity(0.90), location: 0.48),
-                .init(color: Color(.systemBackground).opacity(0.58), location: 0.72),
-                .init(color: Color(.systemBackground).opacity(0), location: 1)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        // Centering this tall background on the inline toolbar title places its
-        // top at the physical screen edge and its tail just below the bar.
-        .frame(width: 1_000, height: 190)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
     }
 }
 

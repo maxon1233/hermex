@@ -38,8 +38,7 @@ struct GitCommitView: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Commit Changes")
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(String(localized: "Commit Changes"))
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Done") { dismiss() }

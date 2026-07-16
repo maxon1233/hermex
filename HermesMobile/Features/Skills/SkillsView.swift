@@ -17,7 +17,7 @@ struct SkillsView: View {
     var body: some View {
         content
             .adaptiveReadableScrollContent(maxWidth: AdaptiveReadableContentWidth.secondaryDestination)
-            .navigationTitle("Skills")
+            .adaptiveNavigationChromeTitle(String(localized: "Skills"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -287,7 +287,7 @@ struct SkillDetailView: View {
 
     var body: some View {
         content
-            .navigationTitle(skill.name ?? String(localized: "Skill"))
+            .adaptiveNavigationChromeTitle(skill.name ?? String(localized: "Skill"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -463,8 +463,7 @@ struct SkillLinkedFileView: View {
                 }
             }
         }
-        .navigationTitle(fileName)
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(fileName)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Close") {

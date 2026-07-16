@@ -123,8 +123,7 @@ private struct ProjectFormSheet: View {
                     .padding(.vertical, 4)
                 }
             }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", action: onCancel)

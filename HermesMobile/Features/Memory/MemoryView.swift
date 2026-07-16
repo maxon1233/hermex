@@ -15,7 +15,7 @@ struct MemoryView: View {
 
     var body: some View {
         content
-            .navigationTitle("Memory")
+            .adaptiveNavigationChromeTitle(String(localized: "Memory"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -236,8 +236,7 @@ private struct MemoryEditSheet: View {
                     }
                 }
             }
-            .navigationTitle("Edit \(section.title)")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Edit \(section.title)"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

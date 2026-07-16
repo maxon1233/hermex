@@ -39,8 +39,7 @@ struct StreamingLabView: View {
             }
         }
         .background(Color(.systemBackground))
-        .navigationTitle("Streaming Lab")
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(String(localized: "Streaming Lab"))
         .task(id: replayID) {
             await replayFixture()
         }

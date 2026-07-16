@@ -79,8 +79,7 @@ struct GoalSubmissionSheet: View {
                 .padding()
                 .scrollContentBackground(.hidden)
                 .background(Color(.systemGroupedBackground))
-                .navigationTitle("Set Goal")
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(String(localized: "Set Goal"))
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Cancel") {

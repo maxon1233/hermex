@@ -77,8 +77,7 @@ struct WorkspaceManagerView: View {
                     }
                 }
             }
-            .navigationTitle("Manage Workspaces")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Manage Workspaces"))
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") {
@@ -267,8 +266,7 @@ private struct WorkspaceAddSheet: View {
                     }
                 }
             }
-            .navigationTitle("Add Workspace")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Add Workspace"))
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") {

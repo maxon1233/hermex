@@ -48,8 +48,7 @@ struct DefaultProfilePickerView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Default Profile")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Default Profile"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -385,8 +384,7 @@ private struct CreateProfileSheet: View {
                 }
             }
             .disabled(isCreating)
-            .navigationTitle("New Profile")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "New Profile"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

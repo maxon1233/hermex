@@ -1396,8 +1396,7 @@ private struct PendingNewChatView: View {
             .padding(.horizontal)
             .padding(.bottom, 12)
         }
-        .navigationTitle("New Chat")
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(String(localized: "New Chat"))
     }
 
     private var pendingComposer: some View {

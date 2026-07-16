@@ -47,8 +47,7 @@ struct FilePreviewView: View {
             }
         }
         .adaptiveReadableScrollContent(maxWidth: AdaptiveReadableContentWidth.workspace)
-        .navigationTitle(displayName)
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(displayName)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if viewModel.canSaveImageToPhotos {

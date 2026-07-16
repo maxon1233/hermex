@@ -89,8 +89,7 @@ struct SelectableResponseTextView: View {
             SelectableTextView(text: selection.text)
                 .accessibilityIdentifier("selectable-response-text")
                 .background(Color(.systemBackground))
-                .navigationTitle("Select Text")
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(String(localized: "Select Text"))
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Done") {
@@ -145,8 +144,7 @@ struct EditMessageSheet: View {
                     .scrollContentBackground(.hidden)
                     .background(Color(.systemGroupedBackground))
             }
-            .navigationTitle("Edit Message")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Edit Message"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

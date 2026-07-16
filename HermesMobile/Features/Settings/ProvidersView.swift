@@ -17,7 +17,7 @@ struct ProvidersView: View {
 
     var body: some View {
         content
-            .navigationTitle("Providers")
+            .adaptiveNavigationChromeTitle(String(localized: "Providers"))
             .background(Color(.systemBackground))
             .task {
                 await viewModel.load()

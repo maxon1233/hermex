@@ -24,8 +24,7 @@ struct GitDiffView: View {
         NavigationStack {
             content
                 .adaptiveReadableScrollContent(maxWidth: AdaptiveReadableContentWidth.workspace)
-                .navigationTitle(file.displayPath)
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(file.displayPath)
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
                 }

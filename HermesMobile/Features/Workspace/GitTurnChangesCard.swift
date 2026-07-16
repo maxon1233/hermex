@@ -153,8 +153,7 @@ struct GitTurnDiffSheet: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle(title)
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(title)
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
                 }

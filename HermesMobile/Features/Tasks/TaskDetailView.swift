@@ -45,7 +45,7 @@ struct TaskDetailView: View {
             }
             .padding()
         }
-        .navigationTitle(viewModel.job.displayName)
+        .adaptiveNavigationChromeTitle(viewModel.job.displayName)
         .navigationDestination(item: $sessionToOpen) { session in
             ChatView(session: session, server: server, onAPIError: onAPIError)
                 .id(session.id)
@@ -413,8 +413,7 @@ struct TaskDetailView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Full Task")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Full Task"))
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {

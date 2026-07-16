@@ -20,8 +20,7 @@ struct GitWorkspaceView: View {
         NavigationStack {
             content
                 .adaptiveReadableScrollContent(maxWidth: AdaptiveReadableContentWidth.workspace)
-                .navigationTitle("Git")
-                .navigationBarTitleDisplayMode(.inline)
+                .adaptiveNavigationChromeTitle(String(localized: "Git"))
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Done") { dismiss() }

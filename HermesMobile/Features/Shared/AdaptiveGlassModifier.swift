@@ -58,13 +58,99 @@ extension View {
     func adaptiveSecondaryNavigationTitle() -> some View {
         modifier(AdaptiveSecondaryNavigationTitleModifier())
     }
+
+    /// Uses a compact navigation title with the shared top-chrome fade.
+    ///
+    /// Keeping the fade attached to the principal toolbar item anchors it to
+    /// the physical top of the screen, even when the destination scrolls.
+    func adaptiveNavigationChromeTitle(_ title: String, subtitle: String? = nil) -> some View {
+        modifier(AdaptiveNavigationChromeTitleModifier(title: title, subtitle: subtitle))
+    }
 }
 
 private struct AdaptiveSecondaryNavigationTitleModifier: ViewModifier {
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    func body(content: Content) -> some View {
+        // Automatic mode becomes a large title on compact iPhones. On the
+        // iOS 27 beta that title can remain visible while the inline bar is
+        // presented, producing a duplicated title beneath the status bar.
+        content.navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct AdaptiveNavigationChromeTitleModifier: ViewModifier {
+    let title: String
+    let subtitle: String?
 
     func body(content: Content) -> some View {
-        content.navigationBarTitleDisplayMode(horizontalSizeClass == .regular ? .inline : .automatic)
+        content
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    AdaptiveNavigationChromeTitleLabel(title: title, subtitle: subtitle)
+                }
+            }
+    }
+}
+
+struct AdaptiveNavigationChromeTitleLabel: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let title: String
+    let subtitle: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            if showsSubtitle, let subtitle {
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .multilineTextAlignment(.leading)
+        .background {
+            AdaptiveNavigationChromeFade()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var showsSubtitle: Bool {
+        !dynamicTypeSize.isAccessibilitySize
+    }
+
+    private var accessibilityLabel: String {
+        guard let subtitle else { return title }
+        return "\(title), \(subtitle)"
+    }
+}
+
+private struct AdaptiveNavigationChromeFade: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(.systemBackground).opacity(0.98), location: 0),
+                .init(color: Color(.systemBackground).opacity(0.90), location: 0.48),
+                .init(color: Color(.systemBackground).opacity(0.58), location: 0.72),
+                .init(color: Color(.systemBackground).opacity(0), location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        // Centering this tall background on the inline toolbar title places
+        // its top at the physical screen edge and its tail below the bar.
+        .frame(width: 1_000, height: 190)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

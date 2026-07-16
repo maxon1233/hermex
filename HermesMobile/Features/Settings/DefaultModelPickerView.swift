@@ -58,8 +58,7 @@ struct DefaultModelPickerView: View {
                 }
                 .padding()
             }
-            .navigationTitle("Default Model")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Default Model"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

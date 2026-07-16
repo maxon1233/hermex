@@ -479,7 +479,7 @@ struct SettingsView: View {
             .adaptiveReadableContent(maxWidth: AdaptiveReadableContentWidth.secondaryDestination)
         }
         .background(Color(.systemBackground))
-        .navigationTitle("Settings")
+        .adaptiveNavigationChromeTitle(String(localized: "Settings"))
         .task {
             await loadServerSettings()
             await refreshNotificationPermissionStatus()
@@ -1710,8 +1710,7 @@ private struct CustomHeadersSettingsView: View {
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .navigationTitle("Connection Headers")
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(String(localized: "Connection Headers"))
         // Live-refresh the network clients on every edit (cheap, in-memory only)
         // but defer the slow Keychain write until the editor is dismissed so
         // typing never stutters.
@@ -2034,8 +2033,7 @@ private struct ServerDetailView: View {
             .padding(.bottom, 36)
         }
         .background(Color(.systemBackground))
-        .navigationTitle(displayName.isEmpty ? hostFallback : displayName)
-        .navigationBarTitleDisplayMode(.inline)
+        .adaptiveNavigationChromeTitle(displayName.isEmpty ? hostFallback : displayName)
         // Persist identity edits to this server's registry entry. When it's the
         // active server, the registry mirrors them into the global @AppStorage so
         // the avatar / header tint update live (#17).
@@ -2186,8 +2184,7 @@ struct AddServerView: View {
                 .padding(.bottom, 36)
             }
             .background(Color(.systemBackground))
-            .navigationTitle("Add Server")
-            .navigationBarTitleDisplayMode(.inline)
+            .adaptiveNavigationChromeTitle(String(localized: "Add Server"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

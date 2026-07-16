@@ -14,7 +14,7 @@ struct InsightsView: View {
 
     var body: some View {
         content
-            .navigationTitle("Usage Analytics")
+            .adaptiveNavigationChromeTitle(String(localized: "Usage Analytics"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
