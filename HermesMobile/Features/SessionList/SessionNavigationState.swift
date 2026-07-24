@@ -13,6 +13,19 @@ enum SessionNavigationDestination: Hashable, Identifiable {
     }
 }
 
+enum SessionListRefreshPolicy {
+    /// SwiftUI keeps the session-list view mounted while a compact-width detail is
+    /// pushed, so returning from chat does not reliably produce another `onAppear`.
+    /// A destination transition is the authoritative signal that the detail the
+    /// user was interacting with is no longer current.
+    static func shouldRefreshAfterNavigationChange(
+        from oldDestination: SessionNavigationDestination?,
+        to newDestination: SessionNavigationDestination?
+    ) -> Bool {
+        oldDestination != nil && oldDestination != newDestination
+    }
+}
+
 struct SessionNavigationState: Equatable {
     private(set) var destination: SessionNavigationDestination?
     private(set) var lastSelectedSessionID: String?
