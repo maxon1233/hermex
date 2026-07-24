@@ -18,6 +18,7 @@ struct SessionListView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.scenePhase) private var scenePhase
     @State private var viewModel: SessionListViewModel
     @State private var navigationState: SessionNavigationState
     @State private var sessionPendingRename: SessionSummary?
@@ -205,7 +206,6 @@ struct SessionListView: View {
                 openPendingSharedImportIfNeeded()
                 openPendingDeepLinkedSessionIfNeeded()
                 openRequestedNewChatIfNeeded()
-                refreshAfterReturningIfNeeded()
             }
             .onChange(of: pendingSharedImport) {
                 openPendingSharedImportIfNeeded()
@@ -217,6 +217,11 @@ struct SessionListView: View {
                 openRequestedNewChatIfNeeded()
             }
             .onChange(of: navigationState.destination) { oldValue, newValue in
+                let shouldRefresh = SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                    from: oldValue,
+                    to: newValue
+                )
+
                 if case .newChat = oldValue,
                    case .newChat = newValue {
                     return
@@ -224,6 +229,17 @@ struct SessionListView: View {
 
                 if case .newChat = oldValue {
                     viewModel.removeEmptySidebarPlaceholders()
+                }
+
+                guard shouldRefresh, didCompleteInitialLoad else { return }
+                Task {
+                    await loadSessions()
+                }
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                guard newPhase == .active, didCompleteInitialLoad else { return }
+                Task {
+                    await loadSessions()
                 }
             }
             .refreshable {
@@ -932,14 +948,6 @@ struct SessionListView: View {
         }
 
         isSearchFocused = true
-    }
-
-    private func refreshAfterReturningIfNeeded() {
-        guard didCompleteInitialLoad else { return }
-
-        Task {
-            await refreshSessionsAndActiveProfile()
-        }
     }
 
     private func monitorActiveSessionRows() async {

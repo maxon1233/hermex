@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct SessionRowView: View {
+    static let relativeDateRefreshInterval: TimeInterval = 1
+
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .caption2) private var pinnedIconSize: CGFloat = 11
     @ScaledMetric(relativeTo: .body) private var verticalPadding: CGFloat = 8
@@ -11,20 +13,26 @@ struct SessionRowView: View {
     var isViewingCachedData = false
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: Self.relativeDateRefreshInterval)) { context in
+            row(relativeTo: context.date)
+        }
+    }
+
+    private func row(relativeTo now: Date) -> some View {
         HStack(alignment: .top, spacing: 10) {
             if Self.isActiveStreaming(session) {
                 ActiveSessionStreamingIndicator()
                     .padding(.top, streamingIndicatorTopPadding)
             }
 
-            rowContent
+            rowContent(relativeTo: now)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, verticalPadding)
         .frame(minHeight: rowMinimumHeight, alignment: .center)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilitySummary)
+        .accessibilityLabel(accessibilitySummary(relativeTo: now))
     }
 
     static func displayTitle(for session: SessionSummary) -> String {
@@ -103,9 +111,9 @@ struct SessionRowView: View {
         )
     }
 
-    private var rowContent: some View {
+    private func rowContent(relativeTo now: Date) -> some View {
         VStack(alignment: .leading, spacing: rowContentSpacing) {
-            titleArea
+            titleArea(relativeTo: now)
 
             if showsSupplementalContent {
                 supplementalArea
@@ -115,7 +123,9 @@ struct SessionRowView: View {
     }
 
     @ViewBuilder
-    private var titleArea: some View {
+    private func titleArea(relativeTo now: Date) -> some View {
+        let relativeDate = Self.relativeDate(for: session, relativeTo: now)
+
         if dynamicTypeSize.isAccessibilitySize {
             VStack(alignment: .leading, spacing: 3) {
                 titleAndPin
@@ -245,17 +255,17 @@ struct SessionRowView: View {
         dynamicTypeSize.isAccessibilitySize ? 8 : 7
     }
 
-    private var relativeDate: String? {
+    static func relativeDate(for session: SessionSummary, relativeTo now: Date) -> String? {
         let timestamp = session.lastMessageAt ?? session.updatedAt ?? session.createdAt
-        guard let timestamp, timestamp > 0 else { return nil }
+        guard let timestamp, timestamp.isFinite, timestamp > 0 else { return nil }
 
         return SessionRelativeDateFormatter.shared.localizedString(
             for: Date(timeIntervalSince1970: timestamp),
-            relativeTo: Date()
+            relativeTo: now
         )
     }
 
-    private var accessibilitySummary: String {
+    private func accessibilitySummary(relativeTo now: Date) -> String {
         var parts = [displayTitle]
 
         parts.append(contentsOf: Self.accessibilityStateLabels(for: session, isViewingCachedData: isViewingCachedData))
@@ -264,7 +274,7 @@ struct SessionRowView: View {
             parts.append(metadataLabel)
         }
 
-        if let relativeDate {
+        if let relativeDate = Self.relativeDate(for: session, relativeTo: now) {
             parts.append(relativeDate)
         }
 
