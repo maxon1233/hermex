@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "required_commits": [
+    {
+      "id": "pr-1-transcript-file-card-actions",
+      "sha": "ebe6ae8fd27095f1616f02bc02d9423861c5d677",
+      "description": "Make transcript file cards fully tappable"
+    },
+    {
+      "id": "pr-2-transcript-file-preview-download",
+      "sha": "26386ce93782d590a20598c80ef72893af1eed77",
+      "description": "Separate transcript file preview and download actions"
+    },
+    {
+      "id": "pr-3-cron-session-isolation",
+      "sha": "a25c2b85fd0418aea4b6f290fb98a21064a949a8",
+      "description": "Separate cron executions from regular sessions"
+    },
+    {
+      "id": "pr-4-transcript-link-preview-removal",
+      "sha": "63c0f8cc1b9dd2e75c009337409c1aa0b89fcf89",
+      "description": "Keep transcript links clickable without preview cards"
+    },
+    {
+      "id": "pr-5-readable-task-results",
+      "sha": "ab2f2c0fa193e1b04e541f4460f316ea360d4839",
+      "description": "Improve task details and run navigation"
+    },
+    {
+      "id": "pr-6-status-bar-safe-area",
+      "sha": "5a2c0d6672c76c846a418ebc03aef225943b0eaf",
+      "description": "Fix status bar content overlap"
+    },
+    {
+      "id": "pr-7-darker-chat-title-fade",
+      "sha": "ada32f288ab72e0f7e6f34508977406ccbdd7da2",
+      "description": "Darken the chat title fade"
+    },
+    {
+      "id": "pr-9-session-list-refresh",
+      "sha": "e8d84ac13b2a92ffec985d19563e9a2b9e60a16e",
+      "description": "Refresh and group the session list automatically"
+    }
+  ]
+}

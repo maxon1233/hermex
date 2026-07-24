@@ -28,6 +28,36 @@ The pin was last verified against the upstream GitHub tag source during the 2026
 
 Contract test readiness is documented in [`CONTRACT_TESTS.md`](CONTRACT_TESTS.md). Current coverage verifies the app's endpoint matrix and native POST header shape with URLProtocol-backed tests; the full Docker-backed upstream contract target remains future hardening.
 
+## Hermex App Upstream Pin
+
+The server/API pin above is intentionally separate from the upstream Hermex iOS
+source. The personal release branch records its app-source integration state in:
+
+- [`HERMEX_APP_UPSTREAM_TRIAGED_SHA`](HERMEX_APP_UPSTREAM_TRIAGED_SHA): latest
+  upstream app commit whose changes were reviewed and routed.
+- [`HERMEX_APP_UPSTREAM_TESTED_SHA`](HERMEX_APP_UPSTREAM_TESTED_SHA): latest
+  upstream app commit contained in `personal/main` and validated with the full
+  suite and simulator smoke.
+
+The daily [`Hermex App Upstream Watch`](.github/workflows/hermex-app-upstream-watch.yml)
+compares those pins with the read-only `upstream/master` ref and maintains a
+standing `needs-triage` issue while they lag.
+
+To integrate new upstream app work:
+
+1. Fetch `upstream/master`; never push or open a pull request against `upstream`.
+2. Create a `sync/upstream-<short-sha>` branch from `personal/main`.
+3. Merge the fetched upstream ref into that sync branch.
+4. Review every upstream commit and conflict, preserving the behaviors in
+   [`Config/PersonalReleaseBaseline.json`](Config/PersonalReleaseBaseline.json).
+5. Run the complete XCTest suite and a signed simulator build/smoke.
+6. Advance both app-upstream pin files to the validated upstream SHA in the same
+   reviewed pull request into `personal/main`.
+
+Do not advance a pin merely to silence the watcher. The personal release guard
+requires the pinned upstream commit to be an ancestor of the release and refuses
+to archive if the latest fetched upstream tip remains unreviewed or untested.
+
 ## SSE and Cloudflare Stream Verification
 
 Phase 4 streaming uses `GET /api/chat/stream?stream_id=...` over Server-Sent Events. Current upstream source confirms the stream response uses `Content-Type: text/event-stream; charset=utf-8`, `X-Accel-Buffering: no`, `Connection: keep-alive`, and sends `: heartbeat` comments every 30 seconds while no app event is ready.
@@ -206,6 +236,51 @@ After merging the repo rebrand slice, update App Store Connect metadata separate
 2. Branch TestFlight app (`com.uzairansar.hermesmobile.branch`): rename listing from `Hermes Agent Branch` → `Hermex Branch`.
 3. Update TestFlight/review notes and any metadata copy that still says the old app name.
 4. Upload a build and confirm TestFlight shows **Hermex** / **Hermex Branch** on the home screen after processing.
+
+### Personal TestFlight archive guard (owner-only)
+
+The personal TestFlight app is separate from the production and branch apps
+documented below. Its bundle, team, App Store Connect app, and beta-group
+identity remain in local-only `CURRENT.md`.
+
+Never archive it with a raw `xcodebuild` command from the active worktree. Check
+the release state first:
+
+```zsh
+scripts/personal-release check
+```
+
+Then create a build-specific archive from the immutable remote
+`personal/main` snapshot:
+
+```zsh
+scripts/personal-release archive \
+  --build-number <unique-build-number> \
+  --xcconfig /absolute/path/to/Personal.xcconfig \
+  --archive-path build/HermexPersonal-<unique-build-number>.xcarchive \
+  --expected-bundle-id <personal-bundle-id-from-CURRENT.md> \
+  --expected-team-id <personal-team-id-from-CURRENT.md>
+```
+
+The archive command always:
+
+- fetches `origin/personal/main` and the read-only app `upstream/master`;
+- verifies every required personal baseline commit;
+- blocks untriaged, untested, or unmerged upstream app changes;
+- exports a clean Git snapshot instead of reading the active worktree;
+- runs the complete XCTest suite;
+- embeds the source branch, source SHA, upstream SHA, and clean state;
+- verifies the archive's bundle, team, build number, and embedded identity;
+- writes a sibling `.source.json` manifest for the delivery record.
+
+Only export/upload the archive that passed this command. After upload, follow the
+personal completion rule in `CURRENT.md`: wait for the exact build to become
+valid and ready for internal testing, add it to the recorded internal group,
+and read the group-build relationship back. Upload success alone is incomplete.
+
+For the scheduled app-upstream watcher to run, the fork's GitHub default branch
+must be `personal/main`. Protect `master` from feature merges and require the
+`CI Gate` check on `personal/main`.
 
 ### Branch TestFlight upload (CLI) — the "push to branch testflight" command
 
