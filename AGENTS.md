@@ -97,6 +97,9 @@ other.
 ## Working with the human
 - Surface tradeoffs in plain English before non-obvious choices; when in doubt, ask.
 - Ask before touching anything under the spec's "Open questions."
+- For access to an installed app/connector/plugin, always try the plugin first. If it
+  is not authorized, present the plugin's OAuth link or authorization flow; never
+  send the human terminal authentication commands unless they explicitly ask for them.
 - After each slice, report: (1) files changed (2) build/test command run (3) result
   (4) next suggested step — plus a short manual simulator test plan when UI changed.
 

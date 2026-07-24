@@ -71,11 +71,7 @@ struct SessionListView: View {
         _pendingDeepLinkedSessionID = pendingDeepLinkedSessionID
         _requestedNewChat = requestedNewChat
         _viewModel = State(initialValue: SessionListViewModel(server: server))
-        _navigationState = State(
-            initialValue: SessionNavigationState(
-                lastSelectedSessionID: SessionNavigationPersistence.load(for: server)
-            )
-        )
+        _navigationState = State(initialValue: SessionNavigationState())
         _showsCliSessions = AppStorage(
             wrappedValue: SessionRowDisplaySettings.showsCliSessions(for: server),
             SessionRowDisplaySettings.showCliSessionsKey(for: server)
@@ -192,7 +188,6 @@ struct SessionListView: View {
             .task {
                 await refreshSessionsAndActiveProfile()
                 didCompleteInitialLoad = true
-                restoreLastSelectedSessionIfNeeded()
             }
             .task(id: remoteSearchTaskID) {
                 await viewModel.searchSessions(query: searchText, content: true, depth: 5)
@@ -1172,36 +1167,18 @@ struct SessionListView: View {
 
     private func selectRootDestination(_ destination: SessionNavigationDestination) {
         navigationState.select(destination)
-        if case .session = destination {
-            persistLastSelectedSession()
-        }
     }
 
     private func selectSession(_ session: SessionSummary) {
         navigationState.select(session)
-        persistLastSelectedSession()
     }
 
     private func rememberCreatedSession(_ session: SessionSummary) {
         navigationState.remember(session)
-        persistLastSelectedSession()
     }
 
     private func removeSessionFromNavigation(_ session: SessionSummary) {
         navigationState.remove(sessionID: session.sessionId)
-        persistLastSelectedSession()
-    }
-
-    private func restoreLastSelectedSessionIfNeeded() {
-        navigationState.restoreIfNeeded(
-            from: viewModel.sessions,
-            clearsMissingSelection: viewModel.sessionLoadError == nil
-        )
-        persistLastSelectedSession()
-    }
-
-    private func persistLastSelectedSession() {
-        SessionNavigationPersistence.save(navigationState.lastSelectedSessionID, for: server)
     }
 
 }
