@@ -101,6 +101,64 @@ final class SessionIdentityTests: XCTestCase {
         )
     }
 
+    func testSessionRowRelativeDateAdvancesWithTimelineDate() throws {
+        let session = SessionSummary(
+            sessionId: "recent",
+            lastMessageAt: 1_770_000_000
+        )
+        let firstTimelineDate = Date(timeIntervalSince1970: 1_770_000_030)
+        let laterTimelineDate = Date(timeIntervalSince1970: 1_770_000_090)
+
+        let firstLabel = try XCTUnwrap(
+            SessionRowView.relativeDate(for: session, relativeTo: firstTimelineDate)
+        )
+        let laterLabel = try XCTUnwrap(
+            SessionRowView.relativeDate(for: session, relativeTo: laterTimelineDate)
+        )
+
+        XCTAssertNotEqual(firstLabel, laterLabel)
+        XCTAssertEqual(SessionRowView.relativeDateRefreshInterval, 1)
+    }
+
+    @MainActor
+    func testSessionListSectionsSeparatePinnedTodayYesterdayThisWeekAndEarlier() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        calendar.firstWeekday = 2
+        let now = try XCTUnwrap(
+            calendar.date(from: DateComponents(year: 2026, month: 7, day: 23, hour: 12))
+        )
+        func timestamp(day: Int, hour: Int = 12) throws -> Double {
+            try XCTUnwrap(
+                calendar.date(from: DateComponents(year: 2026, month: 7, day: day, hour: hour))
+            ).timeIntervalSince1970
+        }
+
+        let sections = SessionListViewModel.makeSections(
+            for: [
+                SessionSummary(sessionId: "earlier", lastMessageAt: try timestamp(day: 19)),
+                SessionSummary(sessionId: "today-older", lastMessageAt: try timestamp(day: 23, hour: 8)),
+                SessionSummary(sessionId: "week", lastMessageAt: try timestamp(day: 21)),
+                SessionSummary(sessionId: "pinned", lastMessageAt: try timestamp(day: 1), pinned: true),
+                SessionSummary(sessionId: "yesterday", lastMessageAt: try timestamp(day: 22)),
+                SessionSummary(sessionId: "today-newer", lastMessageAt: try timestamp(day: 23, hour: 10)),
+                SessionSummary(sessionId: "missing-date")
+            ],
+            relativeTo: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(sections.map(\.kind), [.pinned, .today, .yesterday, .thisWeek, .earlier])
+        XCTAssertEqual(sections[0].sessions.compactMap(\.sessionId), ["pinned"])
+        XCTAssertEqual(
+            sections[1].sessions.compactMap(\.sessionId),
+            ["today-newer", "today-older"]
+        )
+        XCTAssertEqual(sections[2].sessions.compactMap(\.sessionId), ["yesterday"])
+        XCTAssertEqual(sections[3].sessions.compactMap(\.sessionId), ["week"])
+        XCTAssertEqual(sections[4].sessions.compactMap(\.sessionId), ["earlier", "missing-date"])
+    }
+
     func testSessionSummaryFallbackIDIsDeterministicWithoutSessionID() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -159,22 +217,28 @@ final class SessionSidebarDisclosureSettingsTests: XCTestCase {
     func testDisclosureStatesDefaultToCollapsedWhenUnset() {
         XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey))
         XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey))
+        XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.scheduledSessionsAreExpandedKey))
         XCTAssertFalse(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
         XCTAssertFalse(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
+        XCTAssertFalse(SessionSidebarDisclosureSettings.scheduledSessionsAreExpanded(in: defaults))
     }
 
     func testDisclosureStatesRoundTripThroughUserDefaults() {
         defaults.set(true, forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey)
         defaults.set(false, forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey)
+        defaults.set(true, forKey: SessionSidebarDisclosureSettings.scheduledSessionsAreExpandedKey)
 
         XCTAssertTrue(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
         XCTAssertFalse(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
+        XCTAssertTrue(SessionSidebarDisclosureSettings.scheduledSessionsAreExpanded(in: defaults))
 
         defaults.set(false, forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey)
         defaults.set(true, forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey)
+        defaults.set(false, forKey: SessionSidebarDisclosureSettings.scheduledSessionsAreExpandedKey)
 
         XCTAssertFalse(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
         XCTAssertTrue(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
+        XCTAssertFalse(SessionSidebarDisclosureSettings.scheduledSessionsAreExpanded(in: defaults))
     }
 }
 

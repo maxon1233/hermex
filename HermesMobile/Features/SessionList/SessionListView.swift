@@ -18,6 +18,7 @@ struct SessionListView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.scenePhase) private var scenePhase
     @State private var viewModel: SessionListViewModel
     @State private var navigationState: SessionNavigationState
     @State private var sessionPendingRename: SessionSummary?
@@ -40,6 +41,8 @@ struct SessionListView: View {
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
     @AppStorage(SessionSidebarDisclosureSettings.projectsAreExpandedKey)
     private var projectsAreExpanded = SessionSidebarDisclosureSettings.defaultProjectsAreExpanded
+    @AppStorage(SessionSidebarDisclosureSettings.scheduledSessionsAreExpandedKey)
+    private var scheduledSessionsAreExpanded = SessionSidebarDisclosureSettings.defaultScheduledSessionsAreExpanded
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
     @AppStorage(SessionRowDisplaySettings.showCronSessionsKey) private var showsCronSessions = true
@@ -70,11 +73,7 @@ struct SessionListView: View {
         _pendingDeepLinkedSessionID = pendingDeepLinkedSessionID
         _requestedNewChat = requestedNewChat
         _viewModel = State(initialValue: SessionListViewModel(server: server))
-        _navigationState = State(
-            initialValue: SessionNavigationState(
-                lastSelectedSessionID: SessionNavigationPersistence.load(for: server)
-            )
-        )
+        _navigationState = State(initialValue: SessionNavigationState())
         _showsCliSessions = AppStorage(
             wrappedValue: SessionRowDisplaySettings.showsCliSessions(for: server),
             SessionRowDisplaySettings.showCliSessionsKey(for: server)
@@ -90,6 +89,7 @@ struct SessionListView: View {
             .sheet(item: $sessionExportShareItem) { item in
                 SessionExportShareSheet(fileURL: item.fileURL)
                     .presentationDetents([.medium, .large])
+                    .adaptiveFormPresentation()
                     .ignoresSafeArea()
                     // The temp file lives in its own UUID directory (see
                     // SessionListViewModel.export); remove the directory once
@@ -190,7 +190,6 @@ struct SessionListView: View {
             .task {
                 await refreshSessionsAndActiveProfile()
                 didCompleteInitialLoad = true
-                restoreLastSelectedSessionIfNeeded()
             }
             .task(id: remoteSearchTaskID) {
                 await viewModel.searchSessions(query: searchText, content: true, depth: 5)
@@ -202,7 +201,6 @@ struct SessionListView: View {
                 openPendingSharedImportIfNeeded()
                 openPendingDeepLinkedSessionIfNeeded()
                 openRequestedNewChatIfNeeded()
-                refreshAfterReturningIfNeeded()
             }
             .onChange(of: pendingSharedImport) {
                 openPendingSharedImportIfNeeded()
@@ -214,6 +212,11 @@ struct SessionListView: View {
                 openRequestedNewChatIfNeeded()
             }
             .onChange(of: navigationState.destination) { oldValue, newValue in
+                let shouldRefresh = SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                    from: oldValue,
+                    to: newValue
+                )
+
                 if case .newChat = oldValue,
                    case .newChat = newValue {
                     return
@@ -221,6 +224,17 @@ struct SessionListView: View {
 
                 if case .newChat = oldValue {
                     viewModel.removeEmptySidebarPlaceholders()
+                }
+
+                guard shouldRefresh, didCompleteInitialLoad else { return }
+                Task {
+                    await loadSessions()
+                }
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                guard newPhase == .active, didCompleteInitialLoad else { return }
+                Task {
+                    await loadSessions()
                 }
             }
             .refreshable {
@@ -239,6 +253,7 @@ struct SessionListView: View {
                     }
                 )
             )
+            .focusedSceneValue(\.hermexSceneActions, sceneActions)
     }
 
     @ViewBuilder
@@ -335,6 +350,17 @@ struct SessionListView: View {
                 InsightsView(server: server, onAPIError: authManager.handleAPIError)
             case .archived:
                 ArchivedSessionsView(server: server, onAPIError: authManager.handleAPIError)
+            case .scheduled:
+                ScheduledSessionsView(
+                    viewModel: viewModel,
+                    showsCronSessions: showsCronSessions,
+                    showsMessageCount: showsSessionMessageCount,
+                    showsWorkspace: showsSessionWorkspace,
+                    selectedSessionID: horizontalSizeClass == .regular
+                        ? navigationState.selectedSessionID
+                        : nil,
+                    actions: sessionRowActions
+                )
             }
         }
         .adaptiveSecondaryNavigationTitle()
@@ -383,9 +409,26 @@ struct SessionListView: View {
                 )
             }
 
+            if scheduledSessionGroups.showsDisclosure(isSearchActive: isSearchingSessions) {
+                ScheduledSessionsDisclosure(
+                    viewModel: viewModel,
+                    sessions: scheduledSessionGroups.scheduled,
+                    totalCount: scheduledSessionGroups.totalScheduledCount,
+                    isSearchActive: isSearchingSessions,
+                    showsMessageCount: showsSessionMessageCount,
+                    showsWorkspace: showsSessionWorkspace,
+                    selectedSessionID: horizontalSizeClass == .regular
+                        ? navigationState.selectedSessionID
+                        : nil,
+                    userIsExpanded: $scheduledSessionsAreExpanded,
+                    actions: sessionRowActions,
+                    viewAll: { navigationState.select(.scheduled) }
+                )
+            }
+
             SessionListRowsSection(
                 viewModel: viewModel,
-                sessions: visibleSessions,
+                sessions: scheduledSessionGroups.ordinary,
                 emptyTitle: emptySessionsTitle,
                 emptyDescription: emptySessionsDescription,
                 isSearchActive: isSearchingSessions,
@@ -394,7 +437,8 @@ struct SessionListView: View {
                 selectedSessionID: horizontalSizeClass == .regular
                     ? navigationState.selectedSessionID
                     : nil,
-                actions: sessionRowActions
+                actions: sessionRowActions,
+                suppressEmptyState: !scheduledSessionGroups.scheduled.isEmpty
             )
 
             if showsArchivedEntry {
@@ -420,6 +464,7 @@ struct SessionListView: View {
         // so insert/remove animates. Value-based so it works with @AppStorage.
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: profilesAreExpanded)
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
+        .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: scheduledSessionsAreExpanded)
     }
 
     private var header: some View {
@@ -609,6 +654,14 @@ struct SessionListView: View {
 
     private var visibleSessions: [SessionSummary] {
         viewModel.visibleSessions(
+            searchText: searchText,
+            selectedProjectID: selectedProjectID,
+            automatedVisibility: automatedSessionVisibility
+        )
+    }
+
+    private var scheduledSessionGroups: ScheduledSessionGroups {
+        viewModel.scheduledSessionGroups(
             searchText: searchText,
             selectedProjectID: selectedProjectID,
             automatedVisibility: automatedSessionVisibility
@@ -851,6 +904,32 @@ struct SessionListView: View {
         searchFieldIsFocused = true
     }
 
+    private var sceneActions: HermexSceneActions {
+        HermexSceneActions(
+            canCreateNewChat: !viewModel.isViewingCachedData && !navigationState.isCreatingNewChat,
+            createNewChat: openNewChatFromKeyboard,
+            searchSessions: openSearchFromKeyboard
+        )
+    }
+
+    private func openNewChatFromKeyboard() {
+        guard !viewModel.isViewingCachedData, !navigationState.isCreatingNewChat else { return }
+        openNewChat()
+    }
+
+    private func openSearchFromKeyboard() {
+        searchFieldIsFocused = false
+
+        if horizontalSizeClass != .regular {
+            navigationState.clearDestination()
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            openSearch()
+        }
+    }
+
     private func handleSearchFieldFocusChange(_ isFocused: Bool) {
         guard isFocused else {
             isSearchFocused = false
@@ -864,14 +943,6 @@ struct SessionListView: View {
         }
 
         isSearchFocused = true
-    }
-
-    private func refreshAfterReturningIfNeeded() {
-        guard didCompleteInitialLoad else { return }
-
-        Task {
-            await refreshSessionsAndActiveProfile()
-        }
     }
 
     private func monitorActiveSessionRows() async {
@@ -1081,29 +1152,14 @@ struct SessionListView: View {
 
     private func selectSession(_ session: SessionSummary) {
         navigationState.select(session)
-        persistLastSelectedSession()
     }
 
     private func rememberCreatedSession(_ session: SessionSummary) {
         navigationState.remember(session)
-        persistLastSelectedSession()
     }
 
     private func removeSessionFromNavigation(_ session: SessionSummary) {
         navigationState.remove(sessionID: session.sessionId)
-        persistLastSelectedSession()
-    }
-
-    private func restoreLastSelectedSessionIfNeeded() {
-        navigationState.restoreIfNeeded(
-            from: viewModel.sessions,
-            clearsMissingSelection: viewModel.sessionLoadError == nil
-        )
-        persistLastSelectedSession()
-    }
-
-    private func persistLastSelectedSession() {
-        SessionNavigationPersistence.save(navigationState.lastSelectedSessionID, for: server)
     }
 
 }
@@ -1201,6 +1257,7 @@ enum SessionListUtilityDestination: Hashable, Identifiable {
     case insights
     /// Archived sessions screen (issue #17), also reachable from Settings.
     case archived
+    case scheduled
 
     var id: Self { self }
 }

@@ -287,6 +287,9 @@ struct ChatView: View {
     @State private var followScrollGeneration = 0
     @State private var isUserInteractingWithScroll = false
     @State private var userScrollCooldownUntil: Date?
+    @State private var latestObservedScrollMetrics: ChatScrollMetrics?
+    @State private var lastKnownTranscriptScrollPosition: ChatTranscriptScrollPosition?
+    @State private var initialTranscriptScrollPosition: ChatTranscriptScrollPosition?
     /// While set and in the future, auto-follow scrolls snap instead of animating, so
     /// the cache-first → network reconcile re-pins to the bottom without a jump (#289).
     @State private var cacheFirstSnapUntil: Date?
@@ -336,12 +339,21 @@ struct ChatView: View {
         self.onAPIError = onAPIError
         self.loadsInitialMessages = loadsInitialMessages
         self.autoStartsVoiceInput = autoStartsVoiceInput
+        let storedScrollPosition = ChatTranscriptScrollPersistence.load(
+            for: server,
+            sessionID: session.id
+        )
         _draftMessage = State(initialValue: ChatComposerDraftPersistence.initialDraft(
             initialDraft,
             for: session.sessionId,
             server: server
         ))
         _initialAttachments = State(initialValue: initialAttachments)
+        _isScrolledNearBottom = State(initialValue: storedScrollPosition == nil)
+        _isReadingOlderTranscript = State(initialValue: storedScrollPosition != nil)
+        _shouldFollowLatestMessage = State(initialValue: storedScrollPosition == nil)
+        _lastKnownTranscriptScrollPosition = State(initialValue: storedScrollPosition)
+        _initialTranscriptScrollPosition = State(initialValue: storedScrollPosition)
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
             server: server,
@@ -628,14 +640,7 @@ struct ChatView: View {
             .onChange(of: showsLiveActivityResponseExcerpts) {
                 viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
             }
-            .onDisappear {
-                saveComposerDraft(draftMessage)
-                activeStreamStatusRefreshTask?.cancel()
-                activeStreamStatusRefreshTask = nil
-                viewModel.stopListening()
-                viewModel.suspendStreamForNavigation()
-                viewModel.cleanupPollingTasks()
-            }
+            .onDisappear(perform: handleDisappear)
             .onAppear {
                 Task {
                     await viewModel.reconnectStreamIfNeeded(modelContext: modelContext)
@@ -1101,6 +1106,7 @@ struct ChatView: View {
             errorMessage: viewModel.errorMessage,
             messages: viewModel.messages,
             displayedTranscriptMessages: displayedTranscriptMessages,
+            initialScrollPosition: initialTranscriptScrollPosition,
             compressionReferenceCard: viewModel.compressionReferenceCard,
             reasoningGroups: viewModel.displayedReasoningGroups,
             completedToolCallGroupsForAnchor: { anchorMessageID in
@@ -1170,6 +1176,8 @@ struct ChatView: View {
             onScrollToLatestContent: { proxy, animated in
                 scrollToLatestContent(proxy, animated: animated)
             },
+            onInitialScrollPositionResolution: handleInitialScrollPositionResolution,
+            onReadingPositionChange: handleReadingPositionChange,
             onPreviewAttachment: { attachment, localData in
                 presentPreviewRestoringComposerFocusIfNeeded {
                     attachmentPreviewItem = ChatAttachmentPreviewItem(message: attachment, localData: localData)
@@ -1831,6 +1839,7 @@ struct ChatView: View {
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         switch phase {
         case .background:
+            persistTranscriptScrollPosition()
             if viewModel.activeStreamID != nil {
                 beginResponseCompletionBackgroundTask()
             }
@@ -1845,7 +1854,7 @@ struct ChatView: View {
                 }
             }
         case .inactive:
-            break
+            persistTranscriptScrollPosition()
         @unknown default:
             break
         }
@@ -2094,6 +2103,20 @@ struct ChatView: View {
     }
 
     private func updateScrollMetrics(_ metrics: ChatScrollMetrics) {
+        latestObservedScrollMetrics = metrics
+
+        // Initial layout starts at the bottom before the persisted anchor is
+        // restored. Ignore those transient metrics so cache reconciliation
+        // cannot re-enable follow-bottom and overwrite the pending restoration.
+        guard initialTranscriptScrollPosition == nil else {
+            isUserInteractingWithScroll = metrics.isUserInteracting
+            return
+        }
+
+        applyResolvedScrollMetrics(metrics)
+    }
+
+    private func applyResolvedScrollMetrics(_ metrics: ChatScrollMetrics) {
         let isStreaming = viewModel.activeStreamID != nil
         let isNearBottom = ChatScrollPolicy.isNearBottom(
             distanceFromBottom: metrics.distanceFromBottom,
@@ -2127,6 +2150,51 @@ struct ChatView: View {
                 }
             }
         }
+    }
+
+    private func handleReadingPositionChange(_ position: ChatTranscriptScrollPosition?) {
+        guard let position, position != lastKnownTranscriptScrollPosition else { return }
+        lastKnownTranscriptScrollPosition = position
+        ChatTranscriptScrollPersistence.save(
+            position,
+            for: server,
+            sessionID: session.id
+        )
+    }
+
+    private func handleInitialScrollPositionResolution(_ restored: Bool) {
+        initialTranscriptScrollPosition = nil
+
+        if let latestObservedScrollMetrics {
+            applyResolvedScrollMetrics(latestObservedScrollMetrics)
+        } else if !restored {
+            shouldFollowLatestMessage = true
+            isReadingOlderTranscript = false
+            isScrolledNearBottom = true
+        }
+
+        // A fallback caused by unavailable/changed history deliberately keeps
+        // the last persisted anchor. A later online reopen can still restore
+        // it; an explicit user scroll will replace it through the live viewport
+        // callback.
+    }
+
+    private func handleDisappear() {
+        saveComposerDraft(draftMessage)
+        persistTranscriptScrollPosition()
+        activeStreamStatusRefreshTask?.cancel()
+        activeStreamStatusRefreshTask = nil
+        viewModel.stopListening()
+        viewModel.suspendStreamForNavigation()
+        viewModel.cleanupPollingTasks()
+    }
+
+    private func persistTranscriptScrollPosition() {
+        ChatTranscriptScrollPersistence.save(
+            lastKnownTranscriptScrollPosition,
+            for: server,
+            sessionID: session.id
+        )
     }
 
     private var isAutoFollowScrollPaused: Bool {

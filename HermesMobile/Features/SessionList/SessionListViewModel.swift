@@ -4,10 +4,11 @@ import SwiftData
 import SwiftUI
 
 struct SessionListSection: Identifiable {
-    enum Kind: String {
+    enum Kind: String, Equatable {
         case pinned
         case today
         case yesterday
+        case thisWeek
         case earlier
     }
 
@@ -16,6 +17,24 @@ struct SessionListSection: Identifiable {
     let sessions: [SessionSummary]
 
     var id: String { kind.rawValue }
+}
+
+struct ScheduledSessionGroups: Equatable {
+    let ordinary: [SessionSummary]
+    let scheduled: [SessionSummary]
+    let totalScheduledCount: Int
+
+    var scheduledPreview: [SessionSummary] {
+        Array(scheduled.prefix(5))
+    }
+
+    var hasAdditionalScheduledSessions: Bool {
+        scheduled.count > scheduledPreview.count
+    }
+
+    func showsDisclosure(isSearchActive: Bool) -> Bool {
+        totalScheduledCount > 0 && (!isSearchActive || !scheduled.isEmpty)
+    }
 }
 
 enum ActiveSessionStateRefreshResult: Equatable {
@@ -97,30 +116,53 @@ final class SessionListViewModel {
     }()
 
     var sections: [SessionListSection] {
+        Self.makeSections(for: sessions)
+    }
+
+    static func makeSections(
+        for sessions: [SessionSummary],
+        relativeTo now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [SessionListSection] {
         let sortedSessions = sessions.sorted { left, right in
             timestamp(for: left) > timestamp(for: right)
         }
         let pinned = sortedSessions.filter { $0.pinned == true }
         let unpinned = sortedSessions.filter { $0.pinned != true }
 
-        let calendar = Calendar.current
-        let today = unpinned.filter { session in
-            guard let date = date(for: session) else { return false }
-            return calendar.isDateInToday(date)
-        }
-        let yesterday = unpinned.filter { session in
-            guard let date = date(for: session) else { return false }
-            return calendar.isDateInYesterday(date)
-        }
-        let earlier = unpinned.filter { session in
-            guard let date = date(for: session) else { return true }
-            return !calendar.isDateInToday(date) && !calendar.isDateInYesterday(date)
+        let startOfToday = calendar.startOfDay(for: now)
+        let startOfYesterday = calendar.date(byAdding: .day, value: -1, to: startOfToday)
+            ?? startOfToday
+        let startOfWeek = calendar.dateInterval(of: .weekOfYear, for: now)?.start
+            ?? startOfYesterday
+
+        var today: [SessionSummary] = []
+        var yesterday: [SessionSummary] = []
+        var thisWeek: [SessionSummary] = []
+        var earlier: [SessionSummary] = []
+
+        for session in unpinned {
+            guard let date = date(for: session) else {
+                earlier.append(session)
+                continue
+            }
+
+            if date >= startOfToday {
+                today.append(session)
+            } else if date >= startOfYesterday {
+                yesterday.append(session)
+            } else if date >= startOfWeek {
+                thisWeek.append(session)
+            } else {
+                earlier.append(session)
+            }
         }
 
         return [
             SessionListSection(kind: .pinned, title: String(localized: "Pinned"), sessions: pinned),
             SessionListSection(kind: .today, title: String(localized: "Today"), sessions: today),
             SessionListSection(kind: .yesterday, title: String(localized: "Yesterday"), sessions: yesterday),
+            SessionListSection(kind: .thisWeek, title: String(localized: "This Week"), sessions: thisWeek),
             SessionListSection(kind: .earlier, title: String(localized: "Earlier"), sessions: earlier)
         ]
         .filter { !$0.sessions.isEmpty }
@@ -161,6 +203,31 @@ final class SessionListViewModel {
         }
 
         return sortedLocalMatches + Self.sortedSessions(remoteMatches)
+    }
+
+    func scheduledSessionGroups(
+        searchText: String,
+        selectedProjectID: String?,
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> ScheduledSessionGroups {
+        let ordinaryCandidates = visibleSessions(
+            searchText: searchText,
+            selectedProjectID: selectedProjectID,
+            automatedVisibility: automatedVisibility
+        )
+        let scheduledCandidates = visibleSessions(
+            searchText: searchText,
+            selectedProjectID: selectedProjectID,
+            automatedVisibility: automatedVisibility
+        )
+
+        return ScheduledSessionGroups(
+            ordinary: ordinaryCandidates.filter { !$0.isCronSession },
+            scheduled: scheduledCandidates.filter { $0.isCronSession && $0.archived != true },
+            totalScheduledCount: automatedVisibility.showsCron
+                ? sessions.filter { $0.isCronSession && $0.archived != true }.count
+                : 0
+        )
     }
 
     @discardableResult
@@ -928,6 +995,12 @@ final class SessionListViewModel {
         session.lastMessageAt ?? session.updatedAt ?? session.createdAt ?? 0
     }
 
+    private static func date(for session: SessionSummary) -> Date? {
+        let value = timestamp(for: session)
+        guard value.isFinite, value > 0 else { return nil }
+        return Date(timeIntervalSince1970: value)
+    }
+
     private static func searchableText(for session: SessionSummary) -> String {
         [
             session.title,
@@ -986,12 +1059,6 @@ final class SessionListViewModel {
 
     private func timestamp(for session: SessionSummary) -> Double {
         Self.timestamp(for: session)
-    }
-
-    private func date(for session: SessionSummary) -> Date? {
-        let value = timestamp(for: session)
-        guard value > 0 else { return nil }
-        return Date(timeIntervalSince1970: value)
     }
 
     private func duplicateTitle(for session: SessionSummary) -> String {
