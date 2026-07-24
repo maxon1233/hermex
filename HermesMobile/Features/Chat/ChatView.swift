@@ -343,7 +343,11 @@ struct ChatView: View {
             for: server,
             sessionID: session.id
         )
-        _draftMessage = State(initialValue: initialDraft)
+        _draftMessage = State(initialValue: ChatComposerDraftPersistence.initialDraft(
+            initialDraft,
+            for: session.sessionId,
+            server: server
+        ))
         _initialAttachments = State(initialValue: initialAttachments)
         _isScrolledNearBottom = State(initialValue: storedScrollPosition == nil)
         _isReadingOlderTranscript = State(initialValue: storedScrollPosition != nil)
@@ -502,6 +506,9 @@ struct ChatView: View {
         // The composer flips wholesale with the transcript under the RTL
         // toggle (#259): input, placeholder, and chrome mirror together.
         .environment(\.layoutDirection, chatLayoutDirection)
+        .onChange(of: draftMessage) { _, newDraft in
+            saveComposerDraft(newDraft)
+        }
         .background(
             NavigationAppearanceCompletionObserver(action: handleInitialAppearanceCompletion)
                 .allowsHitTesting(false)
@@ -1379,6 +1386,14 @@ struct ChatView: View {
         return didLoad
     }
 
+    private func saveComposerDraft(_ draft: String) {
+        ChatComposerDraftPersistence.save(
+            draft,
+            for: session.sessionId,
+            server: server
+        )
+    }
+
     private func submitGoalDraft(_ submittedGoal: String) async {
         await submitGoal(submittedGoal, clearsDraftOnSuccess: true)
     }
@@ -2165,6 +2180,7 @@ struct ChatView: View {
     }
 
     private func handleDisappear() {
+        saveComposerDraft(draftMessage)
         persistTranscriptScrollPosition()
         activeStreamStatusRefreshTask?.cancel()
         activeStreamStatusRefreshTask = nil
