@@ -354,17 +354,39 @@ struct SessionListRowsSection: View {
                 .padding(.horizontal, 24)
                 .sessionsScreenListRow()
         } else {
-            ForEach(sessions) { session in
-                SessionInteractiveRow(
-                    viewModel: viewModel,
-                    session: session,
-                    showsMessageCount: showsMessageCount,
-                    showsWorkspace: showsWorkspace,
-                    selectedSessionID: selectedSessionID,
-                    actions: actions
-                )
+            ForEach(Array(groupedSections.enumerated()), id: \.element.id) { index, section in
+                sessionGroupHeader(section.title, isFirst: index == 0)
+
+                ForEach(section.sessions) { session in
+                    SessionInteractiveRow(
+                        viewModel: viewModel,
+                        session: session,
+                        showsMessageCount: showsMessageCount,
+                        showsWorkspace: showsWorkspace,
+                        selectedSessionID: selectedSessionID,
+                        actions: actions
+                    )
+                }
             }
         }
+    }
+
+    private var groupedSections: [SessionListSection] {
+        SessionListViewModel.makeSections(for: sessions)
+    }
+
+    private func sessionGroupHeader(_ title: String, isFirst: Bool) -> some View {
+        Text(title)
+            .font(.caption.weight(.bold))
+            .tracking(1.2)
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 24)
+            .padding(.top, isFirst ? 0 : 14)
+            .padding(.bottom, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
+            .sessionsScreenListRow()
     }
 
     private var sessionsHeaderRow: some View {

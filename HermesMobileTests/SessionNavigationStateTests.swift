@@ -157,6 +157,58 @@ final class SessionNavigationStateTests: XCTestCase {
         )
     }
 
+    func testRefreshPolicyReloadsAfterReturningFromExistingSession() {
+        let session = SessionSummary(sessionId: "session-1")
+
+        XCTAssertTrue(
+            SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                from: .session(session),
+                to: nil
+            )
+        )
+    }
+
+    func testRefreshPolicyReloadsAfterReturningFromNewSession() {
+        let route = PendingNewChatRoute()
+
+        XCTAssertTrue(
+            SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                from: .newChat(route),
+                to: nil
+            )
+        )
+    }
+
+    func testRefreshPolicyReloadsWhenSwitchingDetails() {
+        let first = SessionSummary(sessionId: "session-1")
+        let second = SessionSummary(sessionId: "session-2")
+
+        XCTAssertTrue(
+            SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                from: .session(first),
+                to: .session(second)
+            )
+        )
+    }
+
+    func testRefreshPolicySkipsInitialSelectionAndUnchangedDestination() {
+        let session = SessionSummary(sessionId: "session-1")
+        let destination = SessionNavigationDestination.session(session)
+
+        XCTAssertFalse(
+            SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                from: nil,
+                to: destination
+            )
+        )
+        XCTAssertFalse(
+            SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
+                from: destination,
+                to: destination
+            )
+        )
+    }
+
     func testReadableContentWidthsKeepSecondaryAndWorkspaceSurfacesDistinct() {
         XCTAssertEqual(AdaptiveReadableContentWidth.secondaryDestination, 800)
         XCTAssertEqual(AdaptiveReadableContentWidth.workspace, 1_000)
