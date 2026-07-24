@@ -4,11 +4,22 @@ import UIKit
 struct ChatTranscriptView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var transcriptScrollPosition = ScrollPosition(idType: String.self)
+    @State private var rowContentFrames: [ChatTranscriptRowContentFrame] = []
+    @State private var latestScrollGeometry: ChatTranscriptScrollGeometrySnapshot?
+    @State private var hasCompletedInitialScrollResolution = false
+    @State private var isLoadingInitialAnchorPage = false
+    @State private var initialAnchorPageLoadFailed = false
+    @State private var restorationLock: ChatTranscriptRestorationLock?
+    @State private var restorationVerificationGeneration = 0
+    @State private var restorationVerificationStartedAt: Date?
+    @State private var pendingFollowLatestAfterInitialRestoration = false
 
     let isLoading: Bool
     let errorMessage: String?
     let messages: [ChatMessage]
     let displayedTranscriptMessages: [TranscriptMessage]
+    let initialScrollPosition: ChatTranscriptScrollPosition?
     let compressionReferenceCard: CompressionReferenceCard?
     let reasoningGroups: [ReasoningGroup]
     let completedToolCallGroupsForAnchor: (String?) -> [ToolCallGroup]
@@ -58,6 +69,8 @@ struct ChatTranscriptView: View {
     let onScrollToBottom: (ScrollViewProxy) -> Void
     let onScrollToLatestTranscriptMessage: (ScrollViewProxy) -> Void
     let onScrollToLatestContent: (ScrollViewProxy, Bool) -> Void
+    let onInitialScrollPositionResolution: (Bool) -> Void
+    let onReadingPositionChange: (ChatTranscriptScrollPosition?) -> Void
     let onPreviewAttachment: (MessageAttachment, Data?) -> Void
     let onPreviewTranscriptMedia: (TranscriptMediaReference) -> Void
     let onToggleListening: (MessageActionContext) -> Void
@@ -120,6 +133,33 @@ struct ChatTranscriptView: View {
                             contentWidth: contentWidth
                         )
                     }
+                    .scrollPosition($transcriptScrollPosition)
+                    .onScrollGeometryChange(
+                        for: ChatTranscriptScrollGeometrySnapshot.self,
+                        of: { geometry in
+                            ChatTranscriptScrollGeometrySnapshot(
+                                visibleContentOffsetY: Double(
+                                    geometry.contentOffset.y
+                                        + geometry.contentInsets.top
+                                ),
+                                contentHeight: Double(geometry.contentSize.height),
+                                visibleContainerHeight: Double(
+                                    geometry.containerSize.height
+                                ),
+                                topContentInset: Double(geometry.contentInsets.top)
+                            )
+                        },
+                        action: { _, newGeometry in
+                            handleScrollGeometryChange(newGeometry)
+                        }
+                    )
+                    .onScrollPhaseChange { _, newPhase in
+                        guard hasCompletedInitialScrollResolution,
+                              newPhase == .tracking || newPhase == .interacting else {
+                            return
+                        }
+                        releaseRestorationLockForUserScroll()
+                    }
                     .frame(width: viewportWidth)
                     .refreshable {
                         if hasOlderMessages {
@@ -146,16 +186,45 @@ struct ChatTranscriptView: View {
                         ChatScrollToBottomButton(
                             bottomPadding: scrollToBottomButtonBottomPadding,
                             onTap: {
+                                releaseRestorationLockForProgrammaticScroll()
                                 onScrollToBottom(proxy)
                             }
                         )
                         .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
                     }
                 }
+                .opacity(hasCompletedInitialScrollResolution ? 1 : 0)
+                .accessibilityIdentifier("chat-transcript-viewport")
+                .overlay {
+                    if !hasCompletedInitialScrollResolution {
+                        ProgressView()
+                            .accessibilityLabel("Restoring conversation position")
+                    }
+                }
                 .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: showsScrollToBottomButton)
                 .background(Color(.systemBackground))
                 .onAppear {
-                    onScrollToLatestContent(proxy, false)
+                    resolveInitialScrollPositionIfReady()
+                }
+                .onChange(of: isLoading) { _, _ in
+                    resolveInitialScrollPositionIfReady()
+                }
+                .onChange(of: isLoadingOlderMessages) { _, _ in
+                    resolveInitialScrollPositionIfReady()
+                }
+                .onChange(of: hasOlderMessages) { _, _ in
+                    resolveInitialScrollPositionIfReady()
+                }
+                .onChange(of: isLoadingInitialAnchorPage) { _, isLoadingPage in
+                    guard !isLoadingPage else { return }
+                    if initialAnchorPageLoadFailed {
+                        fallBackFromMissingInitialAnchor()
+                    } else {
+                        resolveInitialScrollPositionIfReady()
+                    }
+                }
+                .onPreferenceChange(ChatTranscriptRowFramesPreferenceKey.self) { frames in
+                    handleRowContentFramesChange(frames)
                 }
                 .onChange(of: messages.count) {
                     guard shouldFollowLatestMessage else { return }
@@ -177,6 +246,19 @@ struct ChatTranscriptView: View {
                     // animation) unless the reader has scrolled away in the meantime.
                     guard shouldFollowLatestMessage else { return }
                     onScrollToLatestContent(proxy, false)
+                }
+                .onChange(of: shouldFollowLatestMessage) { _, shouldFollow in
+                    guard hasCompletedInitialScrollResolution else {
+                        pendingFollowLatestAfterInitialRestoration = shouldFollow
+                        return
+                    }
+
+                    pendingFollowLatestAfterInitialRestoration = false
+                    guard shouldFollow,
+                          restorationLock?.preservesStoredPosition != true else {
+                        return
+                    }
+                    releaseRestorationLockForProgrammaticScroll()
                 }
                 .onChange(of: clarificationPrompt?.id) {
                     guard clarificationPrompt != nil, shouldFollowLatestMessage else { return }
@@ -250,6 +332,26 @@ struct ChatTranscriptView: View {
                 )
                 .equatable()
                 .id(transcriptMessage.renderID)
+                .background {
+                    GeometryReader { geometry in
+                        let frame = geometry.frame(
+                            in: .named(ChatTranscriptContentCoordinateSpace.name)
+                        )
+                        Color.clear.preference(
+                            key: ChatTranscriptRowFramesPreferenceKey.self,
+                            value: [
+                                ChatTranscriptRowContentFrame(
+                                    renderID: transcriptMessage.renderID,
+                                    messageID: ChatTranscriptMessageIdentity.resolve(
+                                        for: transcriptMessage.message
+                                    ),
+                                    minY: frame.minY,
+                                    maxY: frame.maxY
+                                )
+                            ]
+                        )
+                    }
+                }
 
                 if let compressionReferenceCard,
                    compressionReferenceCard.afterRenderID == transcriptMessage.renderID {
@@ -274,16 +376,332 @@ struct ChatTranscriptView: View {
         .padding(.horizontal, transcriptHorizontalPadding)
         .frame(width: viewportWidth, alignment: .leading)
         .clipped()
+        .coordinateSpace(name: ChatTranscriptContentCoordinateSpace.name)
         .background {
             ZStack {
-                ChatScrollObserver(isStreaming: activeStreamID != nil) { metrics in
-                    onUpdateScrollMetrics(metrics)
-                }
+                ChatScrollObserver(
+                    isStreaming: activeStreamID != nil,
+                    onMetrics: onUpdateScrollMetrics
+                )
 
                 ChatVerticalScrollAxisGuard()
             }
             .accessibilityHidden(true)
         }
+    }
+
+    private func handleScrollGeometryChange(
+        _ geometry: ChatTranscriptScrollGeometrySnapshot
+    ) {
+        latestScrollGeometry = geometry
+
+        if hasCompletedInitialScrollResolution {
+            maintainCompletedRestorationLockOrPublish()
+            return
+        }
+
+        resolveInitialScrollPositionIfReady()
+    }
+
+    private func handleRowContentFramesChange(
+        _ frames: [ChatTranscriptRowContentFrame]
+    ) {
+        rowContentFrames = frames
+
+        if hasCompletedInitialScrollResolution {
+            maintainCompletedRestorationLockOrPublish()
+            return
+        }
+
+        resolveInitialScrollPositionIfReady(frames: frames)
+    }
+
+    private func publishReadingPosition(
+        geometry: ChatTranscriptScrollGeometrySnapshot,
+        frames: [ChatTranscriptRowContentFrame]
+    ) {
+        onReadingPositionChange(
+            ChatTranscriptReadingPositionResolver.resolve(
+                frames: frames,
+                visibleContentOffsetY: geometry.visibleContentOffsetY
+            )
+        )
+    }
+
+    private func resolveInitialScrollPositionIfReady(
+        frames suppliedFrames: [ChatTranscriptRowContentFrame]? = nil
+    ) {
+        guard !isLoading, !hasCompletedInitialScrollResolution else { return }
+
+        if restorationLock == nil {
+            restorationLock = initialScrollPosition.map {
+                .saved($0)
+            } ?? .bottom(preservesStoredPosition: false)
+        }
+
+        guard let restorationLock else { return }
+        let frames = suppliedFrames ?? rowContentFrames
+
+        if case .saved(let position) = restorationLock,
+           ChatTranscriptReadingPositionResolver.matchingFrame(
+               for: position,
+               frames: frames
+           ) == nil {
+            // The anchor is already part of this render pass, but its preference
+            // frame has not arrived yet. Waiting here avoids treating a stale
+            // frame set as authoritative after a page load.
+            if displayedTranscriptContains(position) {
+                invalidateRestorationVerification()
+                return
+            }
+
+            loadOlderMessagesForInitialAnchorOrFallBack()
+            return
+        }
+
+        applyAndVerifyInitialRestoration(
+            restorationLock,
+            frames: frames
+        )
+    }
+
+    private func loadOlderMessagesForInitialAnchorOrFallBack() {
+        if isLoadingOlderMessages || isLoadingInitialAnchorPage {
+            return
+        }
+
+        guard hasOlderMessages else {
+            fallBackFromMissingInitialAnchor()
+            return
+        }
+
+        invalidateRestorationVerification(resetDeadline: true)
+        initialAnchorPageLoadFailed = false
+        isLoadingInitialAnchorPage = true
+        Task { @MainActor in
+            let didLoad = await onLoadOlderMessages()
+            initialAnchorPageLoadFailed = !didLoad
+            isLoadingInitialAnchorPage = false
+        }
+    }
+
+    private func fallBackFromMissingInitialAnchor() {
+        guard !hasCompletedInitialScrollResolution else { return }
+
+        let fallback = ChatTranscriptRestorationLock.bottom(
+            preservesStoredPosition: true
+        )
+        restorationLock = fallback
+        invalidateRestorationVerification(resetDeadline: true)
+        applyAndVerifyInitialRestoration(fallback, frames: rowContentFrames)
+    }
+
+    private func applyAndVerifyInitialRestoration(
+        _ lock: ChatTranscriptRestorationLock,
+        frames: [ChatTranscriptRowContentFrame]
+    ) {
+        guard restorationLock == lock,
+              let geometry = latestScrollGeometry else {
+            return
+        }
+        guard let targetOffsetY = targetContentOffsetY(
+            for: lock,
+            geometry: geometry,
+            frames: frames
+        ) else {
+            return
+        }
+
+        guard abs(geometry.visibleContentOffsetY - targetOffsetY) <= 0.5 else {
+            invalidateRestorationVerification()
+            transcriptScrollPosition.scrollTo(y: targetOffsetY)
+            return
+        }
+
+        scheduleInitialRestorationVerification(for: lock)
+    }
+
+    private func scheduleInitialRestorationVerification(
+        for lock: ChatTranscriptRestorationLock
+    ) {
+        let verificationStartedAt = restorationVerificationStartedAt ?? Date()
+        restorationVerificationStartedAt = verificationStartedAt
+        restorationVerificationGeneration += 1
+        let verificationGeneration = restorationVerificationGeneration
+
+        Task { @MainActor in
+            // Do not reveal between SwiftUI's initial text/media layout passes.
+            // The generation check restarts this quiet window whenever either
+            // row geometry or the scroll geometry changes.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            // Preference and scroll-geometry callbacks can keep arriving for
+            // many seconds while a long markdown transcript lays out. Do not
+            // let that callback churn starve the reader behind the restoration
+            // spinner forever: after a bounded stabilization window, the most
+            // recent task may verify the current target. The retained lock
+            // continues correcting later non-user layout shifts after reveal.
+            let reachedVerificationDeadline =
+                Date().timeIntervalSince(verificationStartedAt) >= 1.5
+
+            guard (
+                    verificationGeneration == restorationVerificationGeneration
+                        || reachedVerificationDeadline
+                  ),
+                  !hasCompletedInitialScrollResolution,
+                  restorationLock == lock,
+                  let currentGeometry = latestScrollGeometry,
+                  let currentTarget = targetContentOffsetY(
+                      for: lock,
+                      geometry: currentGeometry,
+                      frames: rowContentFrames
+                  ) else {
+                return
+            }
+
+            guard abs(
+                currentGeometry.visibleContentOffsetY - currentTarget
+            ) <= 0.5 else {
+                invalidateRestorationVerification()
+                transcriptScrollPosition.scrollTo(y: currentTarget)
+                return
+            }
+
+            if pendingFollowLatestAfterInitialRestoration,
+               !lock.preservesStoredPosition {
+                // A follow-latest transition can arrive while the restored
+                // viewport is still hidden (for example, a send immediately
+                // after opening). Make bottom the new verified target before
+                // revealing instead of letting the saved-position lock undo
+                // that already-fired scroll and exposing a visible jump.
+                pendingFollowLatestAfterInitialRestoration = false
+                let followLock = ChatTranscriptRestorationLock.bottom(
+                    preservesStoredPosition: false
+                )
+                restorationLock = followLock
+                invalidateRestorationVerification(resetDeadline: true)
+                applyAndVerifyInitialRestoration(
+                    followLock,
+                    frames: rowContentFrames
+                )
+                return
+            }
+
+            hasCompletedInitialScrollResolution = true
+            initialAnchorPageLoadFailed = false
+            restorationVerificationStartedAt = nil
+            pendingFollowLatestAfterInitialRestoration = false
+
+            if !lock.preservesStoredPosition {
+                publishReadingPosition(
+                    geometry: currentGeometry,
+                    frames: rowContentFrames
+                )
+            }
+
+            onInitialScrollPositionResolution(lock.didRestoreRequestedPosition)
+        }
+    }
+
+    private func maintainCompletedRestorationLockOrPublish() {
+        guard let geometry = latestScrollGeometry else { return }
+
+        if transcriptScrollPosition.isPositionedByUser {
+            releaseRestorationLockForUserScroll()
+        }
+
+        guard let restorationLock else {
+            publishReadingPosition(geometry: geometry, frames: rowContentFrames)
+            return
+        }
+
+        guard let targetOffsetY = targetContentOffsetY(
+            for: restorationLock,
+            geometry: geometry,
+            frames: rowContentFrames
+        ) else {
+            // Preserve the last valid stored anchor until the reader explicitly
+            // chooses another position.
+            return
+        }
+
+        guard abs(
+            geometry.visibleContentOffsetY - targetOffsetY
+        ) <= 0.5 else {
+            transcriptScrollPosition.scrollTo(y: targetOffsetY)
+            return
+        }
+
+        if !restorationLock.preservesStoredPosition {
+            publishReadingPosition(geometry: geometry, frames: rowContentFrames)
+        }
+    }
+
+    private func targetContentOffsetY(
+        for lock: ChatTranscriptRestorationLock,
+        geometry: ChatTranscriptScrollGeometrySnapshot,
+        frames: [ChatTranscriptRowContentFrame]
+    ) -> Double? {
+        let proposedOffsetY: Double
+
+        switch lock {
+        case .saved(let position):
+            guard let resolvedOffsetY =
+                ChatTranscriptReadingPositionResolver.targetContentOffsetY(
+                    for: position,
+                    frames: frames,
+                    topContentInset: geometry.topContentInset
+                ) else {
+                return nil
+            }
+            proposedOffsetY = resolvedOffsetY
+        case .bottom:
+            proposedOffsetY = geometry.contentHeight
+                - geometry.visibleContainerHeight
+        }
+
+        return ChatTranscriptReadingPositionResolver
+            .clampedVisibleContentOffsetY(
+                proposedOffsetY,
+                contentHeight: geometry.contentHeight,
+                visibleContainerHeight: geometry.visibleContainerHeight
+            )
+    }
+
+    private func displayedTranscriptContains(
+        _ position: ChatTranscriptScrollPosition
+    ) -> Bool {
+        let identities = displayedTranscriptMessages.map {
+            ChatTranscriptRowIdentity(
+                renderID: $0.renderID,
+                messageID: ChatTranscriptMessageIdentity.resolve(
+                    for: $0.message
+                )
+            )
+        }
+        return ChatTranscriptReadingPositionResolver.matchingRowIndex(
+            for: position,
+            identities: identities
+        ) != nil
+    }
+
+    private func invalidateRestorationVerification(
+        resetDeadline: Bool = false
+    ) {
+        restorationVerificationGeneration += 1
+        if resetDeadline {
+            restorationVerificationStartedAt = nil
+        }
+    }
+
+    private func releaseRestorationLockForUserScroll() {
+        guard restorationLock != nil else { return }
+        invalidateRestorationVerification(resetDeadline: true)
+        restorationLock = nil
+    }
+
+    private func releaseRestorationLockForProgrammaticScroll() {
+        releaseRestorationLockForUserScroll()
     }
 
     private func compressionReferenceCardView(_ card: CompressionReferenceCard) -> some View {
@@ -432,6 +850,47 @@ struct ChatTranscriptView: View {
                 ToolActivityGroupView(group: group)
             }
         }
+    }
+}
+
+private struct ChatTranscriptScrollGeometrySnapshot: Equatable {
+    let visibleContentOffsetY: Double
+    let contentHeight: Double
+    let visibleContainerHeight: Double
+    let topContentInset: Double
+}
+
+private enum ChatTranscriptRestorationLock: Equatable {
+    case saved(ChatTranscriptScrollPosition)
+    case bottom(preservesStoredPosition: Bool)
+
+    var preservesStoredPosition: Bool {
+        if case .bottom(let preservesStoredPosition) = self {
+            return preservesStoredPosition
+        }
+        return false
+    }
+
+    var didRestoreRequestedPosition: Bool {
+        if case .bottom(preservesStoredPosition: true) = self {
+            return false
+        }
+        return true
+    }
+}
+
+private enum ChatTranscriptContentCoordinateSpace {
+    static let name = "chatTranscriptContent"
+}
+
+private struct ChatTranscriptRowFramesPreferenceKey: PreferenceKey {
+    static var defaultValue: [ChatTranscriptRowContentFrame] = []
+
+    static func reduce(
+        value: inout [ChatTranscriptRowContentFrame],
+        nextValue: () -> [ChatTranscriptRowContentFrame]
+    ) {
+        value.append(contentsOf: nextValue())
     }
 }
 
