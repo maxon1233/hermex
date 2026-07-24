@@ -133,6 +133,16 @@ struct ChatTranscriptView: View {
                             contentWidth: contentWidth
                         )
                     }
+                    .defaultScrollAnchor(
+                        ChatScrollPolicy.initialTranscriptAnchor,
+                        for: .initialOffset
+                    )
+                    .defaultScrollAnchor(
+                        ChatScrollPolicy.sizeChangeAnchor(
+                            shouldFollowLatestMessage: shouldFollowLatestMessage
+                        ),
+                        for: .sizeChanges
+                    )
                     .scrollPosition($transcriptScrollPosition)
                     .onScrollGeometryChange(
                         for: ChatTranscriptScrollGeometrySnapshot.self,

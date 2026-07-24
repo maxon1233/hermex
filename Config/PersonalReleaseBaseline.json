@@ -40,6 +40,16 @@
       "id": "pr-9-session-list-refresh",
       "sha": "e8d84ac13b2a92ffec985d19563e9a2b9e60a16e",
       "description": "Refresh and group the session list automatically"
+    },
+    {
+      "id": "pr-10-session-draft-persistence",
+      "sha": "619b1aebad654a070348e8bda7d8ca0a80d33a6e",
+      "description": "Persist unsent composer drafts per server and session"
+    },
+    {
+      "id": "pr-11-chat-scroll-restoration",
+      "sha": "34f53fac87ab8b3cdedcfe98a83f2c782250b143",
+      "description": "Restore the exact visible chat viewport across navigation"
     }
   ]
 }
