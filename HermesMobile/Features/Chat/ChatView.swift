@@ -336,7 +336,11 @@ struct ChatView: View {
         self.onAPIError = onAPIError
         self.loadsInitialMessages = loadsInitialMessages
         self.autoStartsVoiceInput = autoStartsVoiceInput
-        _draftMessage = State(initialValue: initialDraft)
+        _draftMessage = State(initialValue: ChatComposerDraftPersistence.initialDraft(
+            initialDraft,
+            for: session.sessionId,
+            server: server
+        ))
         _initialAttachments = State(initialValue: initialAttachments)
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
@@ -490,6 +494,9 @@ struct ChatView: View {
         // The composer flips wholesale with the transcript under the RTL
         // toggle (#259): input, placeholder, and chrome mirror together.
         .environment(\.layoutDirection, chatLayoutDirection)
+        .onChange(of: draftMessage) { _, newDraft in
+            saveComposerDraft(newDraft)
+        }
         .background(
             NavigationAppearanceCompletionObserver(action: handleInitialAppearanceCompletion)
                 .allowsHitTesting(false)
@@ -622,6 +629,7 @@ struct ChatView: View {
                 viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
             }
             .onDisappear {
+                saveComposerDraft(draftMessage)
                 activeStreamStatusRefreshTask?.cancel()
                 activeStreamStatusRefreshTask = nil
                 viewModel.stopListening()
@@ -1368,6 +1376,14 @@ struct ChatView: View {
         }
 
         return didLoad
+    }
+
+    private func saveComposerDraft(_ draft: String) {
+        ChatComposerDraftPersistence.save(
+            draft,
+            for: session.sessionId,
+            server: server
+        )
     }
 
     private func submitGoalDraft(_ submittedGoal: String) async {

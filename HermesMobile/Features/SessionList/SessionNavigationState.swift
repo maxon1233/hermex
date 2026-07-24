@@ -126,3 +126,48 @@ enum SessionNavigationPersistence {
         }
     }
 }
+
+enum ChatComposerDraftPersistence {
+    private static let keyPrefix = "chatComposer.draft."
+
+    static func load(
+        for sessionID: String?,
+        server: URL,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        guard let key = key(for: sessionID, server: server) else { return nil }
+        return defaults.string(forKey: key)
+    }
+
+    static func initialDraft(
+        _ explicitDraft: String,
+        for sessionID: String?,
+        server: URL,
+        defaults: UserDefaults = .standard
+    ) -> String {
+        guard explicitDraft.isEmpty else { return explicitDraft }
+        return load(for: sessionID, server: server, defaults: defaults) ?? ""
+    }
+
+    static func save(
+        _ draft: String,
+        for sessionID: String?,
+        server: URL,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let key = key(for: sessionID, server: server) else { return }
+
+        if draft.isEmpty {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(draft, forKey: key)
+        }
+    }
+
+    private static func key(for sessionID: String?, server: URL) -> String? {
+        guard let sessionID else { return nil }
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        return keyPrefix + server.absoluteString + "." + normalizedSessionID
+    }
+}
