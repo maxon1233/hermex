@@ -165,3 +165,157 @@ final class SessionNavigationStateTests: XCTestCase {
         )
     }
 }
+
+final class ChatComposerDraftPersistenceTests: XCTestCase {
+    private var suiteName: String!
+    private var defaults: UserDefaults!
+    private let server = URL(string: "https://hermes.example.com")!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        suiteName = "ChatComposerDraftPersistenceTests.\(UUID().uuidString)"
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    }
+
+    override func tearDownWithError() throws {
+        defaults.removePersistentDomain(forName: suiteName)
+        defaults = nil
+        suiteName = nil
+        try super.tearDownWithError()
+    }
+
+    func testDraftRoundTripsForSession() {
+        ChatComposerDraftPersistence.save(
+            "Remember this",
+            for: "session-1",
+            server: server,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.load(
+                for: "session-1",
+                server: server,
+                defaults: defaults
+            ),
+            "Remember this"
+        )
+    }
+
+    func testDraftsAreIsolatedBySessionAndServer() throws {
+        let otherServer = try XCTUnwrap(URL(string: "https://other.example.com"))
+
+        ChatComposerDraftPersistence.save(
+            "First session",
+            for: "session-1",
+            server: server,
+            defaults: defaults
+        )
+        ChatComposerDraftPersistence.save(
+            "Second session",
+            for: "session-2",
+            server: server,
+            defaults: defaults
+        )
+        ChatComposerDraftPersistence.save(
+            "Other server",
+            for: "session-1",
+            server: otherServer,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.load(
+                for: "session-1",
+                server: server,
+                defaults: defaults
+            ),
+            "First session"
+        )
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.load(
+                for: "session-2",
+                server: server,
+                defaults: defaults
+            ),
+            "Second session"
+        )
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.load(
+                for: "session-1",
+                server: otherServer,
+                defaults: defaults
+            ),
+            "Other server"
+        )
+    }
+
+    func testSavingEmptyDraftClearsStoredDraft() {
+        ChatComposerDraftPersistence.save(
+            "Will be sent",
+            for: "session-1",
+            server: server,
+            defaults: defaults
+        )
+
+        ChatComposerDraftPersistence.save(
+            "",
+            for: "session-1",
+            server: server,
+            defaults: defaults
+        )
+
+        XCTAssertNil(
+            ChatComposerDraftPersistence.load(
+                for: "session-1",
+                server: server,
+                defaults: defaults
+            )
+        )
+    }
+
+    func testExplicitIncomingDraftTakesPrecedenceOverStoredDraft() {
+        ChatComposerDraftPersistence.save(
+            "Stored draft",
+            for: "session-1",
+            server: server,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.initialDraft(
+                "Shared text",
+                for: "session-1",
+                server: server,
+                defaults: defaults
+            ),
+            "Shared text"
+        )
+        XCTAssertEqual(
+            ChatComposerDraftPersistence.initialDraft(
+                "",
+                for: "session-1",
+                server: server,
+                defaults: defaults
+            ),
+            "Stored draft"
+        )
+    }
+
+    func testMissingSessionIDDoesNotPersistDraft() {
+        ChatComposerDraftPersistence.save(
+            "No session",
+            for: nil,
+            server: server,
+            defaults: defaults
+        )
+
+        XCTAssertNil(
+            ChatComposerDraftPersistence.load(
+                for: nil,
+                server: server,
+                defaults: defaults
+            )
+        )
+    }
+}
