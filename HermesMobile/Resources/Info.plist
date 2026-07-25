@@ -39,6 +39,14 @@
 	<string>$(KEYCHAIN_SERVICE)</string>
 	<key>HermesURLScheme</key>
 	<string>$(HERMES_URL_SCHEME)</string>
+	<key>HermexBuildSourceBranch</key>
+	<string>$(HERMEX_BUILD_SOURCE_BRANCH)</string>
+	<key>HermexBuildSourceDirty</key>
+	<string>$(HERMEX_BUILD_SOURCE_DIRTY)</string>
+	<key>HermexBuildSourceSHA</key>
+	<string>$(HERMEX_BUILD_SOURCE_SHA)</string>
+	<key>HermexBuildUpstreamSHA</key>
+	<string>$(HERMEX_BUILD_UPSTREAM_SHA)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>

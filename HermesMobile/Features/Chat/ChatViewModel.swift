@@ -235,6 +235,7 @@ final class ChatViewModel {
     /// render, so the view re-pins to the bottom on this token *without* animation —
     /// otherwise the height growth produces a visible scroll jump.
     private(set) var cacheFirstReconcileScrollToken = 0
+    private var hasPrimedInitialCachedMessages = false
     @ObservationIgnored private var pendingStreamingScrollTriggerTask: Task<Void, Never>?
     @ObservationIgnored private var pendingAssistantTokenChunks: [String] = []
     @ObservationIgnored private var pendingReasoningChunks: [String] = []
@@ -1165,12 +1166,16 @@ final class ChatViewModel {
         // render the cached messages immediately so the loading skeleton never shows.
         let previousMessages = messages
         let previousMessagesOffset = messagesOffset
+        let usesPrimedInitialCache = hasPrimedInitialCachedMessages && !previousMessages.isEmpty
+        hasPrimedInitialCachedMessages = false
         let cacheFirstPlaceholder: [ChatMessage]
         if previousMessages.isEmpty, let modelContext {
             cacheFirstPlaceholder = renderCachedMessagesBeforeReload(
                 sessionID: sessionID,
                 modelContext: modelContext
             )
+        } else if usesPrimedInitialCache {
+            cacheFirstPlaceholder = previousMessages
         } else {
             cacheFirstPlaceholder = []
         }
@@ -1330,6 +1335,23 @@ final class ChatViewModel {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// Performs only the fast, local portion of an existing session's first
+    /// load. The network reconcile is intentionally started by `ChatView` after
+    /// its navigation appearance completes so rendering a richer transcript
+    /// cannot stall the system push animation.
+    func prepareInitialMessageLoad(modelContext: ModelContext) {
+        guard let sessionID else { return }
+
+        isLoading = true
+        guard messages.isEmpty else { return }
+
+        let cachedMessages = renderCachedMessagesBeforeReload(
+            sessionID: sessionID,
+            modelContext: modelContext
+        )
+        hasPrimedInitialCachedMessages = !cachedMessages.isEmpty
     }
 
     /// Cache-first render (#289): on a cold session open, paint the cached transcript
@@ -2108,6 +2130,24 @@ final class ChatViewModel {
             streamCoordinator.start(streamID: streamID)
             return true
         } catch {
+            if let streamID = (error as? APIError)?.activeStreamID {
+                rollbackOptimisticMessage(id: localMessageID)
+                cacheCurrentMessages(sessionID: sessionID, modelContext: modelContext)
+                restorePendingAttachments(attachmentsToRestoreOnFailure)
+                // The existing run may have started outside this view model. Reconcile
+                // the server transcript first so the SSE tokens attach to the persisted
+                // assistant turn instead of creating a second bubble with only the tail.
+                await loadMessages(modelContext: modelContext)
+                _ = restoreActiveStreamSnapshotIfAvailable(streamID: streamID)
+                streamingAssistantMessageID = TranscriptTurnClassifier
+                    .currentTurnAssistantAnchorIDs(in: messages, messageOffset: messagesOffset)
+                    .first
+                streamCoordinator.start(streamID: streamID)
+                // The server kept the earlier run, not this newly submitted text.
+                // Report an unaccepted send so ChatView restores the draft while
+                // the coordinator reconnects to the existing response.
+                return false
+            }
             lastError = error
             sendErrorMessage = error.localizedDescription
             rollbackOptimisticMessage(id: localMessageID)

@@ -328,6 +328,56 @@ final class ResponseCompletionNotificationTrackerTests: XCTestCase {
     }
 }
 
+final class AppBuildSourceTests: XCTestCase {
+    func testParsesReleaseIdentityAndFormatsShortSource() throws {
+        let source = try XCTUnwrap(
+            AppBuildSource(
+                infoDictionary: [
+                    "HermexBuildSourceSHA": "e8d84ac13b2a92ffec985d19563e9a2b9e60a16e",
+                    "HermexBuildSourceBranch": "personal/main",
+                    "HermexBuildUpstreamSHA": "2e81b6f049d812e9e16b1148c123e3d8e07ab7d9",
+                    "HermexBuildSourceDirty": "NO",
+                ]
+            )
+        )
+
+        XCTAssertEqual(source.sourceSHA, "e8d84ac13b2a92ffec985d19563e9a2b9e60a16e")
+        XCTAssertEqual(source.sourceBranch, "personal/main")
+        XCTAssertEqual(source.upstreamSHA, "2e81b6f049d812e9e16b1148c123e3d8e07ab7d9")
+        XCTAssertFalse(source.sourceIsDirty)
+        XCTAssertEqual(source.displayValue, "personal/main · e8d84ac1")
+    }
+
+    func testRejectsDevelopmentPlaceholderIdentity() {
+        XCTAssertNil(
+            AppBuildSource(
+                infoDictionary: [
+                    "HermexBuildSourceSHA": "development",
+                    "HermexBuildSourceBranch": "development",
+                    "HermexBuildUpstreamSHA": "development",
+                    "HermexBuildSourceDirty": "UNKNOWN",
+                ]
+            )
+        )
+    }
+
+    func testMarksDirtyReleaseIdentity() throws {
+        let source = try XCTUnwrap(
+            AppBuildSource(
+                infoDictionary: [
+                    "HermexBuildSourceSHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "HermexBuildSourceBranch": "personal/main",
+                    "HermexBuildUpstreamSHA": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "HermexBuildSourceDirty": "YES",
+                ]
+            )
+        )
+
+        XCTAssertTrue(source.sourceIsDirty)
+        XCTAssertEqual(source.displayValue, "personal/main · aaaaaaaa dirty")
+    }
+}
+
 private final class SpyResponseCompletionNotificationScheduler: ResponseCompletionNotificationScheduling {
     private let status: UNAuthorizationStatus
     private let requestAuthorizationResult: Bool

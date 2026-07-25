@@ -261,6 +261,21 @@
 		C23400000000000000000001 /* StreamingLabReplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = C23400000000000000000002 /* StreamingLabReplay.swift */; };
 		C23400000000000000000003 /* StreamingLabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C23400000000000000000004 /* StreamingLabView.swift */; };
 		C23400000000000000000005 /* StreamingLabReplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C23400000000000000000006 /* StreamingLabReplayTests.swift */; };
+		C14900000000000000000001 /* Kanban.swift in Sources */ = {isa = PBXBuildFile; fileRef = C14900000000000000000002 /* Kanban.swift */; };
+		C14900000000000000000003 /* APIClient+Kanban.swift in Sources */ = {isa = PBXBuildFile; fileRef = C14900000000000000000004 /* APIClient+Kanban.swift */; };
+		C14900000000000000000005 /* KanbanFeatureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C14900000000000000000006 /* KanbanFeatureState.swift */; };
+		C14900000000000000000007 /* KanbanLabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C14900000000000000000008 /* KanbanLabView.swift */; };
+		C14900000000000000000009 /* APIClientKanbanTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1490000000000000000000A /* APIClientKanbanTests.swift */; };
+		C1490000000000000000000B /* KanbanFeatureStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1490000000000000000000C /* KanbanFeatureStateTests.swift */; };
+		C15100000000000000000001 /* KanbanEventStreamClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15100000000000000000002 /* KanbanEventStreamClient.swift */; };
+		C15100000000000000000003 /* KanbanEventStreamClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15100000000000000000004 /* KanbanEventStreamClientTests.swift */; };
+		C15100000000000000000005 /* KanbanLiveUpdateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15100000000000000000006 /* KanbanLiveUpdateTests.swift */; };
+		C15400000000000000000001 /* KanbanCardDetailState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15400000000000000000002 /* KanbanCardDetailState.swift */; };
+		C15400000000000000000003 /* KanbanCardDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15400000000000000000004 /* KanbanCardDetailView.swift */; };
+		C15300000000000000000001 /* KanbanCardEditorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15300000000000000000002 /* KanbanCardEditorState.swift */; };
+		C15300000000000000000003 /* KanbanCardEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15300000000000000000004 /* KanbanCardEditorView.swift */; };
+		C15300000000000000000005 /* KanbanCardEditorStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15300000000000000000006 /* KanbanCardEditorStateTests.swift */; };
+		C15400000000000000000005 /* KanbanCardDetailStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15400000000000000000006 /* KanbanCardDetailStateTests.swift */; };
 		C21300000000000000000007 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = C21300000000000000000008 /* MarkdownUI */; };
 		B5A220000000000000000005 /* ChatMarkerMessageClassifierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A220000000000000000006 /* ChatMarkerMessageClassifierTests.swift */; };
 		B5A100000000000000000004 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000014 /* PrivacyInfo.xcprivacy */; };
@@ -294,6 +309,8 @@
 		C5A0D8F5502048B6B9258B01 /* InsightsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A0D8F5502048B6B9258B00 /* InsightsViewModelTests.swift */; };
 		105050000000000000000001 /* ComposerModelPickerSectionExpansionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 105050000000000000000002 /* ComposerModelPickerSectionExpansionState.swift */; };
 		105050000000000000000003 /* ComposerModelPickerSectionExpansionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 105050000000000000000004 /* ComposerModelPickerSectionExpansionStateTests.swift */; };
+		5C4011000000000000000001 /* ScrollRestorationLabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C4011000000000000000011 /* ScrollRestorationLabView.swift */; };
+		5C4011000000000000000002 /* ScrollRestorationUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C4011000000000000000012 /* ScrollRestorationUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -317,6 +334,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = A04500000000000000000040;
 			remoteInfo = HermesLiveActivityWidget;
+		};
+		5C4011000000000000000036 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A2B3C4D5E6F700000000070 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A2B3C4D5E6F700000000040;
+			remoteInfo = HermesMobile;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -604,6 +628,21 @@
 		C23400000000000000000002 /* StreamingLabReplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingLabReplay.swift; sourceTree = "<group>"; };
 		C23400000000000000000004 /* StreamingLabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingLabView.swift; sourceTree = "<group>"; };
 		C23400000000000000000006 /* StreamingLabReplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingLabReplayTests.swift; sourceTree = "<group>"; };
+		C14900000000000000000002 /* Kanban.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Kanban.swift; sourceTree = "<group>"; };
+		C14900000000000000000004 /* APIClient+Kanban.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "APIClient+Kanban.swift"; sourceTree = "<group>"; };
+		C14900000000000000000006 /* KanbanFeatureState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanFeatureState.swift; sourceTree = "<group>"; };
+		C14900000000000000000008 /* KanbanLabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanLabView.swift; sourceTree = "<group>"; };
+		C1490000000000000000000A /* APIClientKanbanTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClientKanbanTests.swift; sourceTree = "<group>"; };
+		C1490000000000000000000C /* KanbanFeatureStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanFeatureStateTests.swift; sourceTree = "<group>"; };
+		C15100000000000000000002 /* KanbanEventStreamClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanEventStreamClient.swift; sourceTree = "<group>"; };
+		C15100000000000000000004 /* KanbanEventStreamClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanEventStreamClientTests.swift; sourceTree = "<group>"; };
+		C15100000000000000000006 /* KanbanLiveUpdateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanLiveUpdateTests.swift; sourceTree = "<group>"; };
+		C15400000000000000000002 /* KanbanCardDetailState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardDetailState.swift; sourceTree = "<group>"; };
+		C15400000000000000000004 /* KanbanCardDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardDetailView.swift; sourceTree = "<group>"; };
+		C15300000000000000000002 /* KanbanCardEditorState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardEditorState.swift; sourceTree = "<group>"; };
+		C15300000000000000000004 /* KanbanCardEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardEditorView.swift; sourceTree = "<group>"; };
+		C15300000000000000000006 /* KanbanCardEditorStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardEditorStateTests.swift; sourceTree = "<group>"; };
+		C15400000000000000000006 /* KanbanCardDetailStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KanbanCardDetailStateTests.swift; sourceTree = "<group>"; };
 		B5A220000000000000000006 /* ChatMarkerMessageClassifierTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMarkerMessageClassifierTests.swift; sourceTree = "<group>"; };
 		B5A100000000000000000017 /* HermesShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HermesShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A04500000000000000000010 /* AgentRunActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunActivityAttributes.swift; sourceTree = "<group>"; };
@@ -619,6 +658,9 @@
 		FC2A37872AC842629FBDDFA4 /* SlashCommandAutocompleteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlashCommandAutocompleteView.swift; sourceTree = "<group>"; };
 		105050000000000000000002 /* ComposerModelPickerSectionExpansionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerModelPickerSectionExpansionState.swift; sourceTree = "<group>"; };
 		105050000000000000000004 /* ComposerModelPickerSectionExpansionStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerModelPickerSectionExpansionStateTests.swift; sourceTree = "<group>"; };
+		5C4011000000000000000011 /* ScrollRestorationLabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollRestorationLabView.swift; sourceTree = "<group>"; };
+		5C4011000000000000000012 /* ScrollRestorationUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollRestorationUITests.swift; sourceTree = "<group>"; };
+		5C4011000000000000000015 /* HermesMobileUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HermesMobileUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -657,6 +699,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5C4011000000000000000021 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -666,6 +715,7 @@
 				351C0F1600000000000000A1 /* Shared.xcconfig */,
 				1A2B3C4D5E6F700000000031 /* HermesMobile */,
 				1A2B3C4D5E6F700000000034 /* HermesMobileTests */,
+				5C4011000000000000000034 /* HermesMobileUITests */,
 				B5A100000000000000000051 /* HermesShareExtension */,
 				A04500000000000000000021 /* HermesLiveActivityWidget */,
 				1A2B3C4D5E6F700000000032 /* Products */,
@@ -695,6 +745,7 @@
 			children = (
 				1A2B3C4D5E6F700000000010 /* HermesMobile.app */,
 				1A2B3C4D5E6F700000000015 /* HermesMobileTests.xctest */,
+				5C4011000000000000000015 /* HermesMobileUITests.xctest */,
 				B5A100000000000000000017 /* HermesShareExtension.appex */,
 				A04500000000000000000017 /* HermesLiveActivityWidget.appex */,
 			);
@@ -769,6 +820,12 @@
 				C21200000000000000000006 /* ChatViewModelStreamingPaceTests.swift */,
 				C21300000000000000000006 /* StreamingTextFadeTests.swift */,
 				C23400000000000000000006 /* StreamingLabReplayTests.swift */,
+				C1490000000000000000000A /* APIClientKanbanTests.swift */,
+				C1490000000000000000000C /* KanbanFeatureStateTests.swift */,
+				C15100000000000000000004 /* KanbanEventStreamClientTests.swift */,
+				C15100000000000000000006 /* KanbanLiveUpdateTests.swift */,
+				C15400000000000000000006 /* KanbanCardDetailStateTests.swift */,
+				C15300000000000000000006 /* KanbanCardEditorStateTests.swift */,
 				C1A042000000000000000006 /* ClarificationTests.swift */,
 				1A2B3C4D5E6F7000000000F4 /* CacheStoreTests.swift */,
 				C04400000000000000000004 /* CacheFallbackPolicyTests.swift */,
@@ -807,6 +864,14 @@
 			path = HermesMobileTests;
 			sourceTree = "<group>";
 		};
+		5C4011000000000000000034 /* HermesMobileUITests */ = {
+			isa = PBXGroup;
+			children = (
+				5C4011000000000000000012 /* ScrollRestorationUITests.swift */,
+			);
+			path = HermesMobileUITests;
+			sourceTree = "<group>";
+		};
 		1A2B3C4D5E6F7000000000C0 /* Auth */ = {
 			isa = PBXGroup;
 			children = (
@@ -830,6 +895,8 @@
 				C04000000000000000000017 /* APIClient+Memory.swift */,
 				C04000000000000000000018 /* APIClient+Skills.swift */,
 				C04000000000000000000019 /* APIClient+Upload.swift */,
+				C14900000000000000000004 /* APIClient+Kanban.swift */,
+				C15100000000000000000002 /* KanbanEventStreamClient.swift */,
 				1A2B3C4D5E6F7000000000B8 /* Endpoints.swift */,
 				C03250000000000000F102 /* APIClient+Transcribe.swift */,
 				C03260000000000000F101 /* APIClient+TTS.swift */,
@@ -868,6 +935,7 @@
 				3F91D2A54B9A4F66A2C01011 /* Cron.swift */,
 				1A2B3C4D5E6F70000000201 /* Memory.swift */,
 				1A2B3C4D5E6F70000000211 /* Skills.swift */,
+				C14900000000000000000002 /* Kanban.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -886,6 +954,7 @@
 				1A2B3C4D5E6F70000000216 /* Skills */,
 				1A2B3C4D5E6F70000000206 /* Memory */,
 				B50E1CE3A8912B92B1924714 /* Insights */,
+				C1490000000000000000000D /* Kanban */,
 			);
 			path = Features;
 			sourceTree = "<group>";
@@ -904,6 +973,19 @@
 				1A2B3C4D5E6F7000000000B6 /* OnboardingViewModel.swift */,
 			);
 			path = Onboarding;
+			sourceTree = "<group>";
+		};
+		C1490000000000000000000D /* Kanban */ = {
+			isa = PBXGroup;
+			children = (
+				C14900000000000000000006 /* KanbanFeatureState.swift */,
+				C14900000000000000000008 /* KanbanLabView.swift */,
+				C15400000000000000000002 /* KanbanCardDetailState.swift */,
+				C15400000000000000000004 /* KanbanCardDetailView.swift */,
+				C15300000000000000000002 /* KanbanCardEditorState.swift */,
+				C15300000000000000000004 /* KanbanCardEditorView.swift */,
+			);
+			path = Kanban;
 			sourceTree = "<group>";
 		};
 		C09300000000000000000010 /* Shared */ = {
@@ -1042,6 +1124,7 @@
 				1A2B3C4D5E6F70000000111 /* ArchivedSessionsView.swift */,
 				C23400000000000000000002 /* StreamingLabReplay.swift */,
 				C23400000000000000000004 /* StreamingLabView.swift */,
+				5C4011000000000000000011 /* ScrollRestorationLabView.swift */,
 				1A2B3C4D5E6F70000000113 /* ArchivedSessionsViewModel.swift */,
 				19C1150000000000000000A2 /* CliSessionsSyncModel.swift */,
 				26AB000000000000000000F2 /* ProvidersView.swift */,
@@ -1216,6 +1299,23 @@
 			productReference = 1A2B3C4D5E6F700000000015 /* HermesMobileTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		5C4011000000000000000044 /* HermesMobileUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5C4011000000000000000045 /* Build configuration list for PBXNativeTarget "HermesMobileUITests" */;
+			buildPhases = (
+				5C4011000000000000000052 /* Sources */,
+				5C4011000000000000000021 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5C4011000000000000000037 /* PBXTargetDependency */,
+			);
+			name = HermesMobileUITests;
+			productName = HermesMobileUITests;
+			productReference = 5C4011000000000000000015 /* HermesMobileUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		B5A100000000000000000040 /* HermesShareExtension */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = B5A100000000000000000041 /* Build configuration list for PBXNativeTarget "HermesShareExtension" */;
@@ -1267,6 +1367,10 @@
 						CreatedOnToolsVersion = 26.4.1;
 						TestTargetID = 1A2B3C4D5E6F700000000040;
 					};
+					5C4011000000000000000044 = {
+						CreatedOnToolsVersion = 26.4.1;
+						TestTargetID = 1A2B3C4D5E6F700000000040;
+					};
 					B5A100000000000000000040 = {
 						CreatedOnToolsVersion = 26.4.1;
 					};
@@ -1315,6 +1419,7 @@
 			targets = (
 				1A2B3C4D5E6F700000000040 /* HermesMobile */,
 				1A2B3C4D5E6F700000000044 /* HermesMobileTests */,
+				5C4011000000000000000044 /* HermesMobileUITests */,
 				B5A100000000000000000040 /* HermesShareExtension */,
 				A04500000000000000000040 /* HermesLiveActivityWidget */,
 			);
@@ -1390,6 +1495,15 @@
 				C04000000000000000000007 /* APIClient+Memory.swift in Sources */,
 				C04000000000000000000008 /* APIClient+Skills.swift in Sources */,
 				C04000000000000000000009 /* APIClient+Upload.swift in Sources */,
+				C14900000000000000000001 /* Kanban.swift in Sources */,
+				C14900000000000000000003 /* APIClient+Kanban.swift in Sources */,
+				C15100000000000000000001 /* KanbanEventStreamClient.swift in Sources */,
+				C14900000000000000000005 /* KanbanFeatureState.swift in Sources */,
+				C14900000000000000000007 /* KanbanLabView.swift in Sources */,
+				C15400000000000000000001 /* KanbanCardDetailState.swift in Sources */,
+				C15400000000000000000003 /* KanbanCardDetailView.swift in Sources */,
+				C15300000000000000000001 /* KanbanCardEditorState.swift in Sources */,
+				C15300000000000000000003 /* KanbanCardEditorView.swift in Sources */,
 				1A2B3C4D5E6F7000000000A8 /* Endpoints.swift in Sources */,
 				C03250000000000000B101 /* TranscribeResponse.swift in Sources */,
 				C03250000000000000B102 /* APIClient+Transcribe.swift in Sources */,
@@ -1427,6 +1541,7 @@
 				1A2B3C4D5E6F70000000110 /* ArchivedSessionsView.swift in Sources */,
 				C23400000000000000000001 /* StreamingLabReplay.swift in Sources */,
 				C23400000000000000000003 /* StreamingLabView.swift in Sources */,
+				5C4011000000000000000001 /* ScrollRestorationLabView.swift in Sources */,
 				1A2B3C4D5E6F70000000112 /* ArchivedSessionsViewModel.swift in Sources */,
 				19C1150000000000000000A1 /* CliSessionsSyncModel.swift in Sources */,
 				1A2B3C4D5E6F7000000000F8 /* AppConfig.swift in Sources */,
@@ -1595,6 +1710,12 @@
 				C21200000000000000000005 /* ChatViewModelStreamingPaceTests.swift in Sources */,
 				C21300000000000000000005 /* StreamingTextFadeTests.swift in Sources */,
 				C23400000000000000000005 /* StreamingLabReplayTests.swift in Sources */,
+				C14900000000000000000009 /* APIClientKanbanTests.swift in Sources */,
+				C1490000000000000000000B /* KanbanFeatureStateTests.swift in Sources */,
+				C15100000000000000000003 /* KanbanEventStreamClientTests.swift in Sources */,
+				C15100000000000000000005 /* KanbanLiveUpdateTests.swift in Sources */,
+				C15400000000000000000005 /* KanbanCardDetailStateTests.swift in Sources */,
+				C15300000000000000000005 /* KanbanCardEditorStateTests.swift in Sources */,
 				C1A042000000000000000005 /* ClarificationTests.swift in Sources */,
 				1A2B3C4D5E6F7000000000F2 /* CacheStoreTests.swift in Sources */,
 				C04400000000000000000003 /* CacheFallbackPolicyTests.swift in Sources */,
@@ -1652,6 +1773,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		5C4011000000000000000052 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5C4011000000000000000002 /* ScrollRestorationUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -1669,6 +1798,11 @@
 			isa = PBXTargetDependency;
 			target = A04500000000000000000040 /* HermesLiveActivityWidget */;
 			targetProxy = A04500000000000000000030 /* PBXContainerItemProxy */;
+		};
+		5C4011000000000000000037 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A2B3C4D5E6F700000000040 /* HermesMobile */;
+			targetProxy = 5C4011000000000000000036 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1906,6 +2040,52 @@
 			};
 			name = Release;
 		};
+		5C4011000000000000000084 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.4;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = HermesMobile;
+			};
+			name = Debug;
+		};
+		5C4011000000000000000085 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.4;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = HermesMobile;
+			};
+			name = Release;
+		};
 		B5A100000000000000000042 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -2033,6 +2213,15 @@
 			buildConfigurations = (
 				1A2B3C4D5E6F700000000084 /* Debug */,
 				1A2B3C4D5E6F700000000085 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5C4011000000000000000045 /* Build configuration list for PBXNativeTarget "HermesMobileUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5C4011000000000000000084 /* Debug */,
+				5C4011000000000000000085 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

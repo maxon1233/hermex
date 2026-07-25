@@ -20,7 +20,11 @@ Read by every agent (Codex, Claude Code, …); keep it tool-agnostic.
 - One issue → one short `issue/<n>-slug` branch → one PR (branches with no issue use
   `chore/` or `fix/`). Issue/triage/domain conventions live in `docs/agents/`.
 - `master` is the protected release-candidate branch (the source for internal
-  TestFlight builds): keep it buildable, never do feature work on it.
+  production TestFlight builds): keep it buildable, never do feature work on it.
+- `personal/main` is the only source for the owner's personal TestFlight app.
+  Personal feature branches start from the latest synchronized `personal/main`;
+  they are never released directly. Upstream integration happens through a
+  reviewed sync branch into `personal/main`.
 - **Publishing boundary:** the `upstream` Git remote is strictly read-only. Never
   push to it, open or update pull requests against it, or otherwise mutate it.
   Push branches only to `origin` (`maxon1233/hermex`) and target this fork's
@@ -71,9 +75,31 @@ unique `CURRENT_PROJECT_VERSION` (e.g. `YYYYMMDDHHMM`) each time. Full commands 
 identity: `DEVELOPMENT.md`. Never touch the production `com.uzairansar.hermesmobile` app
 unless explicitly asked.
 
+## Personal TestFlight delivery (owner-only)
+The personal app must be archived with `scripts/personal-release archive`. The
+script fetches `origin/personal/main` and the read-only app `upstream/master`,
+checks the personal baseline and app-upstream validation pins, runs the complete
+XCTest suite, archives an immutable `origin/personal/main` snapshot, embeds the
+source SHAs, and verifies the bundle/team/build identity. Never archive the
+personal app from the active worktree or bypass a blocked release check.
+
+Personal delivery is not complete when upload succeeds. Use the App Store
+Connect identity recorded in `CURRENT.md`, wait for the exact build to become
+valid and ready for internal testing, add it to the recorded internal beta
+group, and read the relationship back. Stop if `CURRENT.md` lacks that identity;
+never substitute the production or branch TestFlight apps.
+
+`UPSTREAM_TESTED_SHA` / `UPSTREAM_TRIAGED_SHA` track the hermes-webui server.
+`HERMEX_APP_UPSTREAM_TESTED_SHA` / `HERMEX_APP_UPSTREAM_TRIAGED_SHA` separately
+track the upstream Hermex iOS repository. Never substitute one pair for the
+other.
+
 ## Working with the human
 - Surface tradeoffs in plain English before non-obvious choices; when in doubt, ask.
 - Ask before touching anything under the spec's "Open questions."
+- For access to an installed app/connector/plugin, always try the plugin first. If it
+  is not authorized, present the plugin's OAuth link or authorization flow; never
+  send the human terminal authentication commands unless they explicitly ask for them.
 - After each slice, report: (1) files changed (2) build/test command run (3) result
   (4) next suggested step — plus a short manual simulator test plan when UI changed.
 

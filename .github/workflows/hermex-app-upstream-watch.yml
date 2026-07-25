@@ -1,0 +1,177 @@
+# Watches the upstream Hermex iOS repository. This is intentionally separate
+# from upstream-watch.yml, which tracks the hermes-webui server/API.
+name: Hermex App Upstream Watch
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  push:
+    branches:
+      - personal/main
+    paths:
+      - HERMEX_APP_UPSTREAM_TESTED_SHA
+      - HERMEX_APP_UPSTREAM_TRIAGED_SHA
+      - Config/PersonalReleaseBaseline.json
+      - ci/personal_release.py
+      - scripts/personal-release
+      - .github/workflows/hermex-app-upstream-watch.yml
+  workflow_dispatch:
+    inputs:
+      post_issue:
+        description: "Create, update, or close the standing upstream-sync issue."
+        required: false
+        default: true
+        type: boolean
+
+run-name: "Hermex app upstream watch from ${{ github.ref_name }}"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: hermex-app-upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Check Personal Release Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      ISSUE_TITLE: "Hermex app upstream sync required"
+      UPSTREAM_REPOSITORY: "https://github.com/uzairansaruzi/hermex.git"
+
+    steps:
+      - name: Check out personal release branch
+        uses: actions/checkout@v7
+        with:
+          ref: personal/main
+          fetch-depth: 0
+
+      - name: Fetch read-only Hermex app upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "${UPSTREAM_REPOSITORY}"
+          git fetch --no-tags upstream master
+
+      - name: Validate guard tests and personal baseline
+        run: |
+          set -euo pipefail
+          python3 -m unittest ci/personal_release_test.py
+          scripts/personal-release validate-baseline --release-ref HEAD
+
+      - name: Generate app-upstream status
+        id: status
+        run: |
+          set -euo pipefail
+          scripts/personal-release status \
+            --release-ref HEAD \
+            --upstream-ref refs/remotes/upstream/master \
+            --format json > hermex-app-upstream-status.json
+          scripts/personal-release status \
+            --release-ref HEAD \
+            --upstream-ref refs/remotes/upstream/master \
+            --format markdown > hermex-app-upstream-status.md
+
+          cat hermex-app-upstream-status.md
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json
+
+          with open("hermex-app-upstream-status.json", encoding="utf-8") as handle:
+              status = json.load(handle)
+
+          print(f"is_releasable={str(status['is_releasable']).lower()}")
+          print(f"release_sha={status['release_sha']}")
+          print(f"upstream_sha={status['upstream_sha']}")
+          print(f"commits_behind={status['upstream_commits_behind']}")
+          PY
+
+      - name: Upload status report
+        uses: actions/upload-artifact@v7
+        with:
+          name: hermex-app-upstream-status
+          path: |
+            hermex-app-upstream-status.json
+            hermex-app-upstream-status.md
+          if-no-files-found: error
+
+      - name: Create or update blocked-release issue
+        if: ${{ steps.status.outputs.is_releasable != 'true' && (github.event_name != 'workflow_dispatch' || inputs.post_issue) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.status.outputs.release_sha }}
+          UPSTREAM_SHA: ${{ steps.status.outputs.upstream_sha }}
+          COMMITS_BEHIND: ${{ steps.status.outputs.commits_behind }}
+        run: |
+          set -euo pipefail
+
+          if ! gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq "needs-triage"; then
+            gh label create "needs-triage" \
+              --color "D29922" \
+              --description "Maintainer needs to evaluate this issue" || true
+          fi
+
+          issue_body="${RUNNER_TEMP}/hermex-app-upstream-issue.md"
+          {
+            echo "<!-- hermex-app-upstream-watch -->"
+            echo "# Hermex App Upstream Sync Required"
+            echo
+            echo "The personal release gate is blocked until the upstream app changes are reviewed, integrated, and validated."
+            echo
+            echo "- Personal release SHA: \`${RELEASE_SHA}\`"
+            echo "- Current upstream SHA: \`${UPSTREAM_SHA}\`"
+            echo "- Commits awaiting validation: \`${COMMITS_BEHIND}\`"
+            echo "- Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "Create a sync branch from \`personal/main\`, merge the read-only \`upstream/master\` ref, preserve the personal baseline, run the complete suite and simulator smoke, then advance both app-upstream marker files in the reviewed sync PR."
+            echo
+            cat hermex-app-upstream-status.md
+          } > "${issue_body}"
+
+          issue_record="$(
+            gh issue list \
+              --state all \
+              --limit 100 \
+              --search "in:title \"${ISSUE_TITLE}\"" \
+              --json number,state,title \
+              --jq ".[] | select(.title == \"${ISSUE_TITLE}\") | [.number, .state] | @tsv" |
+              head -n 1
+          )"
+
+          if [[ -z "${issue_record}" ]]; then
+            gh issue create \
+              --title "${ISSUE_TITLE}" \
+              --body-file "${issue_body}" \
+              --label "needs-triage"
+          else
+            issue_number="${issue_record%%$'\t'*}"
+            issue_state="${issue_record#*$'\t'}"
+            if [[ "${issue_state}" != "OPEN" ]]; then
+              gh issue reopen "${issue_number}"
+            fi
+            gh issue edit "${issue_number}" \
+              --body-file "${issue_body}" \
+              --add-label "needs-triage"
+          fi
+
+      - name: Close resolved upstream-sync issue
+        if: ${{ steps.status.outputs.is_releasable == 'true' && (github.event_name != 'workflow_dispatch' || inputs.post_issue) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue_number="$(
+            gh issue list \
+              --state open \
+              --limit 100 \
+              --search "in:title \"${ISSUE_TITLE}\"" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${ISSUE_TITLE}\") | .number" |
+              head -n 1
+          )"
+          if [[ -n "${issue_number}" ]]; then
+            gh issue close "${issue_number}" \
+              --comment "The tested upstream marker now matches the upstream app tip and the personal release baseline is intact."
+          fi

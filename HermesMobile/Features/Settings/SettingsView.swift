@@ -417,6 +417,9 @@ struct SettingsView: View {
                 SettingsCard(title: String(localized: "App")) {
                     SettingsInfoRow(title: String(localized: "Version"), value: appVersion)
                     SettingsInfoRow(title: String(localized: "Build"), value: appBuild)
+                    if let buildSource = AppBuildSource.current {
+                        SettingsInfoRow(title: String(localized: "Git"), value: buildSource.displayValue)
+                    }
 
                     SettingsDivider()
 

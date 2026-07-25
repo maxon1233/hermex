@@ -26,6 +26,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  policy:
+    name: Personal Release Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require personal fork pull requests to target personal/main
+        env:
+          REPOSITORY: ${{ github.repository }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "${REPOSITORY}" == "maxon1233/hermex" && "${BASE_REF}" != "personal/main" ]]; then
+            echo "Fork pull requests must target personal/main; found ${BASE_REF}." >&2
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate personal release guard
+        run: |
+          set -euo pipefail
+          python3 -m unittest ci/personal_release_test.py
+          scripts/personal-release validate-baseline --release-ref HEAD
+
   changes:
     name: Detect changed paths
     runs-on: ubuntu-latest
@@ -196,7 +223,7 @@ jobs:
 
   gate:
     name: CI Gate
-    needs: [changes, test]
+    needs: [policy, changes, test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -204,8 +231,13 @@ jobs:
       - name: Check results
         run: |
           set -euo pipefail
+          echo "policy: ${{ needs.policy.result }}"
           echo "changes: ${{ needs.changes.result }}"
           echo "test: ${{ needs.test.result }}"
+          if [[ "${{ needs.policy.result }}" != "success" ]]; then
+            echo "Personal release policy failed — failing the gate." >&2
+            exit 1
+          fi
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
             echo "Path detection failed — failing the gate." >&2
             exit 1
