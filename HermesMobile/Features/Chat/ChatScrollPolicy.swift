@@ -95,6 +95,44 @@ struct ChatTranscriptScrollPosition: Codable, Equatable {
     }
 }
 
+/// Keeps high-frequency viewport samples out of SwiftUI's observation graph.
+///
+/// `record(_:)` is intentionally memory-only so it is safe to call for every
+/// scroll geometry sample. `flush()` performs at most one write for the latest
+/// changed position and is called only when scrolling settles or the view/app
+/// leaves the foreground.
+final class ChatTranscriptScrollPositionRecorder {
+    private(set) var latestPosition: ChatTranscriptScrollPosition?
+    private var persistedPosition: ChatTranscriptScrollPosition?
+    private let writer: (ChatTranscriptScrollPosition) -> Void
+
+    init(
+        initialPosition: ChatTranscriptScrollPosition?,
+        writer: @escaping (ChatTranscriptScrollPosition) -> Void
+    ) {
+        latestPosition = initialPosition
+        persistedPosition = initialPosition
+        self.writer = writer
+    }
+
+    func record(_ position: ChatTranscriptScrollPosition?) {
+        guard let position, position != latestPosition else { return }
+        latestPosition = position
+    }
+
+    @discardableResult
+    func flush() -> Bool {
+        guard let latestPosition,
+              latestPosition != persistedPosition else {
+            return false
+        }
+
+        writer(latestPosition)
+        persistedPosition = latestPosition
+        return true
+    }
+}
+
 struct ChatTranscriptRowContentFrame: Equatable {
     let renderID: String
     let messageID: String?
@@ -144,17 +182,35 @@ enum ChatTranscriptReadingPositionResolver {
         frames: [ChatTranscriptRowContentFrame],
         visibleContentOffsetY: Double
     ) -> ChatTranscriptScrollPosition? {
-        let orderedFrames = frames.sorted { $0.minY < $1.minY }
-        guard let firstFrame = orderedFrames.first else {
+        guard var firstFrame = frames.first else {
             return nil
+        }
+
+        var finalFrame = firstFrame
+        var firstIntersectingFrame: ChatTranscriptRowContentFrame?
+
+        for frame in frames {
+            if frame.minY < firstFrame.minY {
+                firstFrame = frame
+            }
+            if frame.minY > finalFrame.minY {
+                finalFrame = frame
+            }
+            if frame.maxY > visibleContentOffsetY {
+                if let currentFrame = firstIntersectingFrame {
+                    if frame.minY < currentFrame.minY {
+                        firstIntersectingFrame = frame
+                    }
+                } else {
+                    firstIntersectingFrame = frame
+                }
+            }
         }
 
         // When the viewport is in spacing after the final ordinary message
         // (for example above the composer), retain the final row as the anchor
         // and allow an offset larger than that row's height.
-        let anchorFrame = orderedFrames.first { $0.maxY > visibleContentOffsetY }
-            ?? orderedFrames.last
-            ?? firstFrame
+        let anchorFrame = firstIntersectingFrame ?? finalFrame
 
         return ChatTranscriptScrollPosition(
             renderID: anchorFrame.renderID,
