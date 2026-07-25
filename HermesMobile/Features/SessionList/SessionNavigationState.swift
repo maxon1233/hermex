@@ -58,6 +58,17 @@ struct SessionNavigationState: Equatable {
         destination = .utility(utility)
     }
 
+    mutating func select(_ newDestination: SessionNavigationDestination) {
+        switch newDestination {
+        case .session(let session):
+            select(session)
+        case .newChat(let route):
+            select(route)
+        case .utility(let utility):
+            select(utility)
+        }
+    }
+
     mutating func remember(_ session: SessionSummary) {
         guard let sessionID = Self.normalized(session.sessionId) else { return }
         if case .newChat = destination {
@@ -128,5 +139,14 @@ enum ChatComposerDraftPersistence {
         let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSessionID.isEmpty else { return nil }
         return keyPrefix + server.absoluteString + "." + normalizedSessionID
+    }
+}
+
+enum SessionNavigationTransition {
+    static func requiresDismissalBeforeReplacingDestination(
+        hasCurrentDestination: Bool,
+        usesRegularWidthNavigation: Bool
+    ) -> Bool {
+        hasCurrentDestination && !usesRegularWidthNavigation
     }
 }

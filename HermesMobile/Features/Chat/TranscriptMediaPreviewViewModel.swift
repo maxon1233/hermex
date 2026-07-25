@@ -12,10 +12,12 @@ final class TranscriptMediaPreviewViewModel {
     private var loadGeneration = 0
     private var originalData: Data?
     private var temporaryVideoURL: URL?
+    private var temporaryFilePreviewDirectoryURL: URL?
 
     private(set) var previewData: Data?
     private(set) var audioData: Data?
     private(set) var videoFileURL: URL?
+    private(set) var filePreviewURL: URL?
     private(set) var originalByteCount: Int?
     private(set) var isLoading = false
     private(set) var errorMessage: String?
@@ -56,11 +58,16 @@ final class TranscriptMediaPreviewViewModel {
         previewData = nil
         audioData = nil
         videoFileURL = nil
+        filePreviewURL = nil
         originalByteCount = nil
         originalData = nil
         removeTemporaryVideoFile()
+        removeTemporaryFilePreview()
 
-        guard reference.isRasterImageCandidate || reference.isVideoCandidate else {
+        guard reference.isRasterImageCandidate
+            || reference.isVideoCandidate
+            || reference.mediaKind == .unsupported
+        else {
             errorMessage = String(localized: "Preview is not available for this media type.")
             return
         }
@@ -80,7 +87,15 @@ final class TranscriptMediaPreviewViewModel {
             originalData = data
             originalByteCount = data.count
 
-            if reference.isVideoCandidate {
+            if reference.mediaKind == .unsupported {
+                let fileURL = try writeTemporaryFilePreview(data)
+                guard !Task.isCancelled, loadGeneration == generation else {
+                    try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
+                    return
+                }
+                temporaryFilePreviewDirectoryURL = fileURL.deletingLastPathComponent()
+                filePreviewURL = fileURL
+            } else if reference.isVideoCandidate {
                 let fileURL = try writeTemporaryVideoFile(data)
                 guard !Task.isCancelled, loadGeneration == generation else {
                     try? FileManager.default.removeItem(at: fileURL)
@@ -169,6 +184,8 @@ final class TranscriptMediaPreviewViewModel {
         audioData = nil
         removeTemporaryVideoFile()
         videoFileURL = nil
+        removeTemporaryFilePreview()
+        filePreviewURL = nil
     }
 
     private func writeTemporaryVideoFile(_ data: Data) throws -> URL {
@@ -186,6 +203,33 @@ final class TranscriptMediaPreviewViewModel {
         temporaryVideoURL = nil
     }
 
+    private func writeTemporaryFilePreview(_ data: Data) throws -> URL {
+        let payload = TranscriptMediaExportSupport.payload(
+            for: reference,
+            data: data,
+            resolvedKind: .data
+        )
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("transcript-file-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directoryURL.appendingPathComponent(payload.filename)
+
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: [.atomic])
+            return fileURL
+        } catch {
+            try? FileManager.default.removeItem(at: directoryURL)
+            throw error
+        }
+    }
+
+    private func removeTemporaryFilePreview() {
+        if let temporaryFilePreviewDirectoryURL {
+            try? FileManager.default.removeItem(at: temporaryFilePreviewDirectoryURL)
+        }
+        temporaryFilePreviewDirectoryURL = nil
+    }
+
     private static func isAudioData(_ data: Data) -> Bool {
         (try? AVAudioPlayer(data: data)) != nil
     }
@@ -201,6 +245,10 @@ final class TranscriptMediaPreviewViewModel {
 
         if videoFileURL != nil {
             return .video
+        }
+
+        if filePreviewURL != nil {
+            return .data
         }
 
         return nil

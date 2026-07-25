@@ -10,6 +10,13 @@ APP_IDENTIFIER_SUFFIX =
 APP_BUNDLE_IDENTIFIER = com.uzairansar.hermesmobile$(APP_IDENTIFIER_SUFFIX)
 APP_GROUP_IDENTIFIER = group.com.uzairansar.hermesmobile$(APP_IDENTIFIER_SUFFIX)
 
+// Release tooling overrides these without editing the project. Development
+// builds deliberately report no source identity in Settings.
+HERMEX_BUILD_SOURCE_SHA = development
+HERMEX_BUILD_SOURCE_BRANCH = development
+HERMEX_BUILD_UPSTREAM_SHA = development
+HERMEX_BUILD_SOURCE_DIRTY = UNKNOWN
+
 // Optional per-machine overrides. This include must stay last: later
 // assignments win, so Local.xcconfig values override the defaults above.
 #include? "Local.xcconfig"

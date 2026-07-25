@@ -442,6 +442,22 @@ struct AutomatedSessionVisibility: Equatable {
         showsSubagents: true
     )
 
+    /// Visibility policy for the human-conversation Sessions surface. Cron
+    /// executions are owned by Tasks regardless of the other source toggles,
+    /// so recurring jobs can never bury ordinary conversations or search hits.
+    static func sessionsSurface(
+        showsCli: Bool,
+        showsClaudeCode: Bool,
+        showsSubagents: Bool
+    ) -> AutomatedSessionVisibility {
+        AutomatedSessionVisibility(
+            showsCron: false,
+            showsCli: showsCli,
+            showsClaudeCode: showsClaudeCode,
+            showsSubagents: showsSubagents
+        )
+    }
+
     init(
         showsCron: Bool,
         showsCli: Bool,

@@ -116,29 +116,55 @@ final class TranscriptMediaPreviewViewModelTests: XCTestCase {
         XCTAssertEqual(recorder.requestCount, 1)
     }
 
-    func testUnsupportedMediaSetsUnavailableStateWithoutRequest() async {
+    func testLoadUnsupportedFileUsesMediaEndpointAndCreatesQuickLookFileURL() async throws {
         let recorder = TranscriptMediaPreviewRequestRecorder()
+        let fileData = Data("Preview me".utf8)
+        let mediaPath = "/tmp/report.txt"
+        let sessionID = "session-123"
         let client = makeClient { request in
             recorder.record(request)
-            return self.response(statusCode: 200, data: Data(), for: request)
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path, "/api/media")
+            return self.response(statusCode: 200, data: fileData, for: request)
         }
         let viewModel = TranscriptMediaPreviewViewModel(
             server: Self.baseURL,
-            sessionID: "session-123",
-            reference: .init(rawReference: "/tmp/vector.svg"),
+            sessionID: sessionID,
+            reference: .init(rawReference: mediaPath),
             apiClient: client
         )
 
         await viewModel.load()
 
         XCTAssertFalse(viewModel.isLoading)
-        XCTAssertEqual(viewModel.errorMessage, "Preview is not available for this media type.")
+        XCTAssertNil(viewModel.errorMessage)
         XCTAssertNil(viewModel.previewData)
         XCTAssertNil(viewModel.lastError)
+        let filePreviewURL = try XCTUnwrap(viewModel.filePreviewURL)
+        XCTAssertEqual(filePreviewURL.lastPathComponent, "report.txt")
+        XCTAssertEqual(filePreviewURL.pathExtension, "txt")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filePreviewURL.path))
+        XCTAssertEqual(try Data(contentsOf: filePreviewURL), fileData)
+        XCTAssertEqual(viewModel.originalByteCount, fileData.count)
         XCTAssertFalse(viewModel.canSaveImageToPhotos)
         XCTAssertFalse(viewModel.canSaveMediaToPhotos)
-        XCTAssertFalse(viewModel.canExportMedia)
-        XCTAssertEqual(recorder.requestCount, 0)
+        XCTAssertTrue(viewModel.canExportMedia)
+
+        let payload = try await viewModel.exportPayload()
+        XCTAssertEqual(payload.data, fileData)
+        XCTAssertEqual(payload.filename, "report.txt")
+        XCTAssertEqual(payload.contentType, .plainText)
+        XCTAssertFalse(payload.isImage)
+        XCTAssertFalse(payload.isVideo)
+
+        let queryItems = queryItems(for: try XCTUnwrap(recorder.firstURL))
+        XCTAssertEqual(queryItems["session_id"], sessionID)
+        XCTAssertEqual(queryItems["path"], mediaPath)
+        XCTAssertEqual(recorder.requestCount, 1)
+
+        viewModel.cleanupTemporaryFiles()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: filePreviewURL.path))
+        XCTAssertNil(viewModel.filePreviewURL)
     }
 
     func testLoadLocalImageWithoutSessionIDDoesNotRequestMediaEndpoint() async {

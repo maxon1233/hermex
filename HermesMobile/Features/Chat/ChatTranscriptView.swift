@@ -133,6 +133,16 @@ struct ChatTranscriptView: View {
                             contentWidth: contentWidth
                         )
                     }
+                    .defaultScrollAnchor(
+                        ChatScrollPolicy.initialTranscriptAnchor,
+                        for: .initialOffset
+                    )
+                    .defaultScrollAnchor(
+                        ChatScrollPolicy.sizeChangeAnchor(
+                            shouldFollowLatestMessage: shouldFollowLatestMessage
+                        ),
+                        for: .sizeChanges
+                    )
                     .scrollPosition($transcriptScrollPosition)
                     .onScrollGeometryChange(
                         for: ChatTranscriptScrollGeometrySnapshot.self,
@@ -181,7 +191,9 @@ struct ChatTranscriptView: View {
                             .frame(height: transcriptBottomInsetHeight)
                             .accessibilityHidden(true)
                     }
-                    .adaptiveSoftScrollEdges()
+                    // The navigation root supplies a gradual soft top edge;
+                    // retain the softer fade only around the bottom composer.
+                    .adaptiveSoftScrollEdges(.bottom)
                     .simultaneousGesture(
                         TapGesture().onEnded {
                             guard clarificationPrompt == nil else { return }

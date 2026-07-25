@@ -64,7 +64,6 @@ struct SettingsView: View {
     @AppStorage(AgentRunLiveActivityPrivacy.showsResponseExcerptsKey) private var showsLiveActivityResponseExcerpts = false
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
-    @AppStorage(SessionRowDisplaySettings.showCronSessionsKey) private var showsCronSessions = true
     @AppStorage(SessionRowDisplaySettings.showSubagentSessionsKey)
     private var showsSubagentSessions = SessionRowDisplaySettings.defaultShowsSubagentSessions
     @State private var cliSessionsSync: CliSessionsSyncModel
@@ -291,14 +290,6 @@ struct SettingsView: View {
                     SettingsDivider()
 
                     SettingsToggleRow(
-                        title: String(localized: "Cron Sessions"),
-                        systemImage: "clock.arrow.2.circlepath",
-                        isOn: $showsCronSessions
-                    )
-
-                    SettingsDivider()
-
-                    SettingsToggleRow(
                         title: String(localized: "CLI Sessions"),
                         systemImage: "terminal",
                         isOn: Binding(
@@ -426,6 +417,9 @@ struct SettingsView: View {
                 SettingsCard(title: String(localized: "App")) {
                     SettingsInfoRow(title: String(localized: "Version"), value: appVersion)
                     SettingsInfoRow(title: String(localized: "Build"), value: appBuild)
+                    if let buildSource = AppBuildSource.current {
+                        SettingsInfoRow(title: String(localized: "Git"), value: buildSource.displayValue)
+                    }
 
                     SettingsDivider()
 

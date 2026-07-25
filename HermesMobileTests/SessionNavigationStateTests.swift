@@ -87,6 +87,27 @@ final class SessionNavigationStateTests: XCTestCase {
         XCTAssertGreaterThan(state.rootRevision, firstRevision)
     }
 
+    func testCompactNavigationDismissesCurrentDestinationBeforeReplacingIt() {
+        XCTAssertTrue(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: true,
+                usesRegularWidthNavigation: false
+            )
+        )
+        XCTAssertFalse(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: false,
+                usesRegularWidthNavigation: false
+            )
+        )
+        XCTAssertFalse(
+            SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+                hasCurrentDestination: true,
+                usesRegularWidthNavigation: true
+            )
+        )
+    }
+
     func testRefreshPolicyReloadsAfterReturningFromExistingSession() {
         let session = SessionSummary(sessionId: "session-1")
 

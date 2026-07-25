@@ -4,10 +4,16 @@ struct TaskDetailView: View {
     let server: URL
     let onAPIError: (Error) -> Void
     let onMutation: (CronJobListMutation) -> Void
+    let sessions: [SessionSummary]
+    let onStartSession: (String) -> Void
 
     @State private var viewModel: TaskDetailViewModel
     @State private var isPresentingEditTask = false
     @State private var isConfirmingDelete = false
+    @State private var isPresentingFullTask = false
+    @State private var sessionToOpen: SessionSummary?
+    @State private var sessionPendingFullTaskDismissal: SessionSummary?
+    @State private var expandedRunIDs: Set<String> = []
     @Environment(\.dismiss) private var dismiss
 
     init(
@@ -15,50 +21,35 @@ struct TaskDetailView: View {
         runningElapsed: Double?,
         server: URL,
         onAPIError: @escaping (Error) -> Void,
-        onMutation: @escaping (CronJobListMutation) -> Void = { _ in }
+        onMutation: @escaping (CronJobListMutation) -> Void = { _ in },
+        sessions: [SessionSummary] = [],
+        onStartSession: @escaping (String) -> Void = { _ in }
     ) {
         self.server = server
         self.onAPIError = onAPIError
         self.onMutation = onMutation
+        self.sessions = sessions
+        self.onStartSession = onStartSession
         _viewModel = State(initialValue: TaskDetailViewModel(job: job, runningElapsed: runningElapsed, server: server))
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 20) {
                 headerSection
                 actionStatusSection
-                metadataSection
-
-                if viewModel.isLoading && viewModel.outputs.isEmpty {
-                    ProgressView("Loading output...")
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.top, 24)
-                } else if let errorMessage = viewModel.errorMessage, viewModel.outputs.isEmpty {
-                    ContentUnavailableView {
-                        Label("Could Not Load Output", systemImage: "exclamationmark.triangle")
-                    } description: {
-                        Text(errorMessage)
-                    } actions: {
-                        Button("Try Again") {
-                            Task { await loadOutput() }
-                        }
-                    }
-                    .padding(.top, 24)
-                } else if viewModel.outputs.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Recent Output", systemImage: "doc.text")
-                    } description: {
-                        Text("This task has not produced any output yet.")
-                    }
-                    .padding(.top, 24)
-                } else {
-                    outputsSection
-                }
+                descriptionSection
+                scheduleSection
+                currentStatusSection
+                runHistorySection
             }
             .padding()
         }
         .navigationTitle(viewModel.job.displayName)
+        .navigationDestination(item: $sessionToOpen) { session in
+            ChatView(session: session, server: server, onAPIError: onAPIError)
+                .id(session.id)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button {
@@ -123,6 +114,9 @@ struct TaskDetailView: View {
                 return didUpdate
             }
         }
+        .sheet(isPresented: $isPresentingFullTask, onDismiss: openPendingFullTaskSession) {
+            fullTaskSheet
+        }
         .alert("Delete Task?", isPresented: $isConfirmingDelete) {
             Button("Delete", role: .destructive) {
                 Task { await deleteTask() }
@@ -138,27 +132,45 @@ struct TaskDetailView: View {
 
     @ViewBuilder
     private var headerSection: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(viewModel.job.displayName)
+                .font(.title2.bold())
+                .lineLimit(2)
+
+            Spacer(minLength: 8)
+
+            StatusBadge(
+                text: viewModel.runningElapsed == nil ? viewModel.job.status.label : String(localized: "Running"),
+                color: statusColor
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var descriptionSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(viewModel.job.displayName)
-                    .font(.title2.bold())
-                    .lineLimit(2)
+            Text("Description")
+                .font(.headline)
 
-                Spacer(minLength: 8)
-
-                StatusBadge(
-                    text: viewModel.runningElapsed == nil ? viewModel.job.status.label : String(localized: "Running"),
-                    color: statusColor
-                )
-            }
-
-            if let prompt = viewModel.job.prompt, !prompt.isEmpty {
-                Text(prompt)
+            if let summary = viewModel.job.descriptionSummary, !summary.isEmpty {
+                Text(summary)
                     .font(.body)
                     .foregroundStyle(.secondary)
-                    .lineLimit(5)
+
+                Button("Show full task") {
+                    isPresentingFullTask = true
+                }
+                .font(.subheadline.weight(.medium))
+            } else {
+                Text("No description provided.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
             }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     @ViewBuilder
@@ -178,90 +190,320 @@ struct TaskDetailView: View {
     }
 
     @ViewBuilder
-    private var metadataSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            CronJobMetadataRow(
-                title: String(localized: "Schedule"),
-                value: viewModel.job.scheduleText ?? String(localized: "Not available")
-            )
+    private var scheduleSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Schedule")
+                .font(.headline)
 
-            CronJobMetadataRow(
-                title: String(localized: "Next"),
-                value: viewModel.job.nextRunAt?.formatted ?? String(localized: "Not available")
-            )
-
-            CronJobMetadataRow(
-                title: String(localized: "Last"),
-                value: viewModel.job.lastRunAt?.formatted ?? String(localized: "Never")
-            )
-
-            if let runningElapsed = viewModel.runningElapsed {
+            VStack(alignment: .leading, spacing: 6) {
                 CronJobMetadataRow(
-                    title: String(localized: "Elapsed"),
-                    value: elapsedText(runningElapsed)
+                    title: String(localized: "How often"),
+                    value: viewModel.job.readableScheduleText ?? String(localized: "Not available")
                 )
-            }
 
-            CronJobMetadataRow(
-                title: String(localized: "Deliver"),
-                value: viewModel.job.deliver ?? "local"
-            )
+                CronJobMetadataRow(
+                    title: String(localized: "Next run"),
+                    value: viewModel.job.nextRunAt?.formatted ?? String(localized: "Not available")
+                )
 
-            if let model = viewModel.job.model, !model.isEmpty {
-                CronJobMetadataRow(title: String(localized: "Model"), value: model)
-            }
+                CronJobMetadataRow(
+                    title: String(localized: "First run"),
+                    value: firstRunText
+                )
 
-            if let provider = viewModel.job.provider, !provider.isEmpty {
-                CronJobMetadataRow(title: String(localized: "Provider"), value: provider)
+                if let runningElapsed = viewModel.runningElapsed {
+                    CronJobMetadataRow(
+                        title: String(localized: "Running for"),
+                        value: elapsedText(runningElapsed)
+                    )
+                }
             }
-
-            if let profile = viewModel.job.profile, !profile.isEmpty {
-                CronJobMetadataRow(title: String(localized: "Profile"), value: profile)
-            }
-
-            if let toastNotifications = viewModel.job.toastNotifications {
-                CronJobMetadataRow(title: String(localized: "Toasts"), value: toastNotifications ? String(localized: "On") : String(localized: "Off"))
-            }
-
-            if let skills = viewModel.job.skills, !skills.isEmpty {
-                CronJobMetadataRow(title: String(localized: "Skills"), value: skills.joined(separator: ", "))
-            }
-
-            if let error = viewModel.job.lastError ?? viewModel.job.lastDeliveryError, !error.isEmpty {
-                CronJobMetadataRow(title: String(localized: "Error"), value: error)
-                    .foregroundStyle(.red)
-            }
+            .font(.footnote)
         }
-        .font(.footnote)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     @ViewBuilder
-    private var outputsSection: some View {
+    private var currentStatusSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Recent Output")
+            Text("Current Status")
                 .font(.headline)
 
-            ForEach(viewModel.outputs) { output in
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(output.filename ?? String(localized: "Untitled"))
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(currentRunStatus.text, systemImage: currentRunStatus.systemImage)
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(currentRunStatus.color)
 
-                    if let content = output.content, !content.isEmpty {
-                        Text(content)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                            .padding(12)
-                            .background(Color(.secondarySystemBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    } else {
-                        Text("Empty output")
-                            .font(.subheadline)
+                    Spacer(minLength: 8)
+
+                    if let time = viewModel.outputs.first?.formattedRunTime {
+                        Text(time)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
-                .padding(.vertical, 8)
+
+                if viewModel.isLoading && viewModel.outputs.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Loading latest update...")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let errorMessage = viewModel.errorMessage, viewModel.outputs.isEmpty {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+
+                    Button("Try Again") {
+                        Task { await loadOutput() }
+                    }
+                    .font(.subheadline.weight(.medium))
+                } else if let latestOutput = viewModel.outputs.first {
+                    if let result = latestOutput.resultText {
+                        MarkdownRenderer(content: result)
+                    } else {
+                        Text("The latest run did not record an update.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No updates yet. This task has not completed a run.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let error = viewModel.job.lastError ?? viewModel.job.lastDeliveryError, !error.isEmpty {
+                    Divider()
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+                }
+
+                Divider()
+
+                runSessionAction(
+                    output: viewModel.outputs.first,
+                    momentTitle: String(localized: "Current task status")
+                )
+                .font(.subheadline.weight(.semibold))
             }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    private var runHistorySection: some View {
+        let runSessions = resolvedRunSessions
+
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("Run History")
+                .font(.headline)
+
+            if viewModel.outputs.isEmpty {
+                Text("No runs recorded.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 2)
+            } else {
+                LazyVStack(spacing: 12) {
+                    ForEach(viewModel.outputs) { output in
+                        runHistoryCard(output, session: runSessions[output.id])
+                    }
+                }
+            }
+        }
+    }
+
+    private func runHistoryCard(_ output: CronOutputItem, session: SessionSummary?) -> some View {
+        let isExpanded = expandedRunIDs.contains(output.id)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Label(
+                    output.formattedRunTime ?? String(localized: "Recorded result"),
+                    systemImage: "clock"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+                Spacer(minLength: 8)
+
+                if output.id == viewModel.outputs.first?.id {
+                    Text("Latest")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.blue)
+                }
+            }
+
+            if isExpanded, let result = output.resultText {
+                MarkdownRenderer(content: result)
+            } else {
+                Text(output.summaryText)
+                    .font(.body)
+                    .foregroundStyle(output.resultText == nil ? .secondary : .primary)
+                    .lineLimit(3)
+            }
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if isExpanded {
+                            expandedRunIDs.remove(output.id)
+                        } else {
+                            expandedRunIDs.insert(output.id)
+                        }
+                    }
+                } label: {
+                    Label(
+                        isExpanded ? "Show Less" : "Show Full Run",
+                        systemImage: isExpanded ? "chevron.up" : "chevron.down"
+                    )
+                }
+
+                Spacer(minLength: 8)
+
+                runSessionAction(
+                    output: output,
+                    session: session,
+                    momentTitle: String(localized: "Task run")
+                )
+            }
+            .font(.subheadline.weight(.semibold))
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var fullTaskSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text(viewModel.job.prompt ?? String(localized: "No description provided."))
+                        .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button {
+                        if let latestOutput = viewModel.outputs.first,
+                           let session = resolvedRunSessions[latestOutput.id] {
+                            sessionPendingFullTaskDismissal = session
+                            isPresentingFullTask = false
+                        } else {
+                            isPresentingFullTask = false
+                            startSession(from: nil, momentTitle: String(localized: "Full task description"))
+                        }
+                    } label: {
+                        Label(
+                            latestSession == nil ? "Start Session" : "Open Session",
+                            systemImage: "bubble.left.and.bubble.right"
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding()
+            }
+            .navigationTitle("Full Task")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        isPresentingFullTask = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var firstRunText: String {
+        guard let firstRun = viewModel.outputs
+            .filter({ $0.runDate != nil })
+            .min(by: { ($0.runDate ?? .distantFuture) < ($1.runDate ?? .distantFuture) }) else {
+            return String(localized: "Not run yet")
+        }
+        return firstRun.formattedRunTime ?? String(localized: "Not recorded")
+    }
+
+    private var resolvedRunSessions: [String: SessionSummary] {
+        CronRunSessionResolver.sessionsByOutputID(
+            job: viewModel.job,
+            outputs: viewModel.outputs,
+            sessions: sessions
+        )
+    }
+
+    private var latestSession: SessionSummary? {
+        guard let latestOutput = viewModel.outputs.first else { return nil }
+        return resolvedRunSessions[latestOutput.id]
+    }
+
+    @ViewBuilder
+    private func runSessionAction(
+        output: CronOutputItem?,
+        session: SessionSummary? = nil,
+        momentTitle: String
+    ) -> some View {
+        let resolvedSession = session ?? output.flatMap { resolvedRunSessions[$0.id] }
+        if let resolvedSession {
+            Button {
+                sessionToOpen = resolvedSession
+            } label: {
+                Label("Open Session", systemImage: "bubble.left.and.bubble.right")
+            }
+        } else {
+            Button {
+                startSession(from: output, momentTitle: momentTitle)
+            } label: {
+                Label("Start Session", systemImage: "bubble.left.and.bubble.right")
+            }
+        }
+    }
+
+    private func openPendingFullTaskSession() {
+        guard let pendingSession = sessionPendingFullTaskDismissal else { return }
+        sessionPendingFullTaskDismissal = nil
+        sessionToOpen = pendingSession
+    }
+
+    private func startSession(from output: CronOutputItem?, momentTitle: String) {
+        onStartSession(
+            CronSessionContextBuilder.draft(
+                job: viewModel.job,
+                outputs: viewModel.outputs,
+                selectedOutput: output,
+                momentTitle: momentTitle
+            )
+        )
+    }
+
+    private var currentRunStatus: (text: String, systemImage: String, color: Color) {
+        if viewModel.runningElapsed != nil {
+            return (String(localized: "Running now"), "arrow.triangle.2.circlepath", .blue)
+        }
+
+        switch viewModel.job.lastStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ok", "success", "succeeded", "completed":
+            return (String(localized: "Latest run completed"), "checkmark.circle.fill", .green)
+        case "error", "failed", "failure":
+            return (String(localized: "Latest run failed"), "xmark.circle.fill", .red)
+        case "cancelled", "canceled":
+            return (String(localized: "Latest run cancelled"), "slash.circle.fill", .orange)
+        default:
+            if viewModel.outputs.isEmpty {
+                return (String(localized: "Waiting for first run"), "clock", .secondary)
+            }
+            return (String(localized: "Latest update"), "info.circle.fill", .blue)
         }
     }
 

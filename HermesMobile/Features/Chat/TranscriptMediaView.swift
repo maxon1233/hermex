@@ -1,5 +1,6 @@
 import AVFoundation
 import AVKit
+import QuickLook
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -138,6 +139,9 @@ private struct TranscriptMediaThumbnailView: View {
                     reference: reference,
                     loadMediaData: {
                         await loadMediaData(reference)
+                    },
+                    onPreviewFile: {
+                        onPreviewMedia?(reference)
                     }
                 )
             } else {
@@ -388,6 +392,7 @@ private struct TranscriptMediaAudioExportView: View {
 private struct TranscriptMediaFileExportView: View {
     let reference: TranscriptMediaReference
     let loadMediaData: () async -> Data?
+    let onPreviewFile: () -> Void
 
     @State private var cachedData: Data?
     @State private var exportDocument = ExportedFileDocument(data: Data())
@@ -400,48 +405,65 @@ private struct TranscriptMediaFileExportView: View {
     init(
         reference: TranscriptMediaReference,
         initialData: Data? = nil,
-        loadMediaData: @escaping () async -> Data?
+        loadMediaData: @escaping () async -> Data?,
+        onPreviewFile: @escaping () -> Void
     ) {
         self.reference = reference
         self.loadMediaData = loadMediaData
+        self.onPreviewFile = onPreviewFile
         _cachedData = State(initialValue: initialData)
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "doc")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Color(.secondaryLabel))
+        HStack(spacing: 0) {
+            Button(action: onPreviewFile) {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color(.secondaryLabel))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(reference.displayName)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color(.label))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(reference.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color(.label))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
 
-                Text(isExporting
-                     ? String(localized: "Loading…")
-                     : String(localized: "Tap to download"))
-                    .font(.caption2)
-                    .foregroundStyle(Color(.secondaryLabel))
-                    .lineLimit(1)
+                        Text("Tap to preview")
+                            .font(.caption2)
+                            .foregroundStyle(Color(.secondaryLabel))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 8)
+                }
+                .padding(.leading, 10)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
-
-            Spacer(minLength: 8)
+            .buttonStyle(.chatTactile(.thumbnail))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel(String(localized: "Preview file \(reference.displayName)"))
 
             Button {
                 Task { await exportFile() }
             } label: {
-                Image(systemName: "square.and.arrow.down")
-                    .font(.system(size: 15, weight: .semibold))
+                Group {
+                    if isExporting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "square.and.arrow.down")
+                            .font(.system(size: 15, weight: .semibold))
+                    }
+                }
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.chatTactile(.icon))
             .disabled(isExporting)
             .accessibilityLabel(String(localized: "Download \(reference.displayName)"))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
         .frame(maxWidth: 240, alignment: .leading)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -694,6 +716,8 @@ struct TranscriptMediaPreviewView: View {
                     audioContent(audioData)
                 } else if let videoURL = viewModel.videoFileURL {
                     videoContent(videoURL)
+                } else if let fileURL = viewModel.filePreviewURL {
+                    TranscriptFileQuickLookView(url: fileURL)
                 } else {
                     unavailableContent(String(localized: "Preview is not available for this media."))
                 }
@@ -954,6 +978,41 @@ private struct TranscriptVideoPreviewPlayerView: View {
         }
         .onDisappear {
             player?.pause()
+        }
+    }
+}
+
+private struct TranscriptFileQuickLookView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(url: url)
+    }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        controller.reloadData()
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+
+        init(url: URL) {
+            self.url = url
+        }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+            1
+        }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
         }
     }
 }

@@ -612,30 +612,8 @@ struct ChatView: View {
         .navigationTitle(displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .accessibilityIdentifier("chat-detail:\(viewModel.displayTitle)")
-        .task {
-            viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
-            if loadsInitialMessages {
-                await loadMessages(appliesInitialFocus: false)
-            }
-            if initialAttachments.isEmpty {
-                isInitialComposerFocusContentReady = true
-                applyInitialComposerFocusPolicyIfNeeded()
-            }
-            await viewModel.loadComposerConfiguration()
-            await viewModel.refreshApprovalBypassState()
-            await uploadInitialAttachmentsIfNeeded()
-            isInitialComposerFocusContentReady = true
-            applyInitialComposerFocusPolicyIfNeeded()
-            if let lastError = viewModel.lastError {
-                onAPIError(lastError)
-            }
-        }
-        .task(id: gitAvailabilityTaskID) {
-            let availabilityViewModel = GitWorkspaceAvailabilityViewModel(session: session, server: server)
-            await MainActor.run {
-                gitAvailabilityViewModel = availabilityViewModel
-            }
-            await availabilityViewModel.loadIfNeeded()
+        .task(id: didCompleteInitialAppearance) {
+            await handleInitialAppearanceTask()
         }
         .onChange(of: scenePhase) {
                 handleScenePhaseChange(scenePhase)
@@ -847,10 +825,6 @@ struct ChatView: View {
             )
             .transition(ChatMotion.disclosureTransition(reduceMotion: reduceMotion))
         }
-    }
-
-    private var gitAvailabilityTaskID: String {
-        "\(session.id)|\(server.absoluteString)"
     }
 
     private var gitWriteAvailability: GitWriteAvailability {
@@ -1360,6 +1334,60 @@ struct ChatView: View {
 
     private var latestTranscriptMessageRole: String? {
         transcriptMessages.last?.message.role
+    }
+
+    private func prepareInitialAppearance() {
+        viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
+        if loadsInitialMessages {
+            viewModel.prepareInitialMessageLoad(modelContext: modelContext)
+        }
+    }
+
+    private func handleInitialAppearanceTask() async {
+        prepareInitialAppearance()
+
+        guard ChatInitialAppearancePolicy.shouldBeginAsyncWork(
+            hasCompletedAppearance: didCompleteInitialAppearance
+        ) else {
+            return
+        }
+
+        async let chatStartup: Void = performInitialAsyncWork()
+        async let gitAvailability: Void = loadInitialGitAvailability()
+        _ = await (chatStartup, gitAvailability)
+    }
+
+    private func performInitialAsyncWork() async {
+        guard !Task.isCancelled else { return }
+
+        if loadsInitialMessages {
+            await loadMessages(appliesInitialFocus: false)
+            guard !Task.isCancelled else { return }
+        }
+        if initialAttachments.isEmpty {
+            isInitialComposerFocusContentReady = true
+            applyInitialComposerFocusPolicyIfNeeded()
+        }
+        await viewModel.loadComposerConfiguration()
+        guard !Task.isCancelled else { return }
+
+        await viewModel.refreshApprovalBypassState()
+        guard !Task.isCancelled else { return }
+
+        await uploadInitialAttachmentsIfNeeded()
+        guard !Task.isCancelled else { return }
+
+        isInitialComposerFocusContentReady = true
+        applyInitialComposerFocusPolicyIfNeeded()
+        if let lastError = viewModel.lastError {
+            onAPIError(lastError)
+        }
+    }
+
+    private func loadInitialGitAvailability() async {
+        let availabilityViewModel = GitWorkspaceAvailabilityViewModel(session: session, server: server)
+        gitAvailabilityViewModel = availabilityViewModel
+        await availabilityViewModel.loadIfNeeded()
     }
 
     private var goalControlMenu: some View {
@@ -2338,6 +2366,13 @@ struct ChatToolbarTitleLabel: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .multilineTextAlignment(.leading)
+        // The transcript intentionally scrolls beneath the Liquid Glass bar.
+        // Anchor this scrim to the toolbar title itself so the darkest point
+        // stays behind the session name instead of starting at the transcript's
+        // lower safe-area boundary.
+        .background {
+            ChatNavigationChromeFade()
+        }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -2349,6 +2384,26 @@ struct ChatToolbarTitleLabel: View {
     private var accessibilityLabel: String {
         guard let subtitle else { return title }
         return "\(title), \(subtitle)"
+    }
+}
+
+private struct ChatNavigationChromeFade: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(.systemBackground).opacity(0.98), location: 0),
+                .init(color: Color(.systemBackground).opacity(0.90), location: 0.48),
+                .init(color: Color(.systemBackground).opacity(0.58), location: 0.72),
+                .init(color: Color(.systemBackground).opacity(0), location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        // Centering this tall background on the inline toolbar title places its
+        // top at the physical screen edge and its tail just below the bar.
+        .frame(width: 1_000, height: 190)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

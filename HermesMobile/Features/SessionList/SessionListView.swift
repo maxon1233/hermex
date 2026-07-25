@@ -36,16 +36,14 @@ struct SessionListView: View {
     @State private var selectedProjectID: String?
     @State private var sidebarScrollPosition: String?
     @State private var didCompleteInitialLoad = false
+    @State private var pendingDestinationAfterDismissal: SessionNavigationDestination?
     @FocusState private var searchFieldIsFocused: Bool
     @AppStorage(SessionSidebarDisclosureSettings.profilesAreExpandedKey)
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
     @AppStorage(SessionSidebarDisclosureSettings.projectsAreExpandedKey)
     private var projectsAreExpanded = SessionSidebarDisclosureSettings.defaultProjectsAreExpanded
-    @AppStorage(SessionSidebarDisclosureSettings.scheduledSessionsAreExpandedKey)
-    private var scheduledSessionsAreExpanded = SessionSidebarDisclosureSettings.defaultScheduledSessionsAreExpanded
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
-    @AppStorage(SessionRowDisplaySettings.showCronSessionsKey) private var showsCronSessions = true
     @AppStorage(SessionRowDisplaySettings.showSubagentSessionsKey)
     private var showsSubagentSessions = SessionRowDisplaySettings.defaultShowsSubagentSessions
     // Per-server key (#19): the CLI toggle mirrors the active server's
@@ -217,6 +215,18 @@ struct SessionListView: View {
                     to: newValue
                 )
 
+                if newValue == nil,
+                   let pendingDestination = pendingDestinationAfterDismissal {
+                    pendingDestinationAfterDismissal = nil
+                    Task { @MainActor in
+                        // Compact navigation must finish popping the utility
+                        // destination before it can push a different root.
+                        await Task.yield()
+                        guard navigationState.destination == nil else { return }
+                        selectRootDestination(pendingDestination)
+                    }
+                }
+
                 if case .newChat = oldValue,
                    case .newChat = newValue {
                     return
@@ -254,6 +264,9 @@ struct SessionListView: View {
                 )
             )
             .focusedSceneValue(\.hermexSceneActions, sceneActions)
+            // Configure every scroll view in the navigation hierarchy, including
+            // pushed destinations, with one gradual fade into the top chrome.
+            .adaptiveFadingTopScrollEdge()
     }
 
     @ViewBuilder
@@ -281,9 +294,6 @@ struct SessionListView: View {
 
     private var sessionListSurface: some View {
         ZStack(alignment: .bottomTrailing) {
-            Color(.systemBackground)
-                .ignoresSafeArea()
-
             content
 
             if !isSearchingSessions {
@@ -292,6 +302,12 @@ struct SessionListView: View {
                     .padding(.bottom, 22)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+        }
+        // Keep the layout itself inside the safe area. Extending a ZStack child
+        // made the List render underneath the status bar as it scrolled.
+        .background {
+            Color(.systemBackground)
+                .ignoresSafeArea()
         }
     }
 
@@ -305,7 +321,9 @@ struct SessionListView: View {
             } description: {
                 Text("Choose a session from the sidebar or start a new chat.")
             } actions: {
-                Button("New Chat", action: openNewChat)
+                Button("New Chat") {
+                    openNewChat()
+                }
                     .buttonStyle(.borderedProminent)
             }
         }
@@ -341,7 +359,14 @@ struct SessionListView: View {
             case .settings(let scrollTo):
                 SettingsView(authManager: authManager, server: server, initialScrollTarget: scrollTo)
             case .tasks:
-                TasksView(server: server, onAPIError: authManager.handleAPIError)
+                TasksView(
+                    server: server,
+                    onAPIError: authManager.handleAPIError,
+                    sessions: viewModel.sessions,
+                    onStartSession: { context in
+                        openNewChat(initialDraft: context)
+                    }
+                )
             case .skills:
                 SkillsView(server: server, onAPIError: authManager.handleAPIError)
             case .memory:
@@ -350,17 +375,6 @@ struct SessionListView: View {
                 InsightsView(server: server, onAPIError: authManager.handleAPIError)
             case .archived:
                 ArchivedSessionsView(server: server, onAPIError: authManager.handleAPIError)
-            case .scheduled:
-                ScheduledSessionsView(
-                    viewModel: viewModel,
-                    showsCronSessions: showsCronSessions,
-                    showsMessageCount: showsSessionMessageCount,
-                    showsWorkspace: showsSessionWorkspace,
-                    selectedSessionID: horizontalSizeClass == .regular
-                        ? navigationState.selectedSessionID
-                        : nil,
-                    actions: sessionRowActions
-                )
             }
         }
         .adaptiveSecondaryNavigationTitle()
@@ -409,26 +423,9 @@ struct SessionListView: View {
                 )
             }
 
-            if scheduledSessionGroups.showsDisclosure(isSearchActive: isSearchingSessions) {
-                ScheduledSessionsDisclosure(
-                    viewModel: viewModel,
-                    sessions: scheduledSessionGroups.scheduled,
-                    totalCount: scheduledSessionGroups.totalScheduledCount,
-                    isSearchActive: isSearchingSessions,
-                    showsMessageCount: showsSessionMessageCount,
-                    showsWorkspace: showsSessionWorkspace,
-                    selectedSessionID: horizontalSizeClass == .regular
-                        ? navigationState.selectedSessionID
-                        : nil,
-                    userIsExpanded: $scheduledSessionsAreExpanded,
-                    actions: sessionRowActions,
-                    viewAll: { navigationState.select(.scheduled) }
-                )
-            }
-
             SessionListRowsSection(
                 viewModel: viewModel,
-                sessions: scheduledSessionGroups.ordinary,
+                sessions: visibleSessions,
                 emptyTitle: emptySessionsTitle,
                 emptyDescription: emptySessionsDescription,
                 isSearchActive: isSearchingSessions,
@@ -437,8 +434,7 @@ struct SessionListView: View {
                 selectedSessionID: horizontalSizeClass == .regular
                     ? navigationState.selectedSessionID
                     : nil,
-                actions: sessionRowActions,
-                suppressEmptyState: !scheduledSessionGroups.scheduled.isEmpty
+                actions: sessionRowActions
             )
 
             if showsArchivedEntry {
@@ -459,12 +455,26 @@ struct SessionListView: View {
         .scrollContentBackground(.hidden)
         .scrollPosition(id: $sidebarScrollPosition)
         .background(Color(.systemBackground))
+        // Fade rows and the custom header before the List clips at the safe-area
+        // boundary instead of letting them collide with the status indicators.
+        .mask {
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [.clear, .black],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 28)
+
+                Rectangle()
+                    .fill(.black)
+            }
+        }
         .scrollDismissesKeyboard(.interactively)
         // Disclosure subrows are real List rows; drive their fold from the List
         // so insert/remove animates. Value-based so it works with @AppStorage.
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: profilesAreExpanded)
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
-        .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: scheduledSessionsAreExpanded)
     }
 
     private var header: some View {
@@ -660,17 +670,8 @@ struct SessionListView: View {
         )
     }
 
-    private var scheduledSessionGroups: ScheduledSessionGroups {
-        viewModel.scheduledSessionGroups(
-            searchText: searchText,
-            selectedProjectID: selectedProjectID,
-            automatedVisibility: automatedSessionVisibility
-        )
-    }
-
     private var automatedSessionVisibility: AutomatedSessionVisibility {
-        AutomatedSessionVisibility(
-            showsCron: showsCronSessions,
+        AutomatedSessionVisibility.sessionsSurface(
             showsCli: showsCliSessions,
             showsClaudeCode: showsClaudeCodeSessions,
             showsSubagents: showsSubagentSessions
@@ -1146,8 +1147,26 @@ struct SessionListView: View {
         )
     }
 
-    private func openNewChat() {
-        navigationState.select(PendingNewChatRoute())
+    private func openNewChat(initialDraft: String = "") {
+        let route = PendingNewChatRoute(initialDraft: initialDraft)
+        openRootDestination(.newChat(route))
+    }
+
+    private func openRootDestination(_ destination: SessionNavigationDestination) {
+        if SessionNavigationTransition.requiresDismissalBeforeReplacingDestination(
+            hasCurrentDestination: navigationState.destination != nil,
+            usesRegularWidthNavigation: horizontalSizeClass == .regular
+        ) {
+            pendingDestinationAfterDismissal = destination
+            navigationState.clearDestination()
+            return
+        }
+
+        selectRootDestination(destination)
+    }
+
+    private func selectRootDestination(_ destination: SessionNavigationDestination) {
+        navigationState.select(destination)
     }
 
     private func selectSession(_ session: SessionSummary) {
@@ -1257,7 +1276,6 @@ enum SessionListUtilityDestination: Hashable, Identifiable {
     case insights
     /// Archived sessions screen (issue #17), also reachable from Settings.
     case archived
-    case scheduled
 
     var id: Self { self }
 }
