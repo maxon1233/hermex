@@ -68,7 +68,8 @@ private enum ScrollRestorationLabFixture {
 
 private struct ScrollRestorationLabTranscriptView: View {
     @State private var initialPosition: ChatTranscriptScrollPosition?
-    @State private var lastPosition: ChatTranscriptScrollPosition?
+    @State private var committedPosition: ChatTranscriptScrollPosition?
+    @State private var positionRecorder: ChatTranscriptScrollPositionRecorder
     @State private var latestMetrics: ChatScrollMetrics?
     @State private var shouldFollowLatest: Bool
     @State private var isNearBottom: Bool
@@ -80,7 +81,18 @@ private struct ScrollRestorationLabTranscriptView: View {
             sessionID: ScrollRestorationLabFixture.sessionID
         )
         _initialPosition = State(initialValue: storedPosition)
-        _lastPosition = State(initialValue: storedPosition)
+        _committedPosition = State(initialValue: storedPosition)
+        _positionRecorder = State(
+            initialValue: ChatTranscriptScrollPositionRecorder(
+                initialPosition: storedPosition
+            ) { position in
+                ChatTranscriptScrollPersistence.save(
+                    position,
+                    for: ScrollRestorationLabFixture.server,
+                    sessionID: ScrollRestorationLabFixture.sessionID
+                )
+            }
+        )
         _shouldFollowLatest = State(initialValue: storedPosition == nil)
         _isNearBottom = State(initialValue: storedPosition == nil)
     }
@@ -144,7 +156,8 @@ private struct ScrollRestorationLabTranscriptView: View {
                 scrollToBottom(proxy)
             },
             onInitialScrollPositionResolution: completeInitialRestoration,
-            onReadingPositionChange: saveReadingPosition,
+            onReadingPositionChange: recordReadingPosition,
+            onReadingPositionCommit: commitReadingPosition,
             onPreviewAttachment: { _, _ in },
             onPreviewTranscriptMedia: { _ in },
             onToggleListening: { _ in },
@@ -168,30 +181,28 @@ private struct ScrollRestorationLabTranscriptView: View {
                 .accessibilityIdentifier("scroll-position-probe")
         }
         .onDisappear {
-            ChatTranscriptScrollPersistence.save(
-                lastPosition,
-                for: ScrollRestorationLabFixture.server,
-                sessionID: ScrollRestorationLabFixture.sessionID
-            )
+            commitReadingPosition()
         }
     }
 
     private var positionProbeValue: String {
-        guard let lastPosition else {
+        guard let committedPosition else {
             return "\(restorationStatus)|none"
         }
 
         return [
             restorationStatus,
-            lastPosition.renderID,
-            lastPosition.messageID ?? "legacy",
-            String(format: "%.3f", lastPosition.offsetFromRowTop),
+            committedPosition.renderID,
+            committedPosition.messageID ?? "legacy",
+            String(format: "%.3f", committedPosition.offsetFromRowTop),
         ].joined(separator: "|")
     }
 
     private func updateScrollMetrics(_ metrics: ChatScrollMetrics) {
-        latestMetrics = metrics
-        guard initialPosition == nil else { return }
+        if initialPosition != nil {
+            latestMetrics = metrics
+            return
+        }
         applyResolvedMetrics(metrics)
     }
 
@@ -200,11 +211,13 @@ private struct ScrollRestorationLabTranscriptView: View {
             distanceFromBottom: metrics.distanceFromBottom,
             isStreaming: false
         )
-        isNearBottom = nearBottom
+        if isNearBottom != nearBottom {
+            isNearBottom = nearBottom
+        }
 
-        if nearBottom {
+        if nearBottom, !shouldFollowLatest {
             shouldFollowLatest = true
-        } else if metrics.isUserInteracting {
+        } else if !nearBottom, metrics.isUserInteracting, shouldFollowLatest {
             shouldFollowLatest = false
         }
     }
@@ -212,19 +225,22 @@ private struct ScrollRestorationLabTranscriptView: View {
     private func completeInitialRestoration(_: Bool) {
         initialPosition = nil
         if let latestMetrics {
+            self.latestMetrics = nil
             applyResolvedMetrics(latestMetrics)
         }
         restorationStatus = "ready"
+        commitReadingPosition()
     }
 
-    private func saveReadingPosition(_ position: ChatTranscriptScrollPosition?) {
-        guard let position else { return }
-        lastPosition = position
-        ChatTranscriptScrollPersistence.save(
-            position,
-            for: ScrollRestorationLabFixture.server,
-            sessionID: ScrollRestorationLabFixture.sessionID
-        )
+    private func recordReadingPosition(_ position: ChatTranscriptScrollPosition?) {
+        positionRecorder.record(position)
+    }
+
+    private func commitReadingPosition() {
+        positionRecorder.flush()
+        if committedPosition != positionRecorder.latestPosition {
+            committedPosition = positionRecorder.latestPosition
+        }
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {

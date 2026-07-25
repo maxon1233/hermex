@@ -5,8 +5,7 @@ struct ChatTranscriptView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var transcriptScrollPosition = ScrollPosition(idType: String.self)
-    @State private var rowContentFrames: [ChatTranscriptRowContentFrame] = []
-    @State private var latestScrollGeometry: ChatTranscriptScrollGeometrySnapshot?
+    @State private var viewportCache = ChatTranscriptViewportCache()
     @State private var hasCompletedInitialScrollResolution = false
     @State private var isLoadingInitialAnchorPage = false
     @State private var initialAnchorPageLoadFailed = false
@@ -71,6 +70,7 @@ struct ChatTranscriptView: View {
     let onScrollToLatestContent: (ScrollViewProxy, Bool) -> Void
     let onInitialScrollPositionResolution: (Bool) -> Void
     let onReadingPositionChange: (ChatTranscriptScrollPosition?) -> Void
+    let onReadingPositionCommit: () -> Void
     let onPreviewAttachment: (MessageAttachment, Data?) -> Void
     let onPreviewTranscriptMedia: (TranscriptMediaReference) -> Void
     let onToggleListening: (MessageActionContext) -> Void
@@ -164,11 +164,18 @@ struct ChatTranscriptView: View {
                         }
                     )
                     .onScrollPhaseChange { _, newPhase in
-                        guard hasCompletedInitialScrollResolution,
-                              newPhase == .tracking || newPhase == .interacting else {
-                            return
+                        viewportCache.isScrollIdle = newPhase == .idle
+                        if !viewportCache.isScrollIdle {
+                            cancelPendingReadingPositionCommit()
                         }
-                        releaseRestorationLockForUserScroll()
+
+                        guard hasCompletedInitialScrollResolution else { return }
+
+                        if newPhase == .tracking || newPhase == .interacting {
+                            releaseRestorationLockForUserScroll()
+                        } else if newPhase == .idle {
+                            commitLatestReadingPosition()
+                        }
                     }
                     .frame(width: viewportWidth)
                     .refreshable {
@@ -217,6 +224,9 @@ struct ChatTranscriptView: View {
                 .background(Color(.systemBackground))
                 .onAppear {
                     resolveInitialScrollPositionIfReady()
+                }
+                .onDisappear {
+                    commitLatestReadingPosition()
                 }
                 .onChange(of: isLoading) { _, _ in
                     resolveInitialScrollPositionIfReady()
@@ -405,10 +415,11 @@ struct ChatTranscriptView: View {
     private func handleScrollGeometryChange(
         _ geometry: ChatTranscriptScrollGeometrySnapshot
     ) {
-        latestScrollGeometry = geometry
+        viewportCache.latestScrollGeometry = geometry
 
         if hasCompletedInitialScrollResolution {
             maintainCompletedRestorationLockOrPublish()
+            scheduleReadingPositionCommitIfIdle()
             return
         }
 
@@ -418,14 +429,60 @@ struct ChatTranscriptView: View {
     private func handleRowContentFramesChange(
         _ frames: [ChatTranscriptRowContentFrame]
     ) {
-        rowContentFrames = frames
+        viewportCache.rowContentFrames = frames
 
         if hasCompletedInitialScrollResolution {
             maintainCompletedRestorationLockOrPublish()
+            scheduleReadingPositionCommitIfIdle()
             return
         }
 
         resolveInitialScrollPositionIfReady(frames: frames)
+    }
+
+    private var latestScrollGeometry: ChatTranscriptScrollGeometrySnapshot? {
+        viewportCache.latestScrollGeometry
+    }
+
+    private var rowContentFrames: [ChatTranscriptRowContentFrame] {
+        viewportCache.rowContentFrames
+    }
+
+    private func publishLatestReadingPosition() {
+        guard hasCompletedInitialScrollResolution,
+              restorationLock?.preservesStoredPosition != true,
+              let geometry = latestScrollGeometry else {
+            return
+        }
+        publishReadingPosition(
+            geometry: geometry,
+            frames: rowContentFrames
+        )
+    }
+
+    private func scheduleReadingPositionCommitIfIdle() {
+        guard viewportCache.isScrollIdle else { return }
+
+        cancelPendingReadingPositionCommit()
+        viewportCache.pendingReadingPositionCommit = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled, viewportCache.isScrollIdle else { return }
+
+            viewportCache.pendingReadingPositionCommit = nil
+            publishLatestReadingPosition()
+            onReadingPositionCommit()
+        }
+    }
+
+    private func commitLatestReadingPosition() {
+        cancelPendingReadingPositionCommit()
+        publishLatestReadingPosition()
+        onReadingPositionCommit()
+    }
+
+    private func cancelPendingReadingPositionCommit() {
+        viewportCache.pendingReadingPositionCommit?.cancel()
+        viewportCache.pendingReadingPositionCommit = nil
     }
 
     private func publishReadingPosition(
@@ -862,6 +919,19 @@ struct ChatTranscriptView: View {
                 ToolActivityGroupView(group: group)
             }
         }
+    }
+}
+
+/// Non-observable storage for values sampled at display refresh frequency.
+/// Mutating this cache must not invalidate the markdown-heavy transcript tree.
+private final class ChatTranscriptViewportCache {
+    var rowContentFrames: [ChatTranscriptRowContentFrame] = []
+    var latestScrollGeometry: ChatTranscriptScrollGeometrySnapshot?
+    var isScrollIdle = true
+    var pendingReadingPositionCommit: Task<Void, Never>?
+
+    deinit {
+        pendingReadingPositionCommit?.cancel()
     }
 }
 

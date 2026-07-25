@@ -253,6 +253,15 @@ private struct ListenPlaybackBar: View {
     }
 }
 
+private final class ChatTranscriptViewportState {
+    var latestMetrics: ChatScrollMetrics?
+    let positionRecorder: ChatTranscriptScrollPositionRecorder
+
+    init(positionRecorder: ChatTranscriptScrollPositionRecorder) {
+        self.positionRecorder = positionRecorder
+    }
+}
+
 struct ChatView: View {
     private let bottomAnchorID = "chat-bottom-anchor"
     private let transcriptMessageSpacing: CGFloat = 10
@@ -287,8 +296,7 @@ struct ChatView: View {
     @State private var followScrollGeneration = 0
     @State private var isUserInteractingWithScroll = false
     @State private var userScrollCooldownUntil: Date?
-    @State private var latestObservedScrollMetrics: ChatScrollMetrics?
-    @State private var lastKnownTranscriptScrollPosition: ChatTranscriptScrollPosition?
+    @State private var transcriptViewportState: ChatTranscriptViewportState
     @State private var initialTranscriptScrollPosition: ChatTranscriptScrollPosition?
     /// While set and in the future, auto-follow scrolls snap instead of animating, so
     /// the cache-first → network reconcile re-pins to the bottom without a jump (#289).
@@ -343,6 +351,15 @@ struct ChatView: View {
             for: server,
             sessionID: session.id
         )
+        let positionRecorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: storedScrollPosition
+        ) { position in
+            ChatTranscriptScrollPersistence.save(
+                position,
+                for: server,
+                sessionID: session.id
+            )
+        }
         _draftMessage = State(initialValue: ChatComposerDraftPersistence.initialDraft(
             initialDraft,
             for: session.sessionId,
@@ -352,7 +369,11 @@ struct ChatView: View {
         _isScrolledNearBottom = State(initialValue: storedScrollPosition == nil)
         _isReadingOlderTranscript = State(initialValue: storedScrollPosition != nil)
         _shouldFollowLatestMessage = State(initialValue: storedScrollPosition == nil)
-        _lastKnownTranscriptScrollPosition = State(initialValue: storedScrollPosition)
+        _transcriptViewportState = State(
+            initialValue: ChatTranscriptViewportState(
+                positionRecorder: positionRecorder
+            )
+        )
         _initialTranscriptScrollPosition = State(initialValue: storedScrollPosition)
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
@@ -1152,6 +1173,7 @@ struct ChatView: View {
             },
             onInitialScrollPositionResolution: handleInitialScrollPositionResolution,
             onReadingPositionChange: handleReadingPositionChange,
+            onReadingPositionCommit: persistTranscriptScrollPosition,
             onPreviewAttachment: { attachment, localData in
                 presentPreviewRestoringComposerFocusIfNeeded {
                     attachmentPreviewItem = ChatAttachmentPreviewItem(message: attachment, localData: localData)
@@ -2131,13 +2153,14 @@ struct ChatView: View {
     }
 
     private func updateScrollMetrics(_ metrics: ChatScrollMetrics) {
-        latestObservedScrollMetrics = metrics
-
         // Initial layout starts at the bottom before the persisted anchor is
         // restored. Ignore those transient metrics so cache reconciliation
         // cannot re-enable follow-bottom and overwrite the pending restoration.
-        guard initialTranscriptScrollPosition == nil else {
-            isUserInteractingWithScroll = metrics.isUserInteracting
+        if initialTranscriptScrollPosition != nil {
+            transcriptViewportState.latestMetrics = metrics
+            if isUserInteractingWithScroll != metrics.isUserInteracting {
+                isUserInteractingWithScroll = metrics.isUserInteracting
+            }
             return
         }
 
@@ -2145,29 +2168,38 @@ struct ChatView: View {
     }
 
     private func applyResolvedScrollMetrics(_ metrics: ChatScrollMetrics) {
+        let wasUserInteracting = isUserInteractingWithScroll
         let isStreaming = viewModel.activeStreamID != nil
         let isNearBottom = ChatScrollPolicy.isNearBottom(
             distanceFromBottom: metrics.distanceFromBottom,
             isStreaming: isStreaming
         )
-        isScrolledNearBottom = isNearBottom
-        isUserInteractingWithScroll = metrics.isUserInteracting
+        if isScrolledNearBottom != isNearBottom {
+            isScrolledNearBottom = isNearBottom
+        }
+        if wasUserInteracting != metrics.isUserInteracting {
+            isUserInteractingWithScroll = metrics.isUserInteracting
+        }
 
         // Touching the scroll view pauses auto-follow for a short window so
         // streaming layout growth cannot yank the viewport mid-gesture.
-        if metrics.isUserInteracting {
+        if metrics.isUserInteracting != wasUserInteracting {
             userScrollCooldownUntil = ChatScrollPolicy.cooldownDeadline()
         }
 
         if isNearBottom {
-            shouldFollowLatestMessage = true
+            if !shouldFollowLatestMessage {
+                shouldFollowLatestMessage = true
+            }
             if isReadingOlderTranscript {
                 withAnimation(ChatMotion.quickState(reduceMotion: reduceMotion)) {
                     isReadingOlderTranscript = false
                 }
             }
         } else if metrics.isUserInteracting {
-            shouldFollowLatestMessage = false
+            if shouldFollowLatestMessage {
+                shouldFollowLatestMessage = false
+            }
             if !isReadingOlderTranscript,
                ChatScrollPolicy.shouldEnterReadingOlder(
                    distanceFromBottom: metrics.distanceFromBottom,
@@ -2181,25 +2213,21 @@ struct ChatView: View {
     }
 
     private func handleReadingPositionChange(_ position: ChatTranscriptScrollPosition?) {
-        guard let position, position != lastKnownTranscriptScrollPosition else { return }
-        lastKnownTranscriptScrollPosition = position
-        ChatTranscriptScrollPersistence.save(
-            position,
-            for: server,
-            sessionID: session.id
-        )
+        transcriptViewportState.positionRecorder.record(position)
     }
 
     private func handleInitialScrollPositionResolution(_ restored: Bool) {
         initialTranscriptScrollPosition = nil
 
-        if let latestObservedScrollMetrics {
-            applyResolvedScrollMetrics(latestObservedScrollMetrics)
+        if let latestMetrics = transcriptViewportState.latestMetrics {
+            transcriptViewportState.latestMetrics = nil
+            applyResolvedScrollMetrics(latestMetrics)
         } else if !restored {
             shouldFollowLatestMessage = true
             isReadingOlderTranscript = false
             isScrolledNearBottom = true
         }
+        persistTranscriptScrollPosition()
 
         // A fallback caused by unavailable/changed history deliberately keeps
         // the last persisted anchor. A later online reopen can still restore
@@ -2218,11 +2246,7 @@ struct ChatView: View {
     }
 
     private func persistTranscriptScrollPosition() {
-        ChatTranscriptScrollPersistence.save(
-            lastKnownTranscriptScrollPosition,
-            for: server,
-            sessionID: session.id
-        )
+        transcriptViewportState.positionRecorder.flush()
     }
 
     private var isAutoFollowScrollPaused: Bool {

@@ -119,6 +119,80 @@ final class ChatScrollPolicyTests: XCTestCase {
         )
     }
 
+    func testRapidViewportSamplesStayInMemoryUntilOneExactFlush() {
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: nil,
+            writer: { writes.append($0) }
+        )
+
+        let positions = (0..<120).map { index in
+            ChatTranscriptScrollPosition(
+                renderID: "transcript:\(index)",
+                messageID: "message-\(index)",
+                offsetFromRowTop: Double(index) + 0.375
+            )
+        }
+        positions.forEach(recorder.record)
+
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(recorder.latestPosition, positions.last)
+        XCTAssertTrue(recorder.flush())
+        XCTAssertEqual(writes, [positions.last!])
+        XCTAssertFalse(recorder.flush())
+        XCTAssertEqual(writes.count, 1)
+    }
+
+    func testLifecycleFlushAlwaysUsesLatestViewportAfterEarlierCommit() {
+        let initialPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:4",
+            messageID: "message-4",
+            offsetFromRowTop: 18.25
+        )
+        let settledPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:12",
+            messageID: "message-12",
+            offsetFromRowTop: 143.5
+        )
+        let leavingPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:18",
+            messageID: "message-18",
+            offsetFromRowTop: 87.875
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: initialPosition,
+            writer: { writes.append($0) }
+        )
+
+        recorder.record(settledPosition)
+        XCTAssertTrue(recorder.flush())
+        recorder.record(leavingPosition)
+
+        XCTAssertEqual(writes, [settledPosition])
+        XCTAssertTrue(recorder.flush())
+        XCTAssertEqual(writes, [settledPosition, leavingPosition])
+        XCTAssertEqual(recorder.latestPosition, leavingPosition)
+    }
+
+    func testUnchangedRestoredViewportDoesNotRewritePersistence() {
+        let restoredPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:8",
+            messageID: "message-8",
+            offsetFromRowTop: 63
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: restoredPosition,
+            writer: { writes.append($0) }
+        )
+
+        recorder.record(restoredPosition)
+
+        XCTAssertFalse(recorder.flush())
+        XCTAssertTrue(writes.isEmpty)
+    }
+
     func testTranscriptScrollPersistenceUsesIndependentServerAndSessionKeys() throws {
         let suiteName = "ChatScrollPolicyTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -291,6 +365,39 @@ final class ChatScrollPolicyTests: XCTestCase {
                     minY: 1_240,
                     maxY: 1_420
                 )
+            ],
+            visibleContentOffsetY: 620
+        )
+
+        XCTAssertEqual(
+            position,
+            ChatTranscriptScrollPosition(
+                renderID: "transcript:12",
+                messageID: "message-12",
+                offsetFromRowTop: 120
+            )
+        )
+    }
+
+    func testReadingPositionResolutionDoesNotDependOnFrameOrder() {
+        let position = ChatTranscriptReadingPositionResolver.resolve(
+            frames: [
+                ChatTranscriptRowContentFrame(
+                    renderID: "transcript:13",
+                    minY: 1_240,
+                    maxY: 1_420
+                ),
+                ChatTranscriptRowContentFrame(
+                    renderID: "transcript:11",
+                    minY: 0,
+                    maxY: 480
+                ),
+                ChatTranscriptRowContentFrame(
+                    renderID: "transcript:12",
+                    messageID: "message-12",
+                    minY: 500,
+                    maxY: 1_220
+                ),
             ],
             visibleContentOffsetY: 620
         )
