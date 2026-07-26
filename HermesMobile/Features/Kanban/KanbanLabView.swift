@@ -22,11 +22,18 @@ struct KanbanStatusFocusView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Bindable var model: KanbanFeatureState
     @State private var showsFilters = false
+    @State private var showsBoardManagement = false
     @State private var visibleModel: KanbanFeatureState?
     @State private var cardEditor: KanbanCardEditorState?
     @State private var pendingRunningAction: KanbanPendingCardAction?
+    @State private var showsBulkActions = false
+    @State private var confirmsBulkArchive = false
+    @State private var confirmsRunDispatcher = false
     @AccessibilityFocusState private var focusedCardID: String?
     @AccessibilityFocusState private var archiveUndoIsFocused: Bool
+    @AccessibilityFocusState private var selectionControlsAreFocused: Bool
+    @AccessibilityFocusState private var bulkSummaryIsFocused: Bool
+    @AccessibilityFocusState private var dispatchSummaryIsFocused: Bool
 
     var body: some View {
         Group {
@@ -68,11 +75,31 @@ struct KanbanStatusFocusView: View {
         .sheet(isPresented: $showsFilters) {
             KanbanFiltersView(model: model)
         }
+        .sheet(isPresented: $showsBoardManagement) {
+            NavigationStack {
+                KanbanBoardManagementView(model: model)
+            }
+        }
         .sheet(item: $cardEditor) { editor in
             KanbanCardEditorView(
                 state: editor,
                 allowsMutation: model.canMutateCards,
                 onSaved: { await model.reconcileAfterCardMutation() }
+            )
+        }
+        .sheet(isPresented: $showsBulkActions, onDismiss: {
+            selectionControlsAreFocused = true
+        }) {
+            KanbanBulkActionsView(
+                model: model,
+                onArchive: {
+                    showsBulkActions = false
+                    confirmsBulkArchive = true
+                },
+                onFinished: {
+                    showsBulkActions = false
+                    bulkSummaryIsFocused = true
+                }
             )
         }
         .onAppear { activateCurrentModel() }
@@ -86,6 +113,16 @@ struct KanbanStatusFocusView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             updateSceneActivity(phase)
+        }
+        .onChange(of: model.isRefreshing) { wasRefreshing, isRefreshing in
+            if wasRefreshing, !isRefreshing, model.isSelectingCards {
+                selectionControlsAreFocused = true
+            }
+        }
+        .onChange(of: model.dispatchState?.phase) { oldPhase, newPhase in
+            if oldPhase?.isInFlight == true, newPhase?.isInFlight == false {
+                dispatchSummaryIsFocused = true
+            }
         }
         .alert(
             "Leave Running?",
@@ -102,6 +139,27 @@ struct KanbanStatusFocusView: View {
             }
         } message: { _ in
             Text("Leaving Running may clear the Card's claim and worker state.")
+        }
+        .alert("Archive Cards", isPresented: $confirmsBulkArchive) {
+            Button("Cancel", role: .cancel) {
+                selectionControlsAreFocused = true
+            }
+            Button("Archive Cards", role: .destructive) {
+                Task {
+                    await model.performBulkAction(.archiveCards)
+                    bulkSummaryIsFocused = true
+                }
+            }
+        } message: {
+            Text("The selected Cards will be moved to the archive.")
+        }
+        .alert("Run Dispatcher", isPresented: $confirmsRunDispatcher) {
+            Button("Cancel", role: .cancel) {}
+            Button("Run Dispatcher", role: .destructive) {
+                Task { await model.runDispatcher() }
+            }
+        } message: {
+            Text(KanbanDispatchCopy.runConfirmation)
         }
     }
 
@@ -147,9 +205,385 @@ struct KanbanStatusFocusView: View {
             if model.hasAvailableArchiveUndo, let undo = model.archiveUndo {
                 archiveUndoBanner(undo)
             }
-            statusSelector
-            Divider()
-            cardList
+            if model.bulkActionPhase != nil {
+                bulkProgressBanner
+            } else if let summary = model.bulkActionSummary {
+                bulkSummaryBanner(summary)
+            }
+            if model.selectedBoardSlug != nil || model.dispatchState != nil {
+                dispatcherPanel
+            }
+            if model.requiresBoardSelection {
+                boardSelectionContent
+            } else {
+                if model.isSelectingCards {
+                    selectionControls
+                }
+                statusSelector
+                Divider()
+                cardList
+            }
+        }
+    }
+
+    private var dispatcherPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Dispatcher", systemImage: "bolt.horizontal.circle")
+                    .font(.headline)
+                Spacer()
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    previewDispatchButton
+                    runDispatcherButton
+                }
+                VStack(spacing: 8) {
+                    previewDispatchButton
+                        .frame(maxWidth: .infinity)
+                    runDispatcherButton
+                        .frame(maxWidth: .infinity)
+                }
+            }
+
+            Text("Preview is advisory and may become stale. It never starts workers.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if let dispatcherUnavailableReason,
+               model.dispatchState?.phase.isInFlight != true {
+                Text(dispatcherUnavailableReason)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let dispatch = model.dispatchState {
+                Divider()
+                dispatchSummary(dispatch)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.secondary.opacity(0.06))
+    }
+
+    private var previewDispatchButton: some View {
+        Button("Preview Dispatch") {
+            Task { await model.previewDispatch() }
+        }
+        .buttonStyle(.bordered)
+        .disabled(model.dispatcherAvailability != .available)
+        .frame(minHeight: 44)
+    }
+
+    private var runDispatcherButton: some View {
+        Button("Run Dispatcher") {
+            confirmsRunDispatcher = true
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(model.dispatcherAvailability != .available)
+        .frame(minHeight: 44)
+    }
+
+    @ViewBuilder
+    private func dispatchSummary(_ dispatch: KanbanDispatchState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(dispatchModeTitle(dispatch.mode))
+                    .font(.subheadline.weight(.semibold))
+                if let completedAt = dispatch.completedAt {
+                    Text(completedAt, style: .time)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !dispatch.phase.isInFlight, dispatch.phase != .outcomeUncertain {
+                    Button("Dismiss") { model.dismissDispatchResult() }
+                        .font(.footnote)
+                }
+            }
+
+            if dispatch.phase.isInFlight {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(String(localized: dispatch.phase.statusTitle))
+                }
+                .font(.footnote)
+            } else {
+                Label {
+                    Text(String(localized: dispatch.phase.statusTitle))
+                } icon: {
+                    Image(systemName: dispatchStatusIcon(dispatch))
+                }
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(dispatchStatusColor(dispatch))
+            }
+
+            if model.isPreviewStale {
+                Label("This Preview is stale. Run Preview Dispatch again before relying on it.", systemImage: "clock.badge.exclamationmark")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
+            if let result = dispatch.result {
+                dispatchMetrics(result)
+            }
+
+            if dispatch.phase == .outcomeUncertain {
+                Text("Hermex refreshed the Board, but cannot prove whether workers started. Review the current Board before running Dispatcher again.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                if dispatch.canAcknowledgeUncertainOutcome {
+                    Button("I Reviewed the Board") {
+                        model.dismissDispatchResult()
+                    }
+                    .font(.footnote.weight(.semibold))
+                    .frame(minHeight: 44)
+                }
+                Button("Refresh") {
+                    Task { await model.refreshUncertainDispatchOutcome() }
+                }
+                .font(.footnote.weight(.semibold))
+                .frame(minHeight: 44)
+            } else if dispatch.phase == .refused {
+                Text("The server refused this Dispatcher request. Hermex did not retry it.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if dispatch.phase == .boardUnavailable {
+                Text("This Board no longer exists. Choose another Board.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            Text(KanbanDispatchAccessibility.summary(dispatch, isStale: model.isPreviewStale))
+        )
+        .accessibilityFocused($dispatchSummaryIsFocused)
+    }
+
+    private func dispatchMetrics(_ result: KanbanDispatchResult) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 5) {
+            dispatchMetricRow("Spawned", result.spawned, "Promoted", result.promoted)
+            dispatchMetricRow("Reclaimed", result.reclaimed, "Skipped—No Assignee", result.skippedUnassigned)
+            dispatchMetricRow("Skipped—Unknown Profile", result.skippedNonspawnable, "Auto-blocked", result.autoBlocked)
+            dispatchMetricRow("Timed Out", result.timedOut, "Crashed", result.crashed)
+        }
+        .font(.caption)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func dispatchMetricRow(
+        _ firstLabel: LocalizedStringKey,
+        _ firstCount: Int?,
+        _ secondLabel: LocalizedStringKey,
+        _ secondCount: Int?
+    ) -> some View {
+        GridRow {
+            dispatchMetric(firstLabel, firstCount)
+            dispatchMetric(secondLabel, secondCount)
+        }
+    }
+
+    private func dispatchMetric(_ label: LocalizedStringKey, _ count: Int?) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+            Text(count.map(String.init) ?? String(localized: "Unknown"))
+                .fontWeight(.semibold)
+        }
+    }
+
+    private var dispatcherUnavailableReason: LocalizedStringKey? {
+        switch model.dispatcherAvailability {
+        case .available: nil
+        case .busy: "Another Board action is in progress."
+        case .outcomeUncertain: "Outcome Uncertain"
+        case .offline: "Offline—showing previously loaded data"
+        case .incompatible: "Dispatcher is unavailable on this server."
+        case .readOnly: "Read-only"
+        case .refreshing: "The Board is refreshing."
+        case .refreshFailed: "Refresh failed. Try again before using Dispatcher."
+        }
+    }
+
+    private func dispatchModeTitle(_ mode: KanbanDispatchMode) -> LocalizedStringKey {
+        switch mode {
+        case .preview: "Preview Dispatch"
+        case .run: "Run Dispatcher"
+        }
+    }
+
+    private func dispatchStatusIcon(_ dispatch: KanbanDispatchState) -> String {
+        switch dispatch.phase {
+        case .succeeded: model.isPreviewStale ? "clock.badge.exclamationmark" : "checkmark.circle.fill"
+        case .submitting, .reconciling: "arrow.triangle.2.circlepath"
+        case .refused, .failed: "xmark.circle.fill"
+        case .outcomeUncertain, .boardUnavailable: "questionmark.circle.fill"
+        }
+    }
+
+    private func dispatchStatusColor(_ dispatch: KanbanDispatchState) -> Color {
+        switch dispatch.phase {
+        case .succeeded: model.isPreviewStale ? .orange : .green
+        case .submitting, .reconciling: .secondary
+        case .refused, .failed: .red
+        case .outcomeUncertain, .boardUnavailable: .orange
+        }
+    }
+
+    private var boardSelectionContent: some View {
+        ContentUnavailableView {
+            Label(
+                model.boardSelectionNotice?.boardName ?? String(localized: "Board"),
+                systemImage: "rectangle.stack.badge.minus"
+            )
+        } description: {
+            Text("This Board no longer exists. Choose another Board.")
+        } actions: {
+            Menu("Choose Board") {
+                ForEach(model.boards, id: \.slug) { board in
+                    if let slug = board.slug {
+                        Button(board.name ?? slug) {
+                            Task { await model.selectBoard(slug) }
+                        }
+                    }
+                }
+            }
+            .frame(minHeight: 44)
+        }
+    }
+
+    private var bulkProgressBanner: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+            Text(model.bulkActionPhase == .submitting ? "Updating task..." : "Checking Result")
+                .font(.footnote)
+            Spacer()
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.secondary.opacity(0.1))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            Text(model.bulkActionPhase == .submitting ? "Updating task..." : "Checking Result")
+        )
+    }
+
+    private func bulkSummaryBanner(_ summary: KanbanBulkActionSummary) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(
+                    summary.needsAttention.isEmpty ? "Complete" : "Needs Attention",
+                    systemImage: summary.needsAttention.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                )
+                .font(.footnote.weight(.semibold))
+                Spacer()
+                Button("Dismiss") { model.dismissBulkActionSummary() }
+                    .font(.footnote)
+            }
+            HStack(spacing: 12) {
+                Label {
+                    HStack(spacing: 3) {
+                        Text(verbatim: "\(summary.succeededCount)")
+                        Text("Complete")
+                    }
+                } icon: {
+                    Image(systemName: "checkmark.circle")
+                }
+                Label {
+                    HStack(spacing: 3) {
+                        Text(verbatim: "\(summary.failedCount)")
+                        Text("Failed")
+                    }
+                } icon: {
+                    Image(systemName: "xmark.circle")
+                }
+                Label {
+                    HStack(spacing: 3) {
+                        Text(verbatim: "\(summary.uncertainCount)")
+                        Text("Outcome Uncertain")
+                    }
+                } icon: {
+                    Image(systemName: "questionmark.circle")
+                }
+            }
+            .font(.footnote)
+            if !summary.needsAttention.isEmpty {
+                ForEach(summary.needsAttention) { member in
+                    Label {
+                        HStack(spacing: 4) {
+                            Text(member.cardTitle)
+                            Text(member.outcome == .failed ? "Failed" : "Outcome Uncertain")
+                        }
+                    } icon: {
+                        Image(systemName: member.outcome == .failed ? "xmark.circle" : "questionmark.circle")
+                    }
+                    .font(.footnote)
+                }
+            }
+            if model.canRetryFailedBulkAction {
+                Button("Retry Failed") {
+                    Task {
+                        await model.retryFailedBulkAction()
+                        bulkSummaryIsFocused = true
+                    }
+                }
+                .font(.footnote.weight(.semibold))
+                .frame(minHeight: 44)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(summary.needsAttention.isEmpty ? Color.green.opacity(0.1) : Color.orange.opacity(0.12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(KanbanBulkAccessibility.resultLabel(summary))
+        .accessibilityFocused($bulkSummaryIsFocused)
+    }
+
+    private var selectionControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(KanbanCountFormatter.cards(model.selectedCardCount))
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityLabel(
+                        Text(KanbanCountFormatter.cards(model.selectedCardCount))
+                        + Text(", ")
+                        + Text("Selected")
+                    )
+                Spacer()
+                Button("Bulk Actions") { showsBulkActions = true }
+                    .disabled(model.bulkActionsAvailability != .available)
+                    .fontWeight(.semibold)
+                    .frame(minHeight: 44)
+                Button("Done") {
+                    model.clearCardSelection()
+                }
+                .frame(minHeight: 44)
+            }
+            if let explanation = bulkDisabledExplanation {
+                Text(explanation)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(.secondary.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityFocused($selectionControlsAreFocused)
+    }
+
+    private var bulkDisabledExplanation: String? {
+        switch model.bulkActionsAvailability {
+        case .available: nil
+        case .noSelection: nil
+        case .offline: String(localized: "Offline—showing previously loaded data")
+        case .incompatible: String(localized: "Unavailable")
+        case .readOnly: String(localized: "Read-only")
+        case .refreshing: String(localized: "The Board is refreshing.")
+        case .boardBusy: String(localized: "Updating task...")
+        case .invalidSelection: String(localized: "The selection is no longer available. Refresh the Board and select the Cards again.")
+        case .unknownStatus: String(localized: "Unknown Status")
         }
     }
 
@@ -324,7 +758,36 @@ struct KanbanStatusFocusView: View {
         .refreshable { await model.refresh() }
     }
 
+    @ViewBuilder
     private func cardNavigationLink(_ card: KanbanCard) -> some View {
+        if model.isSelectingCards {
+            Button {
+                model.toggleCardSelection(card)
+                selectionControlsAreFocused = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: model.selectedCardIDs.contains(card.cardID ?? "")
+                          ? "checkmark.circle.fill"
+                          : "circle")
+                        .font(.title3)
+                    KanbanCardSummaryView(card: card)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(minHeight: 44)
+            .accessibilityLabel(
+                KanbanBulkAccessibility.selectionLabel(
+                    card,
+                    isSelected: model.selectedCardIDs.contains(card.cardID ?? "")
+                )
+            )
+            .accessibilityAddTraits(
+                model.selectedCardIDs.contains(card.cardID ?? "")
+                    ? .isSelected
+                    : AccessibilityTraits()
+            )
+        } else {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 NavigationLink {
@@ -339,6 +802,7 @@ struct KanbanStatusFocusView: View {
             mutationStatus(for: card)
         }
         .accessibilityFocused($focusedCardID, equals: card.cardID)
+        }
     }
 
     private func cardActionsMenu(_ card: KanbanCard) -> some View {
@@ -504,6 +968,12 @@ struct KanbanStatusFocusView: View {
                         }
                     }
                 }
+                Divider()
+                Button {
+                    showsBoardManagement = true
+                } label: {
+                    Label("Manage", systemImage: "slider.horizontal.3")
+                }
             } label: {
                 HStack(spacing: 4) {
                     Text(model.selectedBoard?.name ?? model.selectedBoardSlug ?? String(localized: "Board"))
@@ -517,6 +987,20 @@ struct KanbanStatusFocusView: View {
         }
 
         ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                if model.isSelectingCards {
+                    model.clearCardSelection()
+                } else {
+                    model.beginSelectingCards()
+                    selectionControlsAreFocused = true
+                }
+            } label: {
+                Image(systemName: model.isSelectingCards ? "xmark" : "checkmark.circle")
+            }
+            .disabled(model.bulkActionPhase != nil)
+            .frame(minWidth: 44, minHeight: 44)
+            .accessibilityLabel(model.isSelectingCards ? Text("Cancel") : Text("Select Cards"))
+
             Button {
                 cardEditor = model.makeCreateCardEditorState()
             } label: {
@@ -552,6 +1036,417 @@ struct KanbanStatusFocusView: View {
         } actions: {
             Button("Try Again") { Task { await model.retry() } }
                 .frame(minHeight: 44)
+        }
+    }
+}
+
+private enum KanbanBoardEditorMode: Identifiable {
+    case create
+    case edit(KanbanBoard)
+
+    var id: String {
+        switch self {
+        case .create: "create"
+        case let .edit(board): "edit-\(board.slug ?? "")"
+        }
+    }
+}
+
+private struct KanbanBoardManagementView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var model: KanbanFeatureState
+    @State private var editorMode: KanbanBoardEditorMode?
+    @State private var pendingArchive: KanbanBoard?
+    @State private var pendingActivation: KanbanBoard?
+
+    var body: some View {
+        List {
+            if let mutation = model.boardMutationState {
+                Section {
+                    boardMutationStatus(mutation)
+                }
+            }
+
+            Section {
+                ForEach(model.boards, id: \.slug) { board in
+                    boardRow(board)
+                }
+            } footer: {
+                Text("Browsing a Board stays local to Hermex. Making a Board active changes shared server state.")
+            }
+        }
+        .navigationTitle("Manage")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Done") { dismiss() }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.dismissBoardMutationResult()
+                    editorMode = .create
+                } label: {
+                    Label("Create", systemImage: "plus")
+                }
+                .disabled(!model.canManageBoards)
+                .accessibilityHint(Text("Creating a Board does not make it active."))
+            }
+        }
+        .sheet(item: $editorMode) { mode in
+            NavigationStack {
+                KanbanBoardEditorView(model: model, mode: mode)
+            }
+        }
+        .alert(
+            "Archive",
+            isPresented: Binding(
+                get: { pendingArchive != nil },
+                set: { if !$0 { pendingArchive = nil } }
+            ),
+            presenting: pendingArchive
+        ) { board in
+            Button("Cancel", role: .cancel) { pendingArchive = nil }
+            Button("Archive", role: .destructive) {
+                pendingArchive = nil
+                Task { await model.archiveBoard(slug: board.slug ?? "") }
+            }
+        } message: { _ in
+            Text("Hermex cannot restore an archived Board in-app.")
+        }
+        .alert(
+            "Make Active Board",
+            isPresented: Binding(
+                get: { pendingActivation != nil },
+                set: { if !$0 { pendingActivation = nil } }
+            ),
+            presenting: pendingActivation
+        ) { board in
+            Button("Cancel", role: .cancel) { pendingActivation = nil }
+            Button("Make Active Board") {
+                pendingActivation = nil
+                Task { await model.makeBoardActive(slug: board.slug ?? "") }
+            }
+        } message: { _ in
+            Text("Making this Board active changes shared server state for other Hermes clients.")
+        }
+    }
+
+    private func boardRow(_ board: KanbanBoard) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(board.icon ?? "▣")
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(board.name ?? board.slug ?? String(localized: "Board"))
+                        .font(.headline)
+                    if let slug = board.slug {
+                        Text(slug)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if board.slug == model.selectedBoardSlug {
+                    Text("Browsing")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if board.slug == model.sharedActiveBoardSlug {
+                    Text("Active")
+                        .font(.caption.bold())
+                }
+            }
+
+            if let description = board.description, !description.isEmpty {
+                Text(description)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Text(KanbanCountFormatter.cards(board.total ?? 0))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                if board.slug != model.selectedBoardSlug {
+                    Button("Browse Board") {
+                        guard let slug = board.slug else { return }
+                        Task { await model.selectBoard(slug) }
+                    }
+                    .accessibilityLabel(Text(KanbanBoardAccessibility.browseLabel(board)))
+                }
+                Button("Edit") {
+                    model.dismissBoardMutationResult()
+                    editorMode = .edit(board)
+                }
+                .disabled(!model.canManageBoards)
+                Button("Make Active Board") {
+                    pendingActivation = board
+                }
+                .disabled(board.slug == model.sharedActiveBoardSlug || !model.canManageBoards)
+                Button("Archive", role: .destructive) {
+                    pendingArchive = board
+                }
+                .disabled(!model.canArchiveBoard(board))
+            }
+            .buttonStyle(.borderless)
+            .frame(minHeight: 44)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func boardMutationStatus(_ mutation: KanbanBoardMutationState) -> some View {
+        HStack(spacing: 10) {
+            if mutation.phase.isInFlight {
+                ProgressView()
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(boardMutationAction(mutation.kind))
+                    .font(.headline)
+                Text(boardMutationPhase(mutation.phase))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if mutation.phase == .outcomeUncertain {
+                Button("Check Result") {
+                    Task { await model.checkBoardMutationResult() }
+                }
+            } else if !mutation.phase.isInFlight {
+                Button {
+                    model.dismissBoardMutationResult()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .accessibilityLabel(Text("Dismiss"))
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func boardMutationAction(_ kind: KanbanBoardMutationKind) -> LocalizedStringKey {
+        switch kind {
+        case .create: "Create"
+        case .edit: "Edit"
+        case .archive: "Archive"
+        case .makeActive: "Make Active Board"
+        }
+    }
+
+    private func boardMutationPhase(_ phase: KanbanCardMutationPhase) -> LocalizedStringKey {
+        switch phase {
+        case .updating: "Updating Board..."
+        case .checkingResult: "Checking Result"
+        case .succeeded: "Done"
+        case .failed: "Failed"
+        case .outcomeUncertain: "Outcome Uncertain"
+        }
+    }
+}
+
+private struct KanbanBoardEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var model: KanbanFeatureState
+    let mode: KanbanBoardEditorMode
+    @State private var slug: String
+    @State private var name: String
+    @State private var description: String
+    @State private var icon: String
+    @State private var color: String
+    @State private var showsSlugError = false
+    @State private var showsNameError = false
+
+    init(model: KanbanFeatureState, mode: KanbanBoardEditorMode) {
+        self.model = model
+        self.mode = mode
+        switch mode {
+        case .create:
+            _slug = State(initialValue: "")
+            _name = State(initialValue: "")
+            _description = State(initialValue: "")
+            _icon = State(initialValue: "")
+            _color = State(initialValue: "")
+        case let .edit(board):
+            _slug = State(initialValue: board.slug ?? "")
+            _name = State(initialValue: board.name ?? "")
+            _description = State(initialValue: board.description ?? "")
+            _icon = State(initialValue: board.icon ?? "")
+            _color = State(initialValue: board.color ?? "")
+        }
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("Slug", text: $slug)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .disabled(isEditing)
+                    .accessibilityHint(Text("The slug cannot be changed after the Board is created."))
+                if showsSlugError {
+                    Text("Required")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                TextField("Name", text: $name)
+                if showsNameError {
+                    Text("Required")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                TextField("Description", text: $description, axis: .vertical)
+                    .lineLimit(2...5)
+                TextField("Icon", text: $icon)
+                TextField("Color", text: $color)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } footer: {
+                Text("Creating a Board does not make it active.")
+            }
+
+            if let mutation = model.boardMutationState,
+               mutation.kind.slug == slug,
+               mutation.phase == .failed || mutation.phase == .outcomeUncertain {
+                Section {
+                    Text(mutation.phase == .failed ? "Failed" : "Outcome Uncertain")
+                        .foregroundStyle(.red)
+                    Text("Refresh the Board before trying again.")
+                        .font(.footnote)
+                }
+            }
+        }
+        .navigationTitle(isEditing ? "Edit" : "Create")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismiss() }
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") { submit() }
+                    .disabled(!model.canManageBoards)
+            }
+        }
+    }
+
+    private var isEditing: Bool {
+        if case .edit = mode { true } else { false }
+    }
+
+    private func submit() {
+        let trimmedSlug = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        showsSlugError = trimmedSlug.isEmpty
+        showsNameError = trimmedName.isEmpty
+        guard !showsSlugError, !showsNameError else { return }
+        Task {
+            if isEditing {
+                await model.editBoard(KanbanEditBoardRequest(
+                    slug: trimmedSlug,
+                    name: trimmedName,
+                    description: description,
+                    icon: icon,
+                    color: color
+                ))
+            } else {
+                await model.createBoard(KanbanCreateBoardRequest(
+                    slug: trimmedSlug,
+                    name: trimmedName,
+                    description: description,
+                    icon: icon,
+                    color: color
+                ))
+            }
+            if model.boardMutationState?.phase == .succeeded {
+                dismiss()
+            }
+        }
+    }
+}
+
+private struct KanbanBulkActionsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let model: KanbanFeatureState
+    let onArchive: () -> Void
+    let onFinished: () -> Void
+    @State private var status = "todo"
+    @State private var profile: String?
+    @State private var priority = 0
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text(KanbanCountFormatter.cards(model.selectedCardCount))
+                        .font(.headline)
+                }
+
+                Section("Change Status") {
+                    Picker("Status", selection: $status) {
+                        ForEach(statusOptions, id: \.self) { value in
+                            Text(KanbanStatusPresentation(value).title).tag(value)
+                        }
+                    }
+                    Button("Change Status") {
+                        submit(.changeStatus(status))
+                    }
+                    .disabled(!model.canSubmitBulkAction(.changeStatus(status)))
+                    .frame(minHeight: 44)
+                }
+
+                Section("Assign Profile") {
+                    Picker("Profile", selection: $profile) {
+                        Text("Unassigned").tag(String?.none)
+                        ForEach(model.profileOptions, id: \.self) { value in
+                            Text(value).tag(Optional(value))
+                        }
+                    }
+                    Button("Assign Profile") {
+                        submit(.assignProfile(profile))
+                    }
+                    .disabled(!model.canSubmitBulkAction(.assignProfile(profile)))
+                    .frame(minHeight: 44)
+                }
+
+                Section("Set Priority") {
+                    Stepper(value: $priority, in: -100...100) {
+                        HStack {
+                            Text("Priority")
+                            Text(verbatim: "\(priority)")
+                        }
+                    }
+                    Button("Set Priority") {
+                        submit(.setPriority(priority))
+                    }
+                    .disabled(!model.canSubmitBulkAction(.setPriority(priority)))
+                    .frame(minHeight: 44)
+                }
+
+                Section {
+                    Button("Archive Cards", role: .destructive) {
+                        onArchive()
+                    }
+                    .disabled(!model.canSubmitBulkAction(.archiveCards))
+                    .frame(minHeight: 44)
+                }
+            }
+            .navigationTitle("Bulk Actions")
+            .navigationBarTitleDisplayMode(.inline)
+            .interactiveDismissDisabled(model.bulkActionPhase != nil)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(model.bulkActionPhase != nil)
+                }
+            }
+        }
+    }
+
+    private var statusOptions: [String] {
+        (model.configuration?.columns ?? []).filter { $0 != "running" }
+    }
+
+    private func submit(_ action: KanbanBulkAction) {
+        Task {
+            await model.performBulkAction(action)
+            onFinished()
         }
     }
 }
@@ -743,6 +1638,29 @@ enum KanbanCardAccessibility {
     }
 }
 
+enum KanbanBoardAccessibility {
+    static func browseLabel(_ board: KanbanBoard) -> String {
+        let boardName = board.name ?? board.slug ?? String(localized: "Board")
+        return String.localizedStringWithFormat(String(localized: "Browse Board: %@"), boardName)
+    }
+}
+
+enum KanbanBulkAccessibility {
+    static func selectionLabel(_ card: KanbanCard, isSelected: Bool) -> String {
+        var parts = [KanbanCardAccessibility.summary(card)]
+        if isSelected { parts.append(String(localized: "Selected")) }
+        return parts.joined(separator: ", ")
+    }
+
+    static func resultLabel(_ summary: KanbanBulkActionSummary) -> String {
+        [
+            "\(summary.succeededCount) \(String(localized: "Complete"))",
+            "\(summary.failedCount) \(String(localized: "Failed"))",
+            "\(summary.uncertainCount) \(String(localized: "Outcome Uncertain"))"
+        ].joined(separator: ", ")
+    }
+}
+
 struct KanbanStatusPresentation {
     let rawValue: String
 
@@ -830,7 +1748,7 @@ struct KanbanLabView: View {
     var body: some View {
         KanbanStatusFocusView(model: model)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .bottomBar) {
                     Menu {
                         Picker("Scenario", selection: $scenario) {
                             ForEach(KanbanLabScenario.allCases) { scenario in
@@ -912,6 +1830,17 @@ actor KanbanLabClient: KanbanDataClient {
     private var storedCards: [String: [String: StoredCard]] = [:]
     private var cardIDsByIntent: [String: String] = [:]
     private var nextCardSequence = 100
+    private var activeBoardSlug = "default"
+    private var storedBoards: [String: StoredBoard] = [
+        "default": StoredBoard(
+            slug: "default", name: "Default Board", description: "Primary fixture Board",
+            icon: "📋", color: "#5B8DEF", total: 8
+        ),
+        "release": StoredBoard(
+            slug: "release", name: "Release Board", description: "Shipping fixture",
+            icon: "🚀", color: "#34C759", total: 2
+        )
+    ]
 
     init(scenario: KanbanLabScenario) { self.scenario = scenario }
 
@@ -927,7 +1856,66 @@ actor KanbanLabClient: KanbanDataClient {
     }
 
     func kanbanBoards() throws -> KanbanBoardsResponse {
-        decode(#"{"boards":[{"slug":"main","name":"Main Board","total":8},{"slug":"release","name":"Release Board","total":2}],"current":"main","read_only":false}"#)
+        decode([
+            "boards": storedBoards.values.sorted { $0.slug < $1.slug }.map(\.object),
+            "current": activeBoardSlug,
+            "read_only": false
+        ])
+    }
+
+    func createKanbanBoard(
+        _ request: KanbanCreateBoardRequest
+    ) throws -> KanbanBoardMutationEnvelope {
+        let board = storedBoards[request.slug] ?? StoredBoard(
+            slug: request.slug,
+            name: request.name,
+            description: request.description,
+            icon: request.icon,
+            color: request.color,
+            total: 0
+        )
+        storedBoards[request.slug] = board
+        return decode([
+            "board": board.object,
+            "current": activeBoardSlug,
+            "read_only": false
+        ])
+    }
+
+    func editKanbanBoard(
+        _ request: KanbanEditBoardRequest
+    ) throws -> KanbanBoardMutationEnvelope {
+        guard var board = storedBoards[request.slug] else {
+            throw APIError.http(statusCode: 404, body: nil)
+        }
+        board.name = request.name
+        board.description = request.description
+        board.icon = request.icon
+        board.color = request.color
+        storedBoards[request.slug] = board
+        return decode(["board": board.object, "read_only": false])
+    }
+
+    func archiveKanbanBoard(
+        _ request: KanbanBoardMutationRequest
+    ) throws -> KanbanBoardMutationEnvelope {
+        guard request.slug != "default", storedBoards.removeValue(forKey: request.slug) != nil else {
+            throw APIError.http(statusCode: 400, body: nil)
+        }
+        if activeBoardSlug == request.slug {
+            activeBoardSlug = storedBoards["default"] != nil ? "default" : storedBoards.keys.sorted().first ?? "default"
+        }
+        return decode(["current": activeBoardSlug, "read_only": false])
+    }
+
+    func makeKanbanBoardActive(
+        _ request: KanbanBoardMutationRequest
+    ) throws -> KanbanBoardMutationEnvelope {
+        guard storedBoards[request.slug] != nil else {
+            throw APIError.http(statusCode: 404, body: nil)
+        }
+        activeBoardSlug = request.slug
+        return decode(["current": activeBoardSlug, "read_only": false])
     }
 
     func kanbanBoard(_ request: KanbanBoardRequest) throws -> KanbanBoardSnapshot {
@@ -957,6 +1945,34 @@ actor KanbanLabClient: KanbanDataClient {
             throw APIError.network(underlying: URLError(.notConnectedToInternet))
         }
         return decode(#"{"events":[],"cursor":9,"latest_event_id":9,"read_only":false}"#)
+    }
+
+    func dispatchKanban(_ request: KanbanDispatchRequest) async throws -> KanbanDispatchResult {
+        try await Task.sleep(for: .milliseconds(650))
+        if scenario == .partial {
+            throw APIError.http(statusCode: 404, body: nil)
+        }
+        if scenario == .offline {
+            throw APIError.network(underlying: URLError(.notConnectedToInternet))
+        }
+
+        if !request.dryRun, var spawnedCard = fixtureCard(cardID: "CARD-3") {
+            spawnedCard.status = "running"
+            storedCards[request.board, default: [:]][spawnedCard.cardID] = spawnedCard
+        }
+
+        return decode([
+            "spawned": request.dryRun
+                ? [["task_id": "CARD-3", "profile": "builder"]]
+                : [["task_id": "CARD-3", "worker_pid": 42_424]],
+            "promoted": [],
+            "reclaimed": [],
+            "skipped_unassigned": [["task_id": "CARD-1"]],
+            "skipped_nonspawnable": [],
+            "auto_blocked": [],
+            "timed_out": [],
+            "crashed": []
+        ])
     }
 
     func kanbanCardDetail(_ request: KanbanCardDetailRequest) async throws -> KanbanCardDetailEnvelope {
@@ -1060,6 +2076,35 @@ actor KanbanLabClient: KanbanDataClient {
         card.apply(request)
         storedCards[request.board, default: [:]][request.cardID] = card
         return mutationEnvelope(for: card)
+    }
+
+    func performKanbanBulkAction(
+        _ request: KanbanBulkActionRequest
+    ) async throws -> KanbanBulkActionEnvelope {
+        var results: [[String: Any]] = []
+        for cardID in request.cardIDs {
+            if scenario == .partial, cardID == "CARD-4" {
+                results.append(["id": cardID, "ok": false, "error": "fixture refusal"])
+                continue
+            }
+            guard var card = storedCards[request.board]?[cardID] ?? fixtureCard(cardID: cardID) else {
+                results.append(["id": cardID, "ok": false, "error": "not found"])
+                continue
+            }
+            switch request.action {
+            case let .changeStatus(status):
+                card.status = status
+            case let .assignProfile(profile):
+                card.assignee = profile
+            case let .setPriority(priority):
+                card.priority = priority
+            case .archiveCards:
+                card.status = "archived"
+            }
+            storedCards[request.board, default: [:]][cardID] = card
+            results.append(["id": cardID, "ok": true])
+        }
+        return decode(["results": results, "read_only": false])
     }
 
     private func mutationEnvelope(for card: StoredCard) -> KanbanCardMutationEnvelope {
@@ -1242,6 +2287,29 @@ actor KanbanLabClient: KanbanDataClient {
             if let workspacePath { result["workspace_path"] = workspacePath }
             if let skills { result["skills"] = skills }
             if let maxRuntimeSeconds { result["max_runtime_seconds"] = maxRuntimeSeconds }
+            return result
+        }
+    }
+
+    private struct StoredBoard: Sendable {
+        let slug: String
+        var name: String?
+        var description: String?
+        var icon: String?
+        var color: String?
+        let total: Int
+
+        var object: [String: Any] {
+            var result: [String: Any] = [
+                "slug": slug,
+                "total": total,
+                "counts": total == 0 ? [:] : ["ready": total],
+                "read_only": false
+            ]
+            result["name"] = name
+            result["description"] = description
+            result["icon"] = icon
+            result["color"] = color
             return result
         }
     }
