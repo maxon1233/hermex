@@ -289,7 +289,7 @@ struct ChatView: View {
     /// "New Chat with Voice" App Intent (#338). Defaults to false for normal opens.
     let autoStartsVoiceInput: Bool
 
-    @State private var draftMessage = ""
+    @State private var composerDraft: ChatComposerDraftState
     @State private var isScrolledNearBottom = true
     @State private var isReadingOlderTranscript = false
     @State private var shouldFollowLatestMessage = true
@@ -360,11 +360,18 @@ struct ChatView: View {
                 sessionID: session.id
             )
         }
-        _draftMessage = State(initialValue: ChatComposerDraftPersistence.initialDraft(
+        let initialComposerDraft = ChatComposerDraftPersistence.initialDraft(
             initialDraft,
             for: session.sessionId,
             server: server
-        ))
+        )
+        _composerDraft = State(initialValue: ChatComposerDraftState(text: initialComposerDraft) { draft in
+            ChatComposerDraftPersistence.save(
+                draft,
+                for: session.sessionId,
+                server: server
+            )
+        })
         _initialAttachments = State(initialValue: initialAttachments)
         _isScrolledNearBottom = State(initialValue: storedScrollPosition == nil)
         _isReadingOlderTranscript = State(initialValue: storedScrollPosition != nil)
@@ -393,7 +400,7 @@ struct ChatView: View {
     // "unable to type-check in reasonable time" limit).
     private var messageComposer: some View {
         MessageComposerView(
-            draftMessage: $draftMessage,
+            draftState: composerDraft,
             isFocused: $composerIsFocused,
             isSending: viewModel.isStartingChat || viewModel.isSendingVoiceNote,
             isCompressingSession: viewModel.isCompressingSession,
@@ -527,9 +534,6 @@ struct ChatView: View {
         // The composer flips wholesale with the transcript under the RTL
         // toggle (#259): input, placeholder, and chrome mirror together.
         .environment(\.layoutDirection, chatLayoutDirection)
-        .onChange(of: draftMessage) { _, newDraft in
-            saveComposerDraft(newDraft)
-        }
         .background(
             NavigationAppearanceCompletionObserver(action: handleInitialAppearanceCompletion)
                 .allowsHitTesting(false)
@@ -1436,14 +1440,6 @@ struct ChatView: View {
         return didLoad
     }
 
-    private func saveComposerDraft(_ draft: String) {
-        ChatComposerDraftPersistence.save(
-            draft,
-            for: session.sessionId,
-            server: server
-        )
-    }
-
     private func submitGoalDraft(_ submittedGoal: String) async {
         await submitGoal(submittedGoal, clearsDraftOnSuccess: true)
     }
@@ -1466,7 +1462,7 @@ struct ChatView: View {
     }
 
     private func sendDraftMessage() async {
-        let submittedDraft = draftMessage
+        let submittedDraft = composerDraft.text
         let shouldRestoreFocusAfterSend = composerIsFocused
 
         if submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
@@ -1534,11 +1530,11 @@ struct ChatView: View {
 
         prepareTranscriptForExplicitSend()
 
-        draftMessage = ""
+        composerDraft.text = ""
 
         let didStart = await viewModel.sendMessage(submittedDraft, modelContext: modelContext)
-        if !didStart, draftMessage.isEmpty {
-            draftMessage = submittedDraft
+        if !didStart, composerDraft.text.isEmpty {
+            composerDraft.text = submittedDraft
         }
 
         return didStart
@@ -1561,13 +1557,13 @@ struct ChatView: View {
                     viewModel.appendLocalAssistantMessage(message)
                 }
             }
-            draftMessage = ""
+            composerDraft.text = ""
         case .openedSession(let session):
             forkedSession = session
-            draftMessage = ""
+            composerDraft.text = ""
         case .unsupported(let friendlyMessage):
             viewModel.setSendErrorMessage(friendlyMessage)
-            draftMessage = ""
+            composerDraft.text = ""
         case .needsSubArg:
             viewModel.setSendErrorMessage(String(localized: "Choose a slash command or continue typing."))
         case .sendAsMessage:
@@ -1889,6 +1885,7 @@ struct ChatView: View {
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         switch phase {
         case .background:
+            composerDraft.flush()
             persistTranscriptScrollPosition()
             if viewModel.activeStreamID != nil {
                 beginResponseCompletionBackgroundTask()
@@ -1904,6 +1901,7 @@ struct ChatView: View {
                 }
             }
         case .inactive:
+            composerDraft.flush()
             persistTranscriptScrollPosition()
         @unknown default:
             break
@@ -2236,7 +2234,7 @@ struct ChatView: View {
     }
 
     private func handleDisappear() {
-        saveComposerDraft(draftMessage)
+        composerDraft.flush()
         persistTranscriptScrollPosition()
         activeStreamStatusRefreshTask?.cancel()
         activeStreamStatusRefreshTask = nil
