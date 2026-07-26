@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import PhotosUI
+import Observation
 
 private struct ComposerStatusView: View {
     let text: String
@@ -53,6 +54,67 @@ private struct ComposerStatusView: View {
     }
 }
 
+@MainActor
+@Observable
+final class ChatComposerDraftState {
+    static let defaultPersistenceDelayNanoseconds: UInt64 = 350_000_000
+
+    var text: String {
+        didSet {
+            guard text != oldValue else { return }
+            schedulePersistence()
+        }
+    }
+
+    private let persistenceDelayNanoseconds: UInt64
+    private let persist: (String) -> Void
+    @ObservationIgnored private var pendingPersistenceTask: Task<Void, Never>?
+
+    init(
+        text: String,
+        persistenceDelayNanoseconds: UInt64 = defaultPersistenceDelayNanoseconds,
+        persist: @escaping (String) -> Void
+    ) {
+        self.text = text
+        self.persistenceDelayNanoseconds = persistenceDelayNanoseconds
+        self.persist = persist
+    }
+
+    func flush() {
+        pendingPersistenceTask?.cancel()
+        pendingPersistenceTask = nil
+        persist(text)
+    }
+
+    private func schedulePersistence() {
+        pendingPersistenceTask?.cancel()
+        pendingPersistenceTask = nil
+
+        // Clearing is uncommon and must remove a previously stored draft before
+        // navigation can reopen it. Non-empty edits stay off the keystroke path.
+        guard !text.isEmpty else {
+            persist("")
+            return
+        }
+
+        let draft = text
+        let delay = persistenceDelayNanoseconds
+        pendingPersistenceTask = Task { @MainActor [weak self] in
+            do {
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: delay)
+                }
+            } catch {
+                return
+            }
+
+            guard let self, !Task.isCancelled, self.text == draft else { return }
+            self.pendingPersistenceTask = nil
+            self.persist(draft)
+        }
+    }
+}
+
 struct MessageComposerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
@@ -65,7 +127,7 @@ struct MessageComposerView: View {
     @ScaledMetric(relativeTo: .title3) private var plusIconSize: CGFloat = 24
     @ScaledMetric(relativeTo: .title3) private var plusButtonSize: CGFloat = 28
 
-    @Binding var draftMessage: String
+    @Bindable var draftState: ChatComposerDraftState
     @Binding var isFocused: Bool
     let isSending: Bool
     let isCompressingSession: Bool
@@ -165,10 +227,10 @@ struct MessageComposerView: View {
     }
 
     private var showsSlashAutocomplete: Bool {
-        let query = draftMessage.drop(while: { $0.isWhitespace })
+        let query = draftState.text.drop(while: { $0.isWhitespace })
         guard query.hasPrefix("/") else { return false }
 
-        let parsed = ParsedSlashQuery(query: draftMessage)
+        let parsed = ParsedSlashQuery(query: draftState.text)
         if let command = parsed.command,
            command.subArgs == .none,
            hasWhitespaceAfterSlashCommand(command.name, in: String(query)) {
@@ -210,7 +272,7 @@ struct MessageComposerView: View {
     }
 
     private var parsedSlashQuery: ParsedSlashQuery {
-        ParsedSlashQuery(query: draftMessage)
+        ParsedSlashQuery(query: draftState.text)
     }
 
     private var slashAutocompleteLoadKey: String {
@@ -263,7 +325,7 @@ struct MessageComposerView: View {
                 Group {
                     if showsSlashAutocomplete {
                         SlashCommandAutocompleteView(
-                            query: draftMessage,
+                            query: draftState.text,
                             selectedModelID: selectedModelID,
                             modelGroups: modelGroups,
                             workspaceRoots: workspaceRoots,
@@ -273,23 +335,23 @@ struct MessageComposerView: View {
                             agentCommands: agentCommands,
                             selectedReasoningEffort: selectedReasoningEffort,
                             onSelectCommand: { command in
-                                draftMessage = "/\(command.name) "
+                                draftState.text = "/\(command.name) "
                             },
                             onSelectSkillCommand: { skill in
-                                draftMessage = "/\(skill.slashName) "
+                                draftState.text = "/\(skill.slashName) "
                             },
                             onSelectAgentCommand: { command in
-                                draftMessage = "/\(command.name) "
+                                draftState.text = "/\(command.name) "
                             },
                             onSelectSkillSubArg: { skill in
-                                draftMessage = "/skills \(skill.slashName) "
+                                draftState.text = "/skills \(skill.slashName) "
                             },
                             onSelectSubArg: { subArg in
-                                let parsed = ParsedSlashQuery(query: draftMessage)
-                                draftMessage = "/\(parsed.commandName) \(subArg)"
+                                let parsed = ParsedSlashQuery(query: draftState.text)
+                                draftState.text = "/\(parsed.commandName) \(subArg)"
                             },
                             onDismiss: {
-                                draftMessage = ""
+                                draftState.text = ""
                             }
                         )
                         .padding(.horizontal)
@@ -306,7 +368,7 @@ struct MessageComposerView: View {
                     )
 
                     ComposerTextInputView(
-                        text: $draftMessage,
+                        text: $draftState.text,
                         isFocused: $isFocused,
                         inputHeight: $textInputHeight,
                         measuredHeight: $textFieldHeight,
@@ -988,7 +1050,7 @@ struct MessageComposerView: View {
     }
 
     private var isComposerExpanded: Bool {
-        draftMessage.contains("\n") || textFieldHeight > 44
+        draftState.text.contains("\n") || textFieldHeight > 44
     }
 
     private var composerCornerRadius: CGFloat {
@@ -1008,7 +1070,7 @@ struct MessageComposerView: View {
     }
 
     private var trimmedDraftMessage: String {
-        draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        draftState.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var showsStopButton: Bool {
@@ -1061,8 +1123,8 @@ struct MessageComposerView: View {
         voiceInput.providerPreference = ComposerSTTProviderPreference.storedValue(sttProviderPreferenceRawValue)
         voiceInput.locale = .current
         Task {
-            await voiceInput.toggle(currentDraft: draftMessage) { newDraft in
-                draftMessage = newDraft
+            await voiceInput.toggle(currentDraft: draftState.text) { newDraft in
+                draftState.text = newDraft
             }
         }
     }

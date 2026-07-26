@@ -324,3 +324,62 @@ final class ChatComposerDraftPersistenceTests: XCTestCase {
         )
     }
 }
+
+final class ChatComposerDraftStateTests: XCTestCase {
+    @MainActor
+    func testNonEmptyEditsPersistAfterIdleAndCoalesceToLatestDraft() async throws {
+        var persistedDrafts: [String] = []
+        let state = ChatComposerDraftState(
+            text: "",
+            persistenceDelayNanoseconds: 20_000_000
+        ) { draft in
+            persistedDrafts.append(draft)
+        }
+
+        state.text = "H"
+        state.text = "He"
+        state.text = "Hello"
+
+        XCTAssertEqual(state.text, "Hello")
+        XCTAssertTrue(persistedDrafts.isEmpty)
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(persistedDrafts, ["Hello"])
+    }
+
+    @MainActor
+    func testFlushPersistsLatestDraftImmediatelyAndCancelsPendingSave() async throws {
+        var persistedDrafts: [String] = []
+        let state = ChatComposerDraftState(
+            text: "",
+            persistenceDelayNanoseconds: 1_000_000_000
+        ) { draft in
+            persistedDrafts.append(draft)
+        }
+
+        state.text = "Leave the chat now"
+        state.flush()
+
+        XCTAssertEqual(persistedDrafts, ["Leave the chat now"])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(persistedDrafts, ["Leave the chat now"])
+    }
+
+    @MainActor
+    func testClearingDraftRemovesPersistenceImmediately() {
+        var persistedDrafts: [String] = []
+        let state = ChatComposerDraftState(
+            text: "Already stored",
+            persistenceDelayNanoseconds: 1_000_000_000
+        ) { draft in
+            persistedDrafts.append(draft)
+        }
+
+        state.text = ""
+
+        XCTAssertEqual(persistedDrafts, [""])
+    }
+}
