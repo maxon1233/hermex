@@ -7,6 +7,9 @@ final class CachedMessage {
     var serverURLString: String
     var sessionID: String
     var sortIndex: Int
+    /// Absolute offset of the loaded message window. nil identifies cache rows
+    /// written before truncated windows preserved their server-side position.
+    var messageOffset: Int?
     var role: String?
     var content: String?
     var timestamp: Double?
@@ -26,6 +29,7 @@ final class CachedMessage {
         sessionID: String,
         message: ChatMessage,
         sortIndex: Int,
+        messageOffset: Int? = nil,
         cachedAt: Date = Date()
     ) {
         self.cacheKey = Self.cacheKey(
@@ -37,9 +41,15 @@ final class CachedMessage {
         self.serverURLString = serverURLString
         self.sessionID = sessionID
         self.sortIndex = sortIndex
+        self.messageOffset = messageOffset
         self.cachedAt = cachedAt
         self.expiresAt = cachedAt.addingTimeInterval(CachePolicy.ttl)
-        apply(message, sortIndex: sortIndex, cachedAt: cachedAt)
+        apply(
+            message,
+            sortIndex: sortIndex,
+            messageOffset: messageOffset,
+            cachedAt: cachedAt
+        )
     }
 
     static func cacheKey(
@@ -52,8 +62,14 @@ final class CachedMessage {
         return "\(serverURLString)|session|\(sessionID)|message|\(messagePart)"
     }
 
-    func apply(_ message: ChatMessage, sortIndex: Int, cachedAt: Date = Date()) {
+    func apply(
+        _ message: ChatMessage,
+        sortIndex: Int,
+        messageOffset: Int? = nil,
+        cachedAt: Date = Date()
+    ) {
         self.sortIndex = sortIndex
+        self.messageOffset = messageOffset
         role = message.role
         content = message.content
         timestamp = message.timestamp

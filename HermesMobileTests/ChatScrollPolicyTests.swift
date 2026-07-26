@@ -19,6 +19,36 @@ final class ChatScrollPolicyTests: XCTestCase {
         XCTAssertTrue(ChatInitialAppearancePolicy.shouldBeginAsyncWork(hasCompletedAppearance: true))
     }
 
+    func testInitialScrollResolutionUsesWarmCacheDuringNetworkRefresh() {
+        XCTAssertTrue(
+            ChatInitialScrollResolutionPolicy.shouldResolve(
+                isLoading: true,
+                requestedPositionIsDisplayed: true
+            )
+        )
+        XCTAssertTrue(
+            ChatInitialScrollResolutionPolicy.shouldResolve(
+                isLoading: true,
+                requestedPositionIsDisplayed: nil
+            )
+        )
+    }
+
+    func testInitialScrollResolutionWaitsWhenWarmCacheIsMissingSavedPosition() {
+        XCTAssertFalse(
+            ChatInitialScrollResolutionPolicy.shouldResolve(
+                isLoading: true,
+                requestedPositionIsDisplayed: false
+            )
+        )
+        XCTAssertTrue(
+            ChatInitialScrollResolutionPolicy.shouldResolve(
+                isLoading: false,
+                requestedPositionIsDisplayed: false
+            )
+        )
+    }
+
     func testBottomThresholdLoosensWhileStreaming() {
         XCTAssertEqual(
             ChatScrollPolicy.bottomThreshold(isStreaming: false),

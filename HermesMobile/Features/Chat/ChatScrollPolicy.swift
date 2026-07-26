@@ -386,3 +386,18 @@ enum ChatInitialAppearancePolicy {
         hasCompletedAppearance
     }
 }
+
+/// Decides when the transcript has enough local state to restore and reveal
+/// while an authoritative message refresh is still in flight.
+///
+/// `nil` means there is no saved row to find, so the cached transcript can use
+/// its bottom anchor immediately. A saved row that is absent from the cache
+/// must wait for the server response because it may exist on an older page.
+enum ChatInitialScrollResolutionPolicy {
+    static func shouldResolve(
+        isLoading: Bool,
+        requestedPositionIsDisplayed: Bool?
+    ) -> Bool {
+        !isLoading || requestedPositionIsDisplayed != false
+    }
+}

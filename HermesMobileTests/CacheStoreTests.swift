@@ -218,6 +218,106 @@ final class CacheStoreTests: XCTestCase {
         XCTAssertEqual(updatedMessage.expiresAt, secondCachedAt.addingTimeInterval(CachePolicy.ttl))
     }
 
+    func testCachedMessageWindowPreservesAbsoluteMessageOffset() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let messages = [
+            ChatMessage(
+                role: "user",
+                content: "Recent question",
+                timestamp: 1_770_000_000,
+                messageId: nil
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Recent answer",
+                timestamp: 1_770_000_001,
+                messageId: nil
+            ),
+        ]
+
+        try CacheStore.cacheMessages(
+            messages,
+            serverURL: serverURL,
+            sessionID: "large-session",
+            messageOffset: 269,
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "large-session",
+            in: context,
+            now: cachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(window.messages, messages)
+        XCTAssertEqual(window.messageOffset, 269)
+        XCTAssertEqual(
+            try fetchCachedMessages(in: context).map(\.sortIndex).sorted(),
+            [269, 270]
+        )
+        XCTAssertEqual(
+            Set(try fetchCachedMessages(in: context).compactMap(\.messageOffset)),
+            [269]
+        )
+    }
+
+    func testCachedMessageWindowInfersOffsetForLegacyZeroBasedCache() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let session = SessionSummary(
+            sessionId: "legacy-large-session",
+            title: "Legacy large session",
+            messageCount: 271
+        )
+        let messages = [
+            ChatMessage(
+                role: "user",
+                content: "Recent question",
+                timestamp: 1_770_000_000,
+                messageId: nil
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Recent answer",
+                timestamp: 1_770_000_001,
+                messageId: nil
+            ),
+        ]
+
+        try CacheStore.cacheSession(
+            session,
+            serverURL: serverURL,
+            in: context,
+            cachedAt: cachedAt
+        )
+        try CacheStore.cacheMessages(
+            messages,
+            serverURL: serverURL,
+            sessionID: "legacy-large-session",
+            in: context,
+            cachedAt: cachedAt
+        )
+        for cachedMessage in try fetchCachedMessages(in: context) {
+            cachedMessage.messageOffset = nil
+        }
+        try context.save()
+
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "legacy-large-session",
+            in: context,
+            now: cachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(window.messages, messages)
+        XCTAssertEqual(window.messageOffset, 269)
+    }
+
     func testCacheSessionUpsertsOneSessionWithoutRemovingExistingSessions() throws {
         let context = try makeContext()
         let serverURL = URL(string: "https://example.test")!

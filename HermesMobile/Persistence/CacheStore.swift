@@ -1,6 +1,13 @@
 import Foundation
 import SwiftData
 
+struct CachedMessageWindow: Equatable {
+    let messages: [ChatMessage]
+    let messageOffset: Int
+    let hasPersistedMessageOffset: Bool
+    let knownMessageCount: Int?
+}
+
 enum CacheStore {
     @MainActor
     static func cachedSessions(
@@ -27,6 +34,21 @@ enum CacheStore {
         in context: ModelContext,
         now: Date = Date()
     ) throws -> [ChatMessage] {
+        try cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: now
+        ).messages
+    }
+
+    @MainActor
+    static func cachedMessageWindow(
+        serverURL: URL,
+        sessionID: String,
+        in context: ModelContext,
+        now: Date = Date()
+    ) throws -> CachedMessageWindow {
         let serverURLString = serverURL.absoluteString
         let descriptor = FetchDescriptor<CachedMessage>(
             predicate: #Predicate { cachedMessage in
@@ -35,10 +57,44 @@ enum CacheStore {
             }
         )
 
-        return try context.fetch(descriptor)
+        let cachedMessages = try context.fetch(descriptor)
             .filter { $0.expiresAt > now }
             .sorted { $0.sortIndex < $1.sortIndex }
-            .map(ChatMessage.init(cachedMessage:))
+        guard !cachedMessages.isEmpty else {
+            return CachedMessageWindow(
+                messages: [],
+                messageOffset: 0,
+                hasPersistedMessageOffset: false,
+                knownMessageCount: nil
+            )
+        }
+
+        // New cache writes mark the window and persist absolute transcript
+        // indexes in `sortIndex`. Older builds wrote every loaded page from zero,
+        // so recover unmarked windows from the session's total message count.
+        let storedOffset = max(0, cachedMessages.first?.sortIndex ?? 0)
+        let sessionCacheKey = CachedSession.cacheKey(
+            serverURLString: serverURLString,
+            sessionID: sessionID
+        )
+        let cachedSessionMessageCount = try cachedSession(
+            cacheKey: sessionCacheKey,
+            in: context
+        )?.messageCount
+        let inferredLegacyOffset = cachedSessionMessageCount
+            .map { max(0, $0 - cachedMessages.count) }
+            ?? 0
+        let hasPersistedMessageOffset = cachedMessages.first?.messageOffset != nil
+        let messageOffset = hasPersistedMessageOffset
+            ? storedOffset
+            : max(storedOffset, inferredLegacyOffset)
+
+        return CachedMessageWindow(
+            messages: cachedMessages.map(ChatMessage.init(cachedMessage:)),
+            messageOffset: messageOffset,
+            hasPersistedMessageOffset: hasPersistedMessageOffset,
+            knownMessageCount: cachedSessionMessageCount
+        )
     }
 
     @MainActor
@@ -110,34 +166,43 @@ enum CacheStore {
         _ messages: [ChatMessage],
         serverURL: URL,
         sessionID: String,
+        messageOffset: Int = 0,
         in context: ModelContext,
         cachedAt: Date = Date()
     ) throws {
         let serverURLString = serverURL.absoluteString
+        let resolvedMessageOffset = max(0, messageOffset)
         let freshKeys = Set(messages.enumerated().map { offset, message in
             CachedMessage.cacheKey(
                 serverURLString: serverURLString,
                 sessionID: sessionID,
                 message: message,
-                sortIndex: offset
+                sortIndex: resolvedMessageOffset + offset
             )
         })
 
         for (offset, message) in messages.enumerated() {
+            let absoluteSortIndex = resolvedMessageOffset + offset
             let cacheKey = CachedMessage.cacheKey(
                 serverURLString: serverURLString,
                 sessionID: sessionID,
                 message: message,
-                sortIndex: offset
+                sortIndex: absoluteSortIndex
             )
             if let cachedMessage = try cachedMessage(cacheKey: cacheKey, in: context) {
-                cachedMessage.apply(message, sortIndex: offset, cachedAt: cachedAt)
+                cachedMessage.apply(
+                    message,
+                    sortIndex: absoluteSortIndex,
+                    messageOffset: resolvedMessageOffset,
+                    cachedAt: cachedAt
+                )
             } else {
                 context.insert(CachedMessage(
                     serverURLString: serverURLString,
                     sessionID: sessionID,
                     message: message,
-                    sortIndex: offset,
+                    sortIndex: absoluteSortIndex,
+                    messageOffset: resolvedMessageOffset,
                     cachedAt: cachedAt
                 ))
             }

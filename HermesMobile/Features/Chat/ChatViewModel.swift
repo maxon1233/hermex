@@ -1145,7 +1145,10 @@ final class ChatViewModel {
         await attachmentCoordinator.transcriptMediaData(for: reference)
     }
 
-    func loadMessages(modelContext: ModelContext? = nil) async {
+    func loadMessages(
+        modelContext: ModelContext? = nil,
+        initialScrollPosition: ChatTranscriptScrollPosition? = nil
+    ) async {
         guard let sessionID else {
             errorMessage = String(localized: "The server did not provide a session ID.")
             return
@@ -1172,7 +1175,8 @@ final class ChatViewModel {
         if previousMessages.isEmpty, let modelContext {
             cacheFirstPlaceholder = renderCachedMessagesBeforeReload(
                 sessionID: sessionID,
-                modelContext: modelContext
+                modelContext: modelContext,
+                initialScrollPosition: initialScrollPosition
             )
         } else if usesPrimedInitialCache {
             cacheFirstPlaceholder = previousMessages
@@ -1239,7 +1243,13 @@ final class ChatViewModel {
             )
             if let modelContext {
                 do {
-                    try CacheStore.cacheMessages(messages, serverURL: server, sessionID: sessionID, in: modelContext)
+                    try CacheStore.cacheMessages(
+                        messages,
+                        serverURL: server,
+                        sessionID: sessionID,
+                        messageOffset: messagesOffset,
+                        in: modelContext
+                    )
                 } catch {
                     cacheErrorMessage = error.localizedDescription
                 }
@@ -1269,11 +1279,12 @@ final class ChatViewModel {
             latestServerLoadHadAssistantResponseAfterLatestUser = false
             if CacheFallbackPolicy.shouldUseCache(for: error), let modelContext {
                 do {
-                    let cachedMessages = try CacheStore.cachedMessages(
+                    let cachedWindow = try CacheStore.cachedMessageWindow(
                         serverURL: server,
                         sessionID: sessionID,
                         in: modelContext
                     )
+                    let cachedMessages = cachedWindow.messages
                     if !cachedMessages.isEmpty {
                         clearCompressionAnchorMetadata()
                         messages = cachedMessages
@@ -1281,7 +1292,9 @@ final class ChatViewModel {
                             in: messages
                         )
                         responseCompletionNeedsTranscriptRefresh = false
-                        messagesOffset = 0
+                        messagesOffset = renderedCacheFirst
+                            ? messagesOffset
+                            : cachedWindow.messageOffset
                         hasOlderMessages = false
                         isViewingCachedData = true
                         contextWindowSnapshot = nil
@@ -1341,7 +1354,10 @@ final class ChatViewModel {
     /// load. The network reconcile is intentionally started by `ChatView` after
     /// its navigation appearance completes so rendering a richer transcript
     /// cannot stall the system push animation.
-    func prepareInitialMessageLoad(modelContext: ModelContext) {
+    func prepareInitialMessageLoad(
+        modelContext: ModelContext,
+        initialScrollPosition: ChatTranscriptScrollPosition? = nil
+    ) {
         guard let sessionID else { return }
 
         isLoading = true
@@ -1349,7 +1365,8 @@ final class ChatViewModel {
 
         let cachedMessages = renderCachedMessagesBeforeReload(
             sessionID: sessionID,
-            modelContext: modelContext
+            modelContext: modelContext,
+            initialScrollPosition: initialScrollPosition
         )
         hasPrimedInitialCachedMessages = !cachedMessages.isEmpty
     }
@@ -1364,14 +1381,21 @@ final class ChatViewModel {
     /// content — but only while the transcript is still that exact placeholder.
     private func renderCachedMessagesBeforeReload(
         sessionID: String,
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        initialScrollPosition: ChatTranscriptScrollPosition?
     ) -> [ChatMessage] {
         let cachedMessages: [ChatMessage]
+        let cachedMessageOffset: Int
         do {
-            cachedMessages = try CacheStore.cachedMessages(
+            let cachedWindow = try CacheStore.cachedMessageWindow(
                 serverURL: server,
                 sessionID: sessionID,
                 in: modelContext
+            )
+            cachedMessages = cachedWindow.messages
+            cachedMessageOffset = Self.resolvedCachedMessageOffset(
+                for: cachedWindow,
+                restoring: initialScrollPosition
             )
         } catch {
             // A cache read failure must not block the normal network load; fall back
@@ -1382,10 +1406,56 @@ final class ChatViewModel {
         guard !cachedMessages.isEmpty else { return [] }
 
         messages = cachedMessages
-        messagesOffset = 0
+        messagesOffset = cachedMessageOffset
         hasOlderMessages = false
         isViewingCachedData = false
         return cachedMessages
+    }
+
+    /// Legacy cache rows were numbered from zero even when they represented the
+    /// tail of a larger transcript. Prefer their saved reading anchor over the
+    /// current session count because a live session may have grown since that
+    /// cache was written. Requiring one matching cached identity, its absolute
+    /// render ID, and a window that still fits the known total keeps the exact
+    /// restoration safeguards intact.
+    nonisolated private static func resolvedCachedMessageOffset(
+        for cachedWindow: CachedMessageWindow,
+        restoring position: ChatTranscriptScrollPosition?
+    ) -> Int {
+        guard !cachedWindow.hasPersistedMessageOffset,
+              let position,
+              let messageID = position.messageID,
+              let absoluteMessageIndex = absoluteMessageIndex(from: position.renderID)
+        else {
+            return cachedWindow.messageOffset
+        }
+
+        let matchingMessages = transcriptMessages(from: cachedWindow.messages)
+            .filter {
+                ChatTranscriptMessageIdentity.resolve(for: $0.message) == messageID
+            }
+        guard matchingMessages.count == 1,
+              let matchingMessage = matchingMessages.first else {
+            return cachedWindow.messageOffset
+        }
+
+        let candidateOffset = absoluteMessageIndex - matchingMessage.loadedIndex
+        guard candidateOffset >= 0 else {
+            return cachedWindow.messageOffset
+        }
+
+        if let knownMessageCount = cachedWindow.knownMessageCount,
+           candidateOffset + cachedWindow.messages.count > knownMessageCount {
+            return cachedWindow.messageOffset
+        }
+
+        return candidateOffset
+    }
+
+    nonisolated private static func absoluteMessageIndex(from renderID: String) -> Int? {
+        let prefix = "transcript:"
+        guard renderID.hasPrefix(prefix) else { return nil }
+        return Int(renderID.dropFirst(prefix.count))
     }
 
     /// Undo a cache-first placeholder (#289) when the reload fails without adopting
@@ -1476,7 +1546,13 @@ final class ChatViewModel {
 
             if let modelContext {
                 do {
-                    try CacheStore.cacheMessages(messages, serverURL: server, sessionID: sessionID, in: modelContext)
+                    try CacheStore.cacheMessages(
+                        messages,
+                        serverURL: server,
+                        sessionID: sessionID,
+                        messageOffset: messagesOffset,
+                        in: modelContext
+                    )
                 } catch {
                     cacheErrorMessage = error.localizedDescription
                 }
@@ -2267,7 +2343,13 @@ final class ChatViewModel {
         guard let modelContext else { return }
 
         do {
-            try CacheStore.cacheMessages(messages, serverURL: server, sessionID: sessionID, in: modelContext)
+            try CacheStore.cacheMessages(
+                messages,
+                serverURL: server,
+                sessionID: sessionID,
+                messageOffset: messagesOffset,
+                in: modelContext
+            )
         } catch {
             cacheErrorMessage = error.localizedDescription
         }
@@ -3346,7 +3428,13 @@ final class ChatViewModel {
 
                 if let modelContext {
                     do {
-                        try CacheStore.cacheMessages(messages, serverURL: server, sessionID: sessionID, in: modelContext)
+                        try CacheStore.cacheMessages(
+                            messages,
+                            serverURL: server,
+                            sessionID: sessionID,
+                            messageOffset: messagesOffset,
+                            in: modelContext
+                        )
                     } catch {
                         cacheErrorMessage = error.localizedDescription
                     }
@@ -3449,7 +3537,13 @@ final class ChatViewModel {
 
                 if let modelContext {
                     do {
-                        try CacheStore.cacheMessages(messages, serverURL: server, sessionID: sessionID, in: modelContext)
+                        try CacheStore.cacheMessages(
+                            messages,
+                            serverURL: server,
+                            sessionID: sessionID,
+                            messageOffset: messagesOffset,
+                            in: modelContext
+                        )
                     } catch {
                         cacheErrorMessage = error.localizedDescription
                     }

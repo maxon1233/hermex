@@ -500,7 +500,7 @@ struct ChatTranscriptView: View {
     private func resolveInitialScrollPositionIfReady(
         frames suppliedFrames: [ChatTranscriptRowContentFrame]? = nil
     ) {
-        guard !isLoading, !hasCompletedInitialScrollResolution else { return }
+        guard !hasCompletedInitialScrollResolution else { return }
 
         if restorationLock == nil {
             restorationLock = initialScrollPosition.map {
@@ -510,6 +510,23 @@ struct ChatTranscriptView: View {
 
         guard let restorationLock else { return }
         let frames = suppliedFrames ?? rowContentFrames
+        let requestedPositionIsDisplayed: Bool?
+        if case .saved(let position) = restorationLock {
+            requestedPositionIsDisplayed = displayedTranscriptContains(position)
+        } else {
+            requestedPositionIsDisplayed = nil
+        }
+
+        guard ChatInitialScrollResolutionPolicy.shouldResolve(
+            isLoading: isLoading,
+            requestedPositionIsDisplayed: requestedPositionIsDisplayed
+        ) else {
+            // The warm cache does not contain the requested row. Keep the
+            // viewport hidden until the server supplies the authoritative page
+            // window and pagination metadata instead of falling back early.
+            invalidateRestorationVerification()
+            return
+        }
 
         if case .saved(let position) = restorationLock,
            ChatTranscriptReadingPositionResolver.matchingFrame(

@@ -35,7 +35,11 @@ struct ScrollRestorationLabView: View {
             }
             .navigationTitle("Scroll Lab")
             .navigationDestination(isPresented: $showsTranscript) {
-                ScrollRestorationLabTranscriptView()
+                ScrollRestorationLabTranscriptView(
+                    isLoadingMessages: ProcessInfo.processInfo.arguments.contains(
+                        "--scroll-restoration-lab-loading"
+                    )
+                )
                     .id(openGeneration)
             }
         }
@@ -63,7 +67,13 @@ private enum ScrollRestorationLabFixture {
         )
     }
 
-    static let transcriptMessages = ChatViewModel.transcriptMessages(from: messages)
+    // Model a warm cache containing only the tail of a much larger session.
+    // Absolute render IDs must survive that truncated window while a refresh is
+    // still in flight, matching real sessions with hundreds of messages.
+    static let transcriptMessages = ChatViewModel.transcriptMessages(
+        from: messages,
+        messageOffset: 700
+    )
 }
 
 private struct ScrollRestorationLabTranscriptView: View {
@@ -74,8 +84,10 @@ private struct ScrollRestorationLabTranscriptView: View {
     @State private var shouldFollowLatest: Bool
     @State private var isNearBottom: Bool
     @State private var restorationStatus = "pending"
+    private let isLoadingMessages: Bool
 
-    init() {
+    init(isLoadingMessages: Bool = false) {
+        self.isLoadingMessages = isLoadingMessages
         let storedPosition = ChatTranscriptScrollPersistence.load(
             for: ScrollRestorationLabFixture.server,
             sessionID: ScrollRestorationLabFixture.sessionID
@@ -99,7 +111,7 @@ private struct ScrollRestorationLabTranscriptView: View {
 
     var body: some View {
         ChatTranscriptView(
-            isLoading: false,
+            isLoading: isLoadingMessages,
             errorMessage: nil,
             messages: ScrollRestorationLabFixture.messages,
             displayedTranscriptMessages: ScrollRestorationLabFixture.transcriptMessages,
