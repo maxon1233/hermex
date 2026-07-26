@@ -1343,7 +1343,10 @@ struct ChatView: View {
     private func prepareInitialAppearance() {
         viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
         if loadsInitialMessages {
-            viewModel.prepareInitialMessageLoad(modelContext: modelContext)
+            viewModel.prepareInitialMessageLoad(
+                modelContext: modelContext,
+                initialScrollPosition: initialTranscriptScrollPosition
+            )
         }
     }
 
@@ -1413,7 +1416,10 @@ struct ChatView: View {
     }
 
     private func loadMessages(appliesInitialFocus: Bool = true) async {
-        await viewModel.loadMessages(modelContext: modelContext)
+        await viewModel.loadMessages(
+            modelContext: modelContext,
+            initialScrollPosition: initialTranscriptScrollPosition
+        )
         await viewModel.reconnectStreamIfNeeded(modelContext: modelContext)
         if appliesInitialFocus {
             applyInitialComposerFocusPolicyIfNeeded()

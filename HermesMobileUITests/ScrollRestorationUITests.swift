@@ -78,6 +78,39 @@ final class ScrollRestorationUITests: XCTestCase {
         )
     }
 
+    func testWarmCachedTranscriptRevealsBeforeMessageRefreshCompletes() throws {
+        let resetButton = app.buttons["scroll-lab-reset"]
+        XCTAssertTrue(
+            resetButton.waitForExistence(timeout: 15),
+            "The deterministic scroll-restoration lab did not launch."
+        )
+        resetButton.tap()
+
+        openTranscript()
+        let cachedPosition = try waitForStableReadyProbe()
+        leaveTranscript()
+
+        app.terminate()
+        app.launchArguments = [
+            "--scroll-restoration-lab",
+            "--scroll-restoration-lab-loading",
+        ]
+        app.launch()
+
+        openTranscript()
+        let restoredPosition = try waitForStableReadyProbe()
+
+        XCTAssertEqual(
+            restoredPosition.rawValue,
+            cachedPosition.rawValue,
+            "The cached transcript did not reveal at its exact saved position while the refresh remained in flight."
+        )
+        XCTAssertFalse(
+            app.activityIndicators["Restoring conversation position"].exists,
+            "The restoration spinner remained over an already-restored cached transcript."
+        )
+    }
+
     private func openTranscript() {
         let openButton = app.buttons["scroll-lab-open"]
         XCTAssertTrue(

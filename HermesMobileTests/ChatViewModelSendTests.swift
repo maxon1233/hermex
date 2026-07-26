@@ -3234,6 +3234,81 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testPrepareInitialMessageLoadRestoresAbsoluteIDsForLegacyTruncatedCache() throws {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let session = SessionSummary(
+            sessionId: "session-abc",
+            title: "Large planning session",
+            // The live session grew after this 271-message cache was written.
+            messageCount: 360
+        )
+        let cachedMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Recent question",
+                timestamp: 1_770_000_001,
+                messageId: nil
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Recent answer",
+                timestamp: 1_770_000_002,
+                messageId: nil
+            ),
+        ]
+        try CacheStore.cacheSession(session, serverURL: serverURL, in: context)
+        // Model the zero-based cache format written by the previous build.
+        try CacheStore.cacheMessages(
+            cachedMessages,
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            in: context
+        )
+        let legacyRows = try context.fetch(FetchDescriptor<CachedMessage>())
+        for cachedMessage in legacyRows {
+            cachedMessage.messageOffset = nil
+        }
+        try context.save()
+        let viewModel = try makeViewModel(sessionSummary: session) { request in
+            XCTFail("Cache preparation must not start a request: \(request.url?.absoluteString ?? "nil")")
+            throw URLError(.badURL)
+        }
+
+        let savedMessage = try XCTUnwrap(cachedMessages.last)
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:270",
+            messageID: ChatTranscriptMessageIdentity.resolve(for: savedMessage),
+            offsetFromRowTop: 120
+        )
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: savedPosition
+        )
+
+        XCTAssertEqual(viewModel.messagesOffset, 269)
+        XCTAssertEqual(
+            viewModel.displayedTranscriptMessages.map(\.renderID),
+            ["transcript:269", "transcript:270"]
+        )
+
+        let cachedIdentities = viewModel.displayedTranscriptMessages.map {
+            ChatTranscriptRowIdentity(
+                renderID: $0.renderID,
+                messageID: ChatTranscriptMessageIdentity.resolve(for: $0.message)
+            )
+        }
+        XCTAssertEqual(
+            ChatTranscriptReadingPositionResolver.matchingRowIndex(
+                for: savedPosition,
+                identities: cachedIdentities
+            ),
+            1
+        )
+        XCTAssertTrue(viewModel.isLoading)
+    }
+
+    @MainActor
     func testLoadMessagesKeepsTranscriptEmptyDuringNetworkWhenCacheIsEmpty() async throws {
         let context = try makeContext()
 
@@ -5992,6 +6067,8 @@ final class ChatViewModelSendTests: XCTestCase {
 
     @MainActor
     func testLoadMessagesTracksOlderHistoryAvailability() async throws {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
         let viewModel = try makeViewModel { request in
             XCTAssertEqual(request.url?.path, "/api/session")
 
@@ -6009,10 +6086,16 @@ final class ChatViewModelSendTests: XCTestCase {
             """, for: request)
         }
 
-        await viewModel.loadMessages()
+        await viewModel.loadMessages(modelContext: context)
 
         XCTAssertEqual(viewModel.messagesOffset, 50)
         XCTAssertTrue(viewModel.hasOlderMessages)
+        let cachedWindow = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            in: context
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 50)
     }
 
     @MainActor
