@@ -84,6 +84,10 @@ private struct ScrollRestorationLabTranscriptView: View {
     @State private var shouldFollowLatest: Bool
     @State private var isNearBottom: Bool
     @State private var restorationStatus = "pending"
+    @State private var draftText = ""
+    @State private var isComposerFocused = false
+    @State private var composerInputHeight: CGFloat = 22
+    @State private var measuredComposerHeight: CGFloat = 22
     private let isLoadingMessages: Bool
 
     init(isLoadingMessages: Bool = false) {
@@ -110,76 +114,103 @@ private struct ScrollRestorationLabTranscriptView: View {
     }
 
     var body: some View {
-        ChatTranscriptView(
-            isLoading: isLoadingMessages,
-            errorMessage: nil,
-            messages: ScrollRestorationLabFixture.messages,
-            displayedTranscriptMessages: ScrollRestorationLabFixture.transcriptMessages,
-            initialScrollPosition: initialPosition,
-            compressionReferenceCard: nil,
-            reasoningGroups: [],
-            completedToolCallGroupsForAnchor: { _ in [] },
-            liveReasoningText: "",
-            reasoningAnchorMessageID: nil,
-            liveToolCalls: [],
-            toolCallAnchorMessageID: nil,
-            streamingAssistantMessageID: nil,
-            activeStreamRecoveryState: .idle,
-            clarificationPrompt: nil,
-            isRespondingToClarification: false,
-            clarificationErrorMessage: nil,
-            hidesRunStatusAccessibility: false,
-            showsThinkingAndToolCards: false,
-            showsAssistantTypingIndicator: false,
-            showsScrollToBottomButton: !isNearBottom,
-            shouldFollowLatestMessage: shouldFollowLatest,
-            latestTranscriptMessageRole: ScrollRestorationLabFixture.messages.last?.role,
-            isScrolledNearBottom: isNearBottom,
-            activeStreamID: nil,
-            streamingScrollTrigger: 0,
-            cacheFirstReconcileScrollToken: 0,
-            bottomAnchorID: ScrollRestorationLabFixture.bottomAnchorID,
-            transcriptMessageSpacing: 10,
-            transcriptBlockSpacing: 6,
-            transcriptBottomInsetHeight: 104,
-            scrollToBottomButtonBottomPadding: 12,
-            localAttachmentPreviews: [:],
-            listeningMessageID: nil,
-            isViewingCachedData: false,
-            hasOlderMessages: false,
-            isLoadingOlderMessages: false,
-            isRegeneratingMessage: false,
-            isEditingMessage: false,
-            isForkingMessage: false,
-            loadAttachmentImage: { _ in nil },
-            loadAttachmentData: { _ in nil },
-            loadTranscriptMediaImage: { _ in nil },
-            loadTranscriptMediaData: { _ in nil },
-            transcriptMediaCacheNamespace: "scroll-restoration-lab",
-            actionContext: { _, _ in nil },
-            shouldRenderMessageRow: { _ in true },
-            onLoadMessages: {},
-            onLoadOlderMessages: { false },
-            onUpdateScrollMetrics: updateScrollMetrics,
-            onDismissKeyboard: {},
-            onScrollToBottom: scrollToBottom,
-            onScrollToLatestTranscriptMessage: scrollToBottom,
-            onScrollToLatestContent: { proxy, _ in
-                scrollToBottom(proxy)
-            },
-            onInitialScrollPositionResolution: completeInitialRestoration,
-            onReadingPositionChange: recordReadingPosition,
-            onReadingPositionCommit: commitReadingPosition,
-            onPreviewAttachment: { _, _ in },
-            onPreviewTranscriptMedia: { _ in },
-            onToggleListening: { _ in },
-            onSubmitClarification: { _ in },
-            onSelectText: { _ in },
-            onRegenerate: { _ in },
-            onEdit: { _ in },
-            onFork: { _ in },
-            onCopy: { _ in }
-        )
+        ZStack(alignment: .bottom) {
+            ChatTranscriptView(
+                isLoading: isLoadingMessages,
+                errorMessage: nil,
+                messages: ScrollRestorationLabFixture.messages,
+                displayedTranscriptMessages: ScrollRestorationLabFixture.transcriptMessages,
+                initialScrollPosition: initialPosition,
+                compressionReferenceCard: nil,
+                reasoningGroups: [],
+                completedToolCallGroupsForAnchor: { _ in [] },
+                liveReasoningText: "",
+                reasoningAnchorMessageID: nil,
+                liveToolCalls: [],
+                toolCallAnchorMessageID: nil,
+                streamingAssistantMessageID: nil,
+                activeStreamRecoveryState: .idle,
+                clarificationPrompt: nil,
+                isRespondingToClarification: false,
+                clarificationErrorMessage: nil,
+                hidesRunStatusAccessibility: false,
+                showsThinkingAndToolCards: false,
+                showsAssistantTypingIndicator: false,
+                showsScrollToBottomButton: !isNearBottom,
+                shouldFollowLatestMessage: shouldFollowLatest,
+                latestTranscriptMessageRole: ScrollRestorationLabFixture.messages.last?.role,
+                isScrolledNearBottom: isNearBottom,
+                activeStreamID: nil,
+                streamingScrollTrigger: 0,
+                cacheFirstReconcileScrollToken: 0,
+                bottomAnchorID: ScrollRestorationLabFixture.bottomAnchorID,
+                transcriptMessageSpacing: 10,
+                transcriptBlockSpacing: 6,
+                transcriptBottomInsetHeight: 104,
+                scrollToBottomButtonBottomPadding: 12,
+                localAttachmentPreviews: [:],
+                listeningMessageID: nil,
+                isViewingCachedData: false,
+                hasOlderMessages: false,
+                isLoadingOlderMessages: false,
+                isRegeneratingMessage: false,
+                isEditingMessage: false,
+                isForkingMessage: false,
+                loadAttachmentImage: { _ in nil },
+                loadAttachmentData: { _ in nil },
+                loadTranscriptMediaImage: { _ in nil },
+                loadTranscriptMediaData: { _ in nil },
+                transcriptMediaCacheNamespace: "scroll-restoration-lab",
+                actionContext: { _, _ in nil },
+                shouldRenderMessageRow: { _ in true },
+                onLoadMessages: {},
+                onLoadOlderMessages: { false },
+                onUpdateScrollMetrics: updateScrollMetrics,
+                onDismissKeyboard: {
+                    isComposerFocused = false
+                },
+                onScrollToBottom: scrollToBottom,
+                onScrollToLatestTranscriptMessage: scrollToBottom,
+                onScrollToLatestContent: { proxy, _ in
+                    scrollToBottom(proxy)
+                },
+                onInitialScrollPositionResolution: completeInitialRestoration,
+                onReadingPositionChange: recordReadingPosition,
+                onReadingPositionCommit: commitReadingPosition,
+                onPreviewAttachment: { _, _ in },
+                onPreviewTranscriptMedia: { _ in },
+                onToggleListening: { _ in },
+                onSubmitClarification: { _ in },
+                onSelectText: { _ in },
+                onRegenerate: { _ in },
+                onEdit: { _ in },
+                onFork: { _ in },
+                onCopy: { _ in }
+            )
+
+            ComposerTextInputView(
+                text: $draftText,
+                isFocused: $isComposerFocused,
+                inputHeight: $composerInputHeight,
+                measuredHeight: $measuredComposerHeight,
+                isDisabled: false,
+                isKeyboardSendEnabled: false,
+                verticalPadding: 10,
+                onKeyboardSend: {},
+                onPasteFileProviders: { _ in },
+                onPasteFileURLs: { _ in },
+                onPasteImageProviders: { _ in },
+                onPasteImages: { _ in }
+            )
+            .background(
+                .regularMaterial,
+                in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+            )
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+            .accessibilityIdentifier("scroll-lab-composer")
+            .zIndex(1)
+        }
         .navigationTitle("Deterministic Transcript")
         .navigationBarTitleDisplayMode(.inline)
         .overlay(alignment: .topLeading) {
@@ -192,7 +223,18 @@ private struct ScrollRestorationLabTranscriptView: View {
                 .accessibilityValue(positionProbeValue)
                 .accessibilityIdentifier("scroll-position-probe")
         }
+        .overlay(alignment: .topTrailing) {
+            Text(isComposerFocused ? "focused" : "unfocused")
+                .font(.system(size: 1))
+                .foregroundStyle(.clear)
+                .frame(width: 1, height: 1)
+                .accessibilityElement()
+                .accessibilityLabel("Composer focus")
+                .accessibilityValue(isComposerFocused ? "focused" : "unfocused")
+                .accessibilityIdentifier("scroll-lab-composer-focus-probe")
+        }
         .onDisappear {
+            isComposerFocused = false
             commitReadingPosition()
         }
     }

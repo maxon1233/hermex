@@ -14,13 +14,6 @@ enum ChatScrollPolicy {
     /// scroll view's first layout, before the destination becomes visible.
     static let initialTranscriptAnchor = UnitPoint.bottom
 
-    /// Rich Markdown can finish measuring after the scroll view's initial
-    /// layout. Keep those size changes bottom-pinned only while the app still
-    /// owns follow-latest intent; return nil as soon as the reader scrolls away.
-    static func sizeChangeAnchor(shouldFollowLatestMessage: Bool) -> UnitPoint? {
-        shouldFollowLatestMessage ? .bottom : nil
-    }
-
     /// Distance (pt) from the bottom within which we treat the transcript as
     /// pinned to the latest content while idle.
     static let bottomDetectionThreshold: CGFloat = 80
@@ -141,6 +134,39 @@ final class ChatTranscriptScrollPositionRecorder {
 
         writer(latestPosition)
         persistedPosition = latestPosition
+        return true
+    }
+}
+
+/// Prevents layout-only viewport changes from replacing a reader's saved
+/// position.
+///
+/// Keyboard presentation, composer-height changes, and late Markdown layout
+/// all change scroll geometry without expressing new navigation intent. Only a
+/// reader gesture or a follow-latest scroll is allowed to advance the persisted
+/// transcript position.
+struct ChatTranscriptReadingPositionCommitGate {
+    enum Trigger {
+        case layout
+        case readerScroll
+        case followLatest
+    }
+
+    private(set) var hasPendingCommit = false
+
+    mutating func register(_ trigger: Trigger) {
+        switch trigger {
+        case .layout:
+            break
+        case .readerScroll, .followLatest:
+            hasPendingCommit = true
+        }
+    }
+
+    @discardableResult
+    mutating func consumePendingCommit() -> Bool {
+        guard hasPendingCommit else { return false }
+        hasPendingCommit = false
         return true
     }
 }

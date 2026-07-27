@@ -111,6 +111,66 @@ final class ScrollRestorationUITests: XCTestCase {
         )
     }
 
+    func testComposerKeepsFocusWithoutReplacingSavedReadingPosition() throws {
+        let resetButton = app.buttons["scroll-lab-reset"]
+        XCTAssertTrue(
+            resetButton.waitForExistence(timeout: 15),
+            "The deterministic scroll-restoration lab did not launch."
+        )
+        resetButton.tap()
+
+        openTranscript()
+        let initialPosition = try waitForStableReadyProbe()
+        dragTowardOlderMessages()
+        let readingPosition = try waitForStableReadyProbe(
+            differentFrom: initialPosition.rawValue
+        )
+
+        let composer = app.textViews.firstMatch
+        XCTAssertTrue(
+            composer.waitForExistence(timeout: 10),
+            "The deterministic composer text view is missing."
+        )
+        composer.tap()
+
+        let focusProbe = app.otherElements["scroll-lab-composer-focus-probe"]
+        guard waitForElementValue(
+            "focused",
+            in: focusProbe,
+            timeout: 3
+        ) else {
+            XCTFail("The composer did not gain keyboard focus.")
+            return
+        }
+
+        // The production race used to resign a newly focused UITextView from a
+        // stale deferred update. Give that task ample time to fire before typing.
+        Thread.sleep(forTimeInterval: 1.0)
+        guard focusProbe.value as? String == "focused" else {
+            XCTFail("The composer lost keyboard focus immediately after opening.")
+            return
+        }
+
+        let message = "Mem0 composer remains usable"
+        composer.typeText(message)
+        XCTAssertTrue(
+            waitForElementValue(message, in: composer, timeout: 3),
+            "Typing did not reach the focused composer."
+        )
+
+        let positionAfterKeyboard = try waitForStableReadyProbe()
+        XCTAssertEqual(
+            positionAfterKeyboard.rawValue,
+            readingPosition.rawValue,
+            "Keyboard presentation replaced the reader's saved transcript position."
+        )
+        XCTAssertEqual(
+            focusProbe.value as? String,
+            "focused",
+            "The composer lost focus while the keyboard remained in use."
+        )
+    }
+
     private func openTranscript() {
         let openButton = app.buttons["scroll-lab-open"]
         XCTAssertTrue(
@@ -160,6 +220,23 @@ final class ScrollRestorationUITests: XCTestCase {
 
     private var probeElement: XCUIElement {
         app.otherElements["scroll-position-probe"]
+    }
+
+    private func waitForElementValue(
+        _ expectedValue: String,
+        in element: XCUIElement,
+        timeout: TimeInterval
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            if element.value as? String == expectedValue {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        return element.value as? String == expectedValue
     }
 
     private func waitForStableReadyProbe(

@@ -132,6 +132,7 @@ private struct ComposerTextView: UIViewRepresentable {
         @Binding var isFocused: Bool
         var onHeightChange: (CGFloat) -> Void
         private var pendingFocusTarget: Bool?
+        private var pendingFocusTask: Task<Void, Never>?
 
         init(
             text: Binding<String>,
@@ -152,13 +153,14 @@ private struct ComposerTextView: UIViewRepresentable {
 
             let target = shouldFocus && !isDisabled
             guard textView.isFirstResponder != target else {
-                pendingFocusTarget = nil
+                cancelPendingFocusRequest()
                 return
             }
             guard pendingFocusTarget != target else { return }
 
+            cancelPendingFocusRequest()
             pendingFocusTarget = target
-            Task { @MainActor [weak self, weak textView] in
+            pendingFocusTask = Task { @MainActor [weak self, weak textView] in
                 await Task.yield()
                 guard let self, let textView else { return }
 
@@ -166,7 +168,14 @@ private struct ComposerTextView: UIViewRepresentable {
                     try? await Task.sleep(nanoseconds: 60_000_000)
                 }
 
+                guard !Task.isCancelled,
+                      self.pendingFocusTarget == target,
+                      (self.isFocused && textView.isEditable) == target else {
+                    return
+                }
+
                 self.pendingFocusTarget = nil
+                self.pendingFocusTask = nil
 
                 if target {
                     guard self.isFocused, textView.isEditable, textView.window != nil else { return }
@@ -178,12 +187,14 @@ private struct ComposerTextView: UIViewRepresentable {
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
+            cancelPendingFocusRequest()
             if !isFocused {
                 isFocused = true
             }
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
+            cancelPendingFocusRequest()
             if isFocused {
                 isFocused = false
             }
@@ -200,6 +211,12 @@ private struct ComposerTextView: UIViewRepresentable {
             let fittingSize = CGSize(width: textView.bounds.width, height: .greatestFiniteMagnitude)
             let height = ceil(textView.sizeThatFits(fittingSize).height)
             onHeightChange(min(96, max(22, height)))
+        }
+
+        private func cancelPendingFocusRequest() {
+            pendingFocusTask?.cancel()
+            pendingFocusTask = nil
+            pendingFocusTarget = nil
         }
     }
 
