@@ -6,14 +6,6 @@ final class ChatScrollPolicyTests: XCTestCase {
         XCTAssertEqual(ChatScrollPolicy.initialTranscriptAnchor, .bottom)
     }
 
-    func testTranscriptSizeChangesStayBottomAnchoredOnlyWhileFollowingLatest() {
-        XCTAssertEqual(
-            ChatScrollPolicy.sizeChangeAnchor(shouldFollowLatestMessage: true),
-            .bottom
-        )
-        XCTAssertNil(ChatScrollPolicy.sizeChangeAnchor(shouldFollowLatestMessage: false))
-    }
-
     func testInitialAsyncWorkWaitsForNavigationAppearanceCompletion() {
         XCTAssertFalse(ChatInitialAppearancePolicy.shouldBeginAsyncWork(hasCompletedAppearance: false))
         XCTAssertTrue(ChatInitialAppearancePolicy.shouldBeginAsyncWork(hasCompletedAppearance: true))
@@ -221,6 +213,27 @@ final class ChatScrollPolicyTests: XCTestCase {
 
         XCTAssertFalse(recorder.flush())
         XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testLayoutOnlyChangesDoNotRequestReadingPositionCommit() {
+        var gate = ChatTranscriptReadingPositionCommitGate()
+
+        gate.register(.layout)
+
+        XCTAssertFalse(gate.hasPendingCommit)
+        XCTAssertFalse(gate.consumePendingCommit())
+    }
+
+    func testReaderAndFollowLatestScrollsRequestOneReadingPositionCommit() {
+        var gate = ChatTranscriptReadingPositionCommitGate()
+
+        gate.register(.readerScroll)
+        gate.register(.followLatest)
+
+        XCTAssertTrue(gate.hasPendingCommit)
+        XCTAssertTrue(gate.consumePendingCommit())
+        XCTAssertFalse(gate.hasPendingCommit)
+        XCTAssertFalse(gate.consumePendingCommit())
     }
 
     func testTranscriptScrollPersistenceUsesIndependentServerAndSessionKeys() throws {

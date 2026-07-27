@@ -137,12 +137,6 @@ struct ChatTranscriptView: View {
                         ChatScrollPolicy.initialTranscriptAnchor,
                         for: .initialOffset
                     )
-                    .defaultScrollAnchor(
-                        ChatScrollPolicy.sizeChangeAnchor(
-                            shouldFollowLatestMessage: shouldFollowLatestMessage
-                        ),
-                        for: .sizeChanges
-                    )
                     .scrollPosition($transcriptScrollPosition)
                     .onScrollGeometryChange(
                         for: ChatTranscriptScrollGeometrySnapshot.self,
@@ -174,7 +168,7 @@ struct ChatTranscriptView: View {
                         if newPhase == .tracking || newPhase == .interacting {
                             releaseRestorationLockForUserScroll()
                         } else if newPhase == .idle {
-                            commitLatestReadingPosition()
+                            scheduleReadingPositionCommitIfNeeded()
                         }
                     }
                     .frame(width: viewportWidth)
@@ -226,7 +220,7 @@ struct ChatTranscriptView: View {
                     resolveInitialScrollPositionIfReady()
                 }
                 .onDisappear {
-                    commitLatestReadingPosition()
+                    commitPendingReadingPosition()
                 }
                 .onChange(of: isLoading) { _, _ in
                     resolveInitialScrollPositionIfReady()
@@ -250,6 +244,7 @@ struct ChatTranscriptView: View {
                 }
                 .onChange(of: messages.count) {
                     guard shouldFollowLatestMessage else { return }
+                    markFollowLatestReadingPositionChange()
 
                     if latestTranscriptMessageRole == "user" {
                         onScrollToLatestTranscriptMessage(proxy)
@@ -267,6 +262,7 @@ struct ChatTranscriptView: View {
                     // the lighter cached render, so snap back to the bottom (no
                     // animation) unless the reader has scrolled away in the meantime.
                     guard shouldFollowLatestMessage else { return }
+                    markFollowLatestReadingPositionChange()
                     onScrollToLatestContent(proxy, false)
                 }
                 .onChange(of: shouldFollowLatestMessage) { _, shouldFollow in
@@ -284,7 +280,16 @@ struct ChatTranscriptView: View {
                 }
                 .onChange(of: clarificationPrompt?.id) {
                     guard clarificationPrompt != nil, shouldFollowLatestMessage else { return }
+                    markFollowLatestReadingPositionChange()
                     onScrollToBottom(proxy)
+                }
+                .onChange(of: activeStreamID) { previousStreamID, newStreamID in
+                    guard previousStreamID != nil,
+                          newStreamID == nil,
+                          shouldFollowLatestMessage else {
+                        return
+                    }
+                    markFollowLatestReadingPositionChange()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
                     if isScrolledNearBottom {
@@ -418,8 +423,8 @@ struct ChatTranscriptView: View {
         viewportCache.latestScrollGeometry = geometry
 
         if hasCompletedInitialScrollResolution {
-            maintainCompletedRestorationLockOrPublish()
-            scheduleReadingPositionCommitIfIdle()
+            maintainCompletedRestorationLock()
+            scheduleReadingPositionCommitIfNeeded()
             return
         }
 
@@ -432,8 +437,8 @@ struct ChatTranscriptView: View {
         viewportCache.rowContentFrames = frames
 
         if hasCompletedInitialScrollResolution {
-            maintainCompletedRestorationLockOrPublish()
-            scheduleReadingPositionCommitIfIdle()
+            maintainCompletedRestorationLock()
+            scheduleReadingPositionCommitIfNeeded()
             return
         }
 
@@ -448,35 +453,47 @@ struct ChatTranscriptView: View {
         viewportCache.rowContentFrames
     }
 
-    private func publishLatestReadingPosition() {
+    @discardableResult
+    private func publishLatestReadingPosition() -> Bool {
         guard hasCompletedInitialScrollResolution,
               restorationLock?.preservesStoredPosition != true,
               let geometry = latestScrollGeometry else {
-            return
+            return false
         }
-        publishReadingPosition(
+        return publishReadingPosition(
             geometry: geometry,
             frames: rowContentFrames
         )
     }
 
-    private func scheduleReadingPositionCommitIfIdle() {
-        guard viewportCache.isScrollIdle else { return }
+    private func scheduleReadingPositionCommitIfNeeded() {
+        guard viewportCache.isScrollIdle,
+              viewportCache.readingPositionCommitGate.hasPendingCommit else {
+            return
+        }
 
         cancelPendingReadingPositionCommit()
         viewportCache.pendingReadingPositionCommit = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 120_000_000)
-            guard !Task.isCancelled, viewportCache.isScrollIdle else { return }
+            guard !Task.isCancelled,
+                  viewportCache.isScrollIdle,
+                  viewportCache.readingPositionCommitGate.hasPendingCommit else {
+                return
+            }
 
             viewportCache.pendingReadingPositionCommit = nil
-            publishLatestReadingPosition()
+            guard publishLatestReadingPosition() else { return }
+            viewportCache.readingPositionCommitGate.consumePendingCommit()
             onReadingPositionCommit()
         }
     }
 
-    private func commitLatestReadingPosition() {
+    private func commitPendingReadingPosition() {
         cancelPendingReadingPositionCommit()
-        publishLatestReadingPosition()
+        if viewportCache.readingPositionCommitGate.hasPendingCommit,
+           publishLatestReadingPosition() {
+            viewportCache.readingPositionCommitGate.consumePendingCommit()
+        }
         onReadingPositionCommit()
     }
 
@@ -485,16 +502,19 @@ struct ChatTranscriptView: View {
         viewportCache.pendingReadingPositionCommit = nil
     }
 
+    @discardableResult
     private func publishReadingPosition(
         geometry: ChatTranscriptScrollGeometrySnapshot,
         frames: [ChatTranscriptRowContentFrame]
-    ) {
-        onReadingPositionChange(
-            ChatTranscriptReadingPositionResolver.resolve(
-                frames: frames,
-                visibleContentOffsetY: geometry.visibleContentOffsetY
-            )
-        )
+    ) -> Bool {
+        guard let position = ChatTranscriptReadingPositionResolver.resolve(
+            frames: frames,
+            visibleContentOffsetY: geometry.visibleContentOffsetY
+        ) else {
+            return false
+        }
+        onReadingPositionChange(position)
+        return true
     }
 
     private func resolveInitialScrollPositionIfReady(
@@ -689,17 +709,14 @@ struct ChatTranscriptView: View {
         }
     }
 
-    private func maintainCompletedRestorationLockOrPublish() {
+    private func maintainCompletedRestorationLock() {
         guard let geometry = latestScrollGeometry else { return }
 
         if transcriptScrollPosition.isPositionedByUser {
-            releaseRestorationLockForUserScroll()
+            releaseRestorationLock()
         }
 
-        guard let restorationLock else {
-            publishReadingPosition(geometry: geometry, frames: rowContentFrames)
-            return
-        }
+        guard let restorationLock else { return }
 
         guard let targetOffsetY = targetContentOffsetY(
             for: restorationLock,
@@ -718,9 +735,6 @@ struct ChatTranscriptView: View {
             return
         }
 
-        if !restorationLock.preservesStoredPosition {
-            publishReadingPosition(geometry: geometry, frames: rowContentFrames)
-        }
     }
 
     private func targetContentOffsetY(
@@ -781,13 +795,24 @@ struct ChatTranscriptView: View {
     }
 
     private func releaseRestorationLockForUserScroll() {
+        viewportCache.readingPositionCommitGate.register(.readerScroll)
+        releaseRestorationLock()
+    }
+
+    private func releaseRestorationLock() {
         guard restorationLock != nil else { return }
         invalidateRestorationVerification(resetDeadline: true)
         restorationLock = nil
     }
 
     private func releaseRestorationLockForProgrammaticScroll() {
-        releaseRestorationLockForUserScroll()
+        markFollowLatestReadingPositionChange()
+        releaseRestorationLock()
+    }
+
+    private func markFollowLatestReadingPositionChange() {
+        viewportCache.readingPositionCommitGate.register(.followLatest)
+        scheduleReadingPositionCommitIfNeeded()
     }
 
     private func compressionReferenceCardView(_ card: CompressionReferenceCard) -> some View {
@@ -945,6 +970,7 @@ private final class ChatTranscriptViewportCache {
     var rowContentFrames: [ChatTranscriptRowContentFrame] = []
     var latestScrollGeometry: ChatTranscriptScrollGeometrySnapshot?
     var isScrollIdle = true
+    var readingPositionCommitGate = ChatTranscriptReadingPositionCommitGate()
     var pendingReadingPositionCommit: Task<Void, Never>?
 
     deinit {
