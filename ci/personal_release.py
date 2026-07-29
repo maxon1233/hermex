@@ -59,11 +59,25 @@ class ReleaseInspection:
     triage_commits_behind: int | None
     missing_required_commits: tuple[RequiredCommit, ...]
     new_upstream_commits: tuple[str, ...]
-    errors: tuple[str, ...]
+    # Lineage errors mean the release snapshot itself is wrong (a required
+    # personal commit is missing) and always block archiving. Freshness
+    # errors mean the app upstream has moved past the validated pins; the
+    # owner treats upstream syncs as free-time housekeeping, so they are
+    # advisory for archives and only affect the strict readiness report.
+    lineage_errors: tuple[str, ...]
+    freshness_errors: tuple[str, ...]
+
+    @property
+    def errors(self) -> tuple[str, ...]:
+        return self.lineage_errors + self.freshness_errors
 
     @property
     def is_releasable(self) -> bool:
         return not self.errors
+
+    @property
+    def is_archivable(self) -> bool:
+        return not self.lineage_errors
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -79,6 +93,7 @@ class ReleaseInspection:
             "new_upstream_commits": list(self.new_upstream_commits),
             "errors": list(self.errors),
             "is_releasable": self.is_releasable,
+            "is_archivable": self.is_archivable,
         }
 
 
@@ -213,7 +228,8 @@ def evaluate_release(
     commit_count: Callable[[str, str], int | None],
     commit_summaries: Callable[[str, str], tuple[str, ...]],
 ) -> ReleaseInspection:
-    errors: list[str] = []
+    lineage_errors: list[str] = []
+    freshness_errors: list[str] = []
 
     missing_required_commits = tuple(
         commit
@@ -221,7 +237,7 @@ def evaluate_release(
         if not is_ancestor(commit.sha, release_sha)
     )
     for commit in missing_required_commits:
-        errors.append(
+        lineage_errors.append(
             f"Personal baseline {commit.id} is missing: {commit.description} ({commit.sha[:12]})."
         )
 
@@ -234,7 +250,7 @@ def evaluate_release(
             if tested_lag is not None
             else "not an ancestor of the current upstream tip"
         )
-        errors.append(
+        freshness_errors.append(
             "Hermex app upstream has not been validated: "
             f"{tested_upstream_sha[:12]} is {lag_description}; "
             f"current upstream is {upstream_sha[:12]}."
@@ -246,14 +262,14 @@ def evaluate_release(
             if triage_lag is not None
             else "not an ancestor of the current upstream tip"
         )
-        errors.append(
+        freshness_errors.append(
             "Hermex app upstream has not been triaged: "
             f"{triaged_upstream_sha[:12]} is {lag_description}; "
             f"current upstream is {upstream_sha[:12]}."
         )
 
     if not is_ancestor(upstream_sha, release_sha):
-        errors.append(
+        freshness_errors.append(
             f"Release {release_sha[:12]} does not contain upstream {upstream_sha[:12]}."
         )
 
@@ -266,7 +282,8 @@ def evaluate_release(
         triage_commits_behind=triage_lag,
         missing_required_commits=missing_required_commits,
         new_upstream_commits=commit_summaries(tested_upstream_sha, upstream_sha),
-        errors=tuple(errors),
+        lineage_errors=tuple(lineage_errors),
+        freshness_errors=tuple(freshness_errors),
     )
 
 
@@ -467,9 +484,20 @@ def archive_personal_release(args: argparse.Namespace, repository: GitRepository
         release_ref=DEFAULT_RELEASE_REF,
         upstream_ref=DEFAULT_UPSTREAM_REF,
     )
-    if not inspection.is_releasable:
+    if not inspection.is_archivable:
         print(format_markdown(inspection), file=sys.stderr)
         raise PersonalReleaseError("Personal release preflight is blocked.")
+    if not inspection.is_releasable:
+        # Upstream freshness is advisory for personal archives: TestFlight is
+        # the owner's fast iteration channel, and upstream syncs happen in
+        # free time. personal/main is already CI-gated, so the snapshot being
+        # archived has passed the full suite on merge.
+        print(format_markdown(inspection), file=sys.stderr)
+        print(
+            "WARNING: archiving despite upstream freshness findings; "
+            "sync upstream in free time.",
+            file=sys.stderr,
+        )
 
     build_number = args.build_number.strip()
     if not build_number.isdigit():
@@ -486,15 +514,17 @@ def archive_personal_release(args: argparse.Namespace, repository: GitRepository
         )
     archive_path.parent.mkdir(parents=True, exist_ok=True)
 
-    result_bundle_path = (
-        Path(args.result_bundle_path).expanduser().resolve()
-        if args.result_bundle_path
-        else archive_path.with_suffix(".tests.xcresult")
-    )
-    if result_bundle_path.exists():
-        raise PersonalReleaseError(
-            f"Test result path already exists: {result_bundle_path}"
+    result_bundle_path: Path | None = None
+    if args.run_tests:
+        result_bundle_path = (
+            Path(args.result_bundle_path).expanduser().resolve()
+            if args.result_bundle_path
+            else archive_path.with_suffix(".tests.xcresult")
         )
+        if result_bundle_path.exists():
+            raise PersonalReleaseError(
+                f"Test result path already exists: {result_bundle_path}"
+            )
 
     with tempfile.TemporaryDirectory(prefix="hermex-personal-release-") as temporary:
         temporary_root = Path(temporary)
@@ -510,30 +540,34 @@ def archive_personal_release(args: argparse.Namespace, repository: GitRepository
             "HERMEX_BUILD_SOURCE_DIRTY=NO",
         ]
 
-        run_xcodebuild(
-            [
-                "test",
-                "-project",
-                "HermesMobile.xcodeproj",
-                "-scheme",
-                "HermesMobile",
-                "-destination",
-                args.test_destination,
-                "-derivedDataPath",
-                str(derived_data),
-                "-resultBundlePath",
-                str(result_bundle_path),
-                "-parallel-testing-enabled",
-                "YES",
-                "-parallel-testing-worker-count",
-                "1",
-                "-xcconfig",
-                str(xcconfig),
-                "CODE_SIGNING_ALLOWED=NO",
-                *common_identity_settings,
-            ],
-            cwd=source_root,
-        )
+        # The suite rerun is opt-in: personal/main only advances through the
+        # required CI Gate, so the exported snapshot already passed the full
+        # suite on merge. Pass --run-tests to revalidate anyway.
+        if args.run_tests and result_bundle_path is not None:
+            run_xcodebuild(
+                [
+                    "test",
+                    "-project",
+                    "HermesMobile.xcodeproj",
+                    "-scheme",
+                    "HermesMobile",
+                    "-destination",
+                    args.test_destination,
+                    "-derivedDataPath",
+                    str(derived_data),
+                    "-resultBundlePath",
+                    str(result_bundle_path),
+                    "-parallel-testing-enabled",
+                    "YES",
+                    "-parallel-testing-worker-count",
+                    "1",
+                    "-xcconfig",
+                    str(xcconfig),
+                    "CODE_SIGNING_ALLOWED=NO",
+                    *common_identity_settings,
+                ],
+                cwd=source_root,
+            )
 
         run_xcodebuild(
             [
@@ -579,7 +613,11 @@ def archive_personal_release(args: argparse.Namespace, repository: GitRepository
         "upstream_sha": identity.upstream_sha,
         "source_dirty": identity.source_dirty,
         "archive_path": str(archive_path),
-        "test_result_path": str(result_bundle_path),
+        "test_result_path": (
+            str(result_bundle_path)
+            if result_bundle_path is not None
+            else "skipped (personal/main is CI-gated; pass --run-tests to revalidate)"
+        ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Verified personal archive: {archive_path}")
@@ -620,7 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     archive = subparsers.add_parser(
         "archive",
-        help="Test and archive the exact remote personal/main snapshot.",
+        help="Archive the exact remote personal/main snapshot (fast by default).",
     )
     archive.add_argument("--repo", default=".")
     archive.add_argument("--build-number", required=True)
@@ -629,6 +667,14 @@ def build_parser() -> argparse.ArgumentParser:
     archive.add_argument("--expected-bundle-id", required=True)
     archive.add_argument("--expected-team-id", required=True)
     archive.add_argument("--result-bundle-path")
+    archive.add_argument(
+        "--run-tests",
+        action="store_true",
+        help=(
+            "Rerun the full XCTest suite before archiving. Off by default: "
+            "personal/main is CI-gated, so merged snapshots already passed."
+        ),
+    )
     archive.add_argument(
         "--test-destination",
         default="platform=iOS Simulator,name=iPhone 17",
