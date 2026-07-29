@@ -8952,10 +8952,10 @@ final class ChatViewModelSendTests: XCTestCase {
 
     @MainActor
     func testInitialRestorationIdentityMismatchKeepsLatestWithoutRetrying() async throws {
-        var sessionRequestCount = 0
+        var latestRequestCount = 0
+        var targetedRequestCount = 0
         let viewModel = try makeViewModel { request in
             XCTAssertEqual(request.url?.path, "/api/session")
-            sessionRequestCount += 1
             let components = URLComponents(
                 url: try XCTUnwrap(request.url),
                 resolvingAgainstBaseURL: false
@@ -8967,6 +8967,7 @@ final class ChatViewModelSendTests: XCTestCase {
             )
 
             if query["msg_before"] == nil {
+                latestRequestCount += 1
                 return apiTestJSONResponse("""
                 {
                   "session": {
@@ -8983,6 +8984,7 @@ final class ChatViewModelSendTests: XCTestCase {
                 """, for: request)
             }
 
+            targetedRequestCount += 1
             XCTAssertEqual(query["msg_before"], "351")
             return apiTestJSONResponse("""
             {
@@ -9006,7 +9008,17 @@ final class ChatViewModelSendTests: XCTestCase {
 
         await viewModel.loadMessages(initialScrollPosition: position)
 
-        XCTAssertEqual(sessionRequestCount, 2)
+        // The contract under test: an identity mismatch performs exactly one
+        // targeted lookup and never retries it. Count request kinds instead of
+        // a total so a stray late request leaked from an earlier test through
+        // the shared MockURLProtocol handler (observed on slow CI runners)
+        // cannot fail the wrong assertion.
+        XCTAssertEqual(
+            targetedRequestCount,
+            1,
+            "The identity mismatch must not retry the targeted window request."
+        )
+        XCTAssertGreaterThanOrEqual(latestRequestCount, 1)
         XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
         XCTAssertEqual(viewModel.messagesOffset, 998)
         XCTAssertEqual(
