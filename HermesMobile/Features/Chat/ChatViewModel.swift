@@ -195,14 +195,140 @@ enum ActiveStreamRecoveryState: Equatable {
     case reconnecting
 }
 
+private struct ChatResponseCompletionEvent: Equatable {
+    let trigger: Int
+    let needsTranscriptRefresh: Bool
+}
+
+struct ChatTranscriptScrollPositionRebaseMapping: Equatable {
+    let sourceRenderID: String
+    let sourceMessageID: String?
+    let targetRenderID: String
+    let targetMessageID: String?
+}
+
+struct ChatTranscriptScrollPositionRebaseEvent: Equatable {
+    let generation: Int
+    let mappings: [ChatTranscriptScrollPositionRebaseMapping]
+}
+
+enum ChatTranscriptScrollPositionRetirementReason: Equatable {
+    case missingAuthoritativeAssistant
+    case missingAuthoritativeUser
+    case ambiguousAuthoritativeAssistants
+}
+
+struct ChatTranscriptScrollPositionRetirementEvent: Equatable {
+    let generation: Int
+    let renderID: String
+    let messageID: String?
+    let reason: ChatTranscriptScrollPositionRetirementReason
+}
+
+private enum TransientRestorationMigrationOutcome {
+    case migrated(ChatTranscriptScrollPosition)
+    case retire(ChatTranscriptScrollPositionRetirementReason)
+    case inconclusive
+}
+
+private struct AuthoritativeMessageWindow: Equatable {
+    let offset: Int
+    let hasOlderMessages: Bool
+}
+
+private struct LatestTranscriptSnapshot {
+    let messages: [ChatMessage]
+    let offset: Int
+    let hasOlderMessages: Bool
+    let completedToolCallGroups: [ToolCallGroup]
+    let completedReasoningGroups: [ReasoningGroup]
+    let hadAssistantResponseAfterLatestUser: Bool
+    let compressionAnchorMetadata: CompressionAnchorMetadata?
+}
+
+@MainActor
+private final class SessionResponseLoadState {
+    var result: Result<SessionResponse, Error>?
+}
+
+struct CompletedTranscriptWindowResolution: Equatable {
+    let startIndex: Int
+    let messageOffset: Int
+    let hasOlderMessages: Bool
+    let trimmedUnboundedPayload: Bool
+}
+
+enum CompletedTranscriptWindowPolicy {
+    static func resolve(
+        messagesCount: Int,
+        messageCount: Int?,
+        messagesOffset: Int?,
+        messagesTruncated: Bool?,
+        maximumUnboundedMessages: Int
+    ) -> CompletedTranscriptWindowResolution? {
+        guard messagesCount > 0, maximumUnboundedMessages > 0 else {
+            return nil
+        }
+
+        let explicitOffset = max(0, messagesOffset ?? 0)
+        let knownMessageCount = max(messagesCount, messageCount ?? messagesCount)
+        let isExplicitlyWindowed = messagesTruncated == true
+            || explicitOffset > 0
+            || knownMessageCount > messagesCount
+        if isExplicitlyWindowed {
+            let resolvedOffset = explicitOffset > 0
+                ? explicitOffset
+                : max(0, knownMessageCount - messagesCount)
+            return CompletedTranscriptWindowResolution(
+                startIndex: 0,
+                messageOffset: resolvedOffset,
+                hasOlderMessages: resolvedOffset > 0
+                    || messagesTruncated == true,
+                trimmedUnboundedPayload: false
+            )
+        }
+
+        let droppedMessageCount = max(
+            0,
+            messagesCount - maximumUnboundedMessages
+        )
+        return CompletedTranscriptWindowResolution(
+            startIndex: droppedMessageCount,
+            messageOffset: droppedMessageCount,
+            hasOlderMessages: droppedMessageCount > 0,
+            trimmedUnboundedPayload: droppedMessageCount > 0
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class ChatViewModel {
     private static let messagePageLimit = 50
+    /// Automatic loads and post-response reconciliation retain a bounded recent
+    /// window. Manual "Load earlier" requests may temporarily expand beyond
+    /// this, but a reload can never carry an entire restored transcript forward.
+    nonisolated static let automaticMessageWindowLimit = 400
+    /// A saved row outside the newest page is restored with exactly one bounded
+    /// request. The request is wider than the retained window because completed
+    /// tool turns can insert many raw rows after a locally streamed assistant.
+    /// Presentation and cache storage remain capped at 50 messages.
+    nonisolated static let restorationMessageWindowLimit = 100
+    nonisolated static let retainedRestorationMessageWindowLimit = 50
+    nonisolated static let restorationForwardContext = 50
+    /// Persisted tool activity is ordered with the transcript. Inspect only a
+    /// bounded suffix before filtering it to the retained message window so an
+    /// oversized side channel cannot recreate the same main-actor stall as an
+    /// oversized message payload.
+    nonisolated static let automaticPersistedToolCallWindowLimit = 400
 
     private(set) var messages: [ChatMessage] = [] {
-        didSet { recomputeDisplayedTranscriptMessages() }
+        didSet {
+            transcriptMutationGeneration &+= 1
+            recomputeDisplayedTranscriptMessages()
+        }
     }
+    @ObservationIgnored private var transcriptMutationGeneration = 0
     /// Memoized transcript mapping, recomputed once whenever `messages` or
     /// `messagesOffset` changes. Views read this single cached value instead of
     /// re-running the full classification pass on every body evaluation.
@@ -271,9 +397,11 @@ final class ChatViewModel {
     }
 
     private func recomputeDisplayedTranscriptMessages() {
+        let previousDisplayModel = displayedTranscriptMessages
         displayedTranscriptMessages = Self.transcriptMessages(
             from: messages,
-            messageOffset: messagesOffset
+            messageOffset: messagesOffset,
+            reusing: previousDisplayModel
         )
         recomputeCompressionReferenceCard()
     }
@@ -313,10 +441,32 @@ final class ChatViewModel {
     private(set) var messagesOffset = 0 {
         didSet { recomputeDisplayedTranscriptMessages() }
     }
+    @ObservationIgnored private var latestAuthoritativeWindow: AuthoritativeMessageWindow?
+    @ObservationIgnored private var retainedLatestTranscriptSnapshot: LatestTranscriptSnapshot?
+    @ObservationIgnored private var latestWindowActivationGeneration = 0
+    @ObservationIgnored private var latestWindowActivationTranscriptMutationGeneration:
+        Int?
+    /// Records an explicit jump-to-latest while the authoritative tail request
+    /// is still in flight and no retained snapshot exists yet.
+    @ObservationIgnored private var pendingLatestWindowActivation = false
+    @ObservationIgnored private var initialRestorationRequestGeneration = 0
+    @ObservationIgnored private var initialRestorationRequestTask:
+        Task<ChatTranscriptScrollPosition?, Error>?
+    @ObservationIgnored private var transcriptScrollPositionEventGeneration = 0
+    private(set) var transcriptScrollPositionRebaseEvent:
+        ChatTranscriptScrollPositionRebaseEvent?
+    private(set) var transcriptScrollPositionRetirementEvent:
+        ChatTranscriptScrollPositionRetirementEvent?
+    private(set) var isShowingHistoricalMessageWindow = false
     private(set) var hasOlderMessages = false
     private(set) var contextWindowSnapshot: ContextWindowSnapshot?
-    private(set) var responseCompletionHapticTrigger = 0
-    private(set) var responseCompletionNeedsTranscriptRefresh = false
+    private var responseCompletionEvent: ChatResponseCompletionEvent?
+    var responseCompletionHapticTrigger: Int {
+        responseCompletionEvent?.trigger ?? 0
+    }
+    var responseCompletionNeedsTranscriptRefresh: Bool {
+        responseCompletionEvent?.needsTranscriptRefresh ?? false
+    }
     private(set) var modelCatalogGroups: [ModelCatalogGroup] = []
     private(set) var agentCommands: [AgentCommand] = []
     private(set) var workspaceRoots: [WorkspaceRoot] = []
@@ -1147,10 +1297,29 @@ final class ChatViewModel {
 
     func loadMessages(
         modelContext: ModelContext? = nil,
-        initialScrollPosition: ChatTranscriptScrollPosition? = nil
+        initialScrollPosition: ChatTranscriptScrollPosition? = nil,
+        allowsCacheFallback: Bool = true,
+        expectedResponseCompletionTrigger: Int? = nil
     ) async {
         guard let sessionID else {
             errorMessage = String(localized: "The server did not provide a session ID.")
+            return
+        }
+
+        cancelInitialRestorationRequest()
+        let initialRestorationGeneration = initialRestorationRequestGeneration
+
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "vm.loadMessages.enter pos=\(initialScrollPosition?.renderID ?? "nil") trigger=\(expectedResponseCompletionTrigger.map(String.init) ?? "nil") count=\(messages.count) offset=\(messagesOffset) historical=\(isShowingHistoricalMessageWindow)"
+        )
+        // A completion-triggered reload is launched asynchronously by the
+        // view. A quick next send may already own the transcript by the time
+        // this task first reaches the main actor. Reject it before clearing
+        // pending stream buffers or preparing session-load state.
+        guard completionRefreshStateIsCurrent(
+            expectedTrigger: expectedResponseCompletionTrigger
+        ) else {
             return
         }
 
@@ -1169,6 +1338,7 @@ final class ChatViewModel {
         // render the cached messages immediately so the loading skeleton never shows.
         let previousMessages = messages
         let previousMessagesOffset = messagesOffset
+        let previousAuthoritativeWindow = latestAuthoritativeWindow
         let usesPrimedInitialCache = hasPrimedInitialCachedMessages && !previousMessages.isEmpty
         hasPrimedInitialCachedMessages = false
         let cacheFirstPlaceholder: [ChatMessage]
@@ -1184,19 +1354,72 @@ final class ChatViewModel {
             cacheFirstPlaceholder = []
         }
         let renderedCacheFirst = !cacheFirstPlaceholder.isEmpty
+        let loadTranscriptMutationGeneration = transcriptMutationGeneration
+        let loadLatestWindowActivationGeneration =
+            latestWindowActivationGeneration
+        let restorationLoadTask: Task<ChatTranscriptScrollPosition?, Never>?
+        if let initialScrollPosition,
+           activeStreamID == nil,
+           !Self.messageWindow(
+               messages,
+               messageOffset: messagesOffset,
+               contains: initialScrollPosition
+           ) {
+            restorationLoadTask = Task { @MainActor [weak self] in
+                guard let self else { return nil }
+                return await self.loadInitialRestorationMessageWindow(
+                    containing: initialScrollPosition,
+                    sessionID: sessionID,
+                    modelContext: modelContext,
+                    expectedRequestGeneration: initialRestorationGeneration
+                )
+            }
+        } else {
+            restorationLoadTask = nil
+        }
+        var resolvedInitialRestorationPosition = initialScrollPosition
+        let latestRequestState = SessionResponseLoadState()
+        let latestRequestTask = Task { @MainActor in
+            do {
+                latestRequestState.result = .success(
+                    try await self.client.session(
+                        id: sessionID,
+                        includeMessages: true,
+                        messageLimit: Self.messagePageLimit,
+                        // Cold load only: widen the window to renderable-dense (upstream #3790) so a
+                        // tool-heavy session opens populated. "Load earlier" keeps the raw cap.
+                        expandRenderable: true
+                    )
+                )
+            } catch {
+                latestRequestState.result = .failure(error)
+            }
+        }
 
         do {
-            let response = try await client.session(
-                id: sessionID,
-                includeMessages: true,
-                messageLimit: Self.messagePageLimit,
-                // Cold load only: widen the window to renderable-dense (upstream #3790) so a
-                // tool-heavy session opens populated. "Load earlier" keeps the raw cap.
-                expandRenderable: true
-            )
+            await withTaskCancellationHandler {
+                await latestRequestTask.value
+            } onCancel: {
+                latestRequestTask.cancel()
+                restorationLoadTask?.cancel()
+            }
+            guard let latestRequestResult = latestRequestState.result else {
+                throw CancellationError()
+            }
+            let response = try latestRequestResult.get()
             let session = response.session
             let loadedMessages = session?.messages ?? []
+            let authoritativeOffset = Self.resolvedMessagesOffset(
+                from: session,
+                loadedMessageCount: loadedMessages.count
+            )
+            let authoritativeHasOlderMessages = authoritativeOffset > 0
+                || session?.messagesTruncated == true
             let loadedActiveStreamID = session?.activeStreamId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if loadedActiveStreamID?.isEmpty == false {
+                cancelInitialRestorationRequest()
+                restorationLoadTask?.cancel()
+            }
             let reloadedMessages: [ChatMessage]
             if let modelContext {
                 do {
@@ -1216,22 +1439,207 @@ final class ChatViewModel {
             } else {
                 reloadedMessages = loadedMessages
             }
-            applyCompressionAnchorMetadata(from: session)
-            applyReloadedMessages(
+            if loadedActiveStreamID?.isEmpty != false,
+               let restoredPosition = await restorationLoadTask?.value {
+                resolvedInitialRestorationPosition = restoredPosition
+            }
+            let hadAlreadyAppliedRequestedHistoricalWindow =
+                resolvedInitialRestorationPosition.map { position in
+                    isShowingHistoricalMessageWindow
+                        && Self.messageWindow(
+                            messages,
+                            messageOffset: messagesOffset,
+                            contains: position
+                        )
+                } ?? false
+            let hadActivatedLatestWithoutSubsequentMutation =
+                latestWindowActivationGeneration
+                    != loadLatestWindowActivationGeneration
+                    && latestWindowActivationTranscriptMutationGeneration
+                        == transcriptMutationGeneration
+            let transcriptStillOwnedByThisLoad =
+                transcriptMutationGeneration == loadTranscriptMutationGeneration
+                    || (
+                        expectedResponseCompletionTrigger == nil
+                            && (
+                                hadAlreadyAppliedRequestedHistoricalWindow
+                                    || hadActivatedLatestWithoutSubsequentMutation
+                            )
+                    )
+            guard completionRefreshStateIsCurrent(
+                expectedTrigger: expectedResponseCompletionTrigger
+            ), transcriptStillOwnedByThisLoad else {
+                return
+            }
+            if expectedResponseCompletionTrigger != nil,
+               !Self.reloadedMessagesContainCurrentCompletedTurn(
+                    loadedMessages,
+                    reloadedMessagesOffset: authoritativeOffset,
+                    currentMessages: previousMessages,
+                    currentMessagesOffset: previousMessagesOffset
+               ) {
+                // A just-completed turn can take a moment to become visible to
+                // `/api/session`. Keep the streamed transcript rather than
+                // replacing it with a successful but stale server snapshot.
+                return
+            }
+            let completionScrollPositionRebaseMappings =
+                expectedResponseCompletionTrigger.map { _ in
+                    Self.completedTurnScrollPositionRebaseMappings(
+                        authoritativeMessages: loadedMessages,
+                        authoritativeMessagesOffset: authoritativeOffset,
+                        currentMessages: previousMessages,
+                        currentMessagesOffset: previousMessagesOffset
+                    )
+                } ?? []
+
+            let boundedReloadedWindow = Self.boundedMessageWindow(
                 reloadedMessages,
-                from: session,
-                previousMessages: previousMessages,
-                previousMessagesOffset: previousMessagesOffset
+                messageOffset: authoritativeOffset,
+                maximumCount: Self.automaticMessageWindowLimit
             )
-            if renderedCacheFirst {
+            let boundedAuthoritativeHasOlderMessages =
+                authoritativeHasOlderMessages
+                    || boundedReloadedWindow.messageOffset > 0
+            let latestHadAssistantResponseAfterLatestUser =
+                Self.hasAssistantResponseAfterLatestUser(
+                    in: boundedReloadedWindow.messages
+                )
+            let latestCompletedToolCallGroups = ToolCallGroup.groups(
+                persistedToolCalls: Self.boundedPersistedToolCalls(
+                    session?.toolCalls ?? [],
+                    messageOffset: boundedReloadedWindow.messageOffset,
+                    messageCount: boundedReloadedWindow.messages.count
+                ),
+                messages: boundedReloadedWindow.messages,
+                messageOffset: boundedReloadedWindow.messageOffset
+            )
+            if loadedActiveStreamID?.isEmpty != false,
+               restorationLoadTask != nil {
+                // The authoritative tail is already available, but it must not
+                // become the first visible frame while a saved historical
+                // position is resolving. Retain it for send/jump-to-latest and
+                // let the targeted request exclusively own presentation.
+                retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                    messages: boundedReloadedWindow.messages,
+                    offset: boundedReloadedWindow.messageOffset,
+                    hasOlderMessages: boundedAuthoritativeHasOlderMessages,
+                    completedToolCallGroups: latestCompletedToolCallGroups,
+                    completedReasoningGroups: [],
+                    hadAssistantResponseAfterLatestUser:
+                        latestHadAssistantResponseAfterLatestUser,
+                    compressionAnchorMetadata:
+                        CompressionAnchorMetadata(from: session)
+                )
+                latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                    offset: boundedReloadedWindow.messageOffset,
+                    hasOlderMessages: boundedAuthoritativeHasOlderMessages
+                )
+            }
+            let didApplyRequestedHistoricalWindow =
+                resolvedInitialRestorationPosition.map { position in
+                    isShowingHistoricalMessageWindow
+                        && Self.messageWindow(
+                            messages,
+                            messageOffset: messagesOffset,
+                            contains: position
+                        )
+                } ?? false
+            let didActivateLatestWithoutSubsequentMutationAfterRestoration =
+                latestWindowActivationGeneration
+                    != loadLatestWindowActivationGeneration
+                    && latestWindowActivationTranscriptMutationGeneration
+                        == transcriptMutationGeneration
+            let transcriptStillOwnedAfterRestoration =
+                transcriptMutationGeneration == loadTranscriptMutationGeneration
+                    || (
+                        expectedResponseCompletionTrigger == nil
+                            && (
+                                didApplyRequestedHistoricalWindow
+                                    || didActivateLatestWithoutSubsequentMutationAfterRestoration
+                            )
+                    )
+            guard transcriptStillOwnedAfterRestoration else {
+                // SCROLLTRACE
+                ChatScrollTrace.log("vm.loadMessages.abandoned (ownership lost)")
+                return
+            }
+            // A load that carried the saved position preserves the historical
+            // window it just applied. A position-less refresh (foreground
+            // reconcile, status poll, or the deferred initial load that runs
+            // after view-side restoration already consumed the saved position)
+            // must equally leave the displayed historical window alone: its
+            // fresh tail belongs in the retained latest snapshot until the
+            // reader explicitly sends or jumps to latest. Without the second
+            // arm, every such refresh replaced the restored window underneath
+            // the reader and made the viewport show unrelated content until
+            // the restoration lock corrected it back.
+            let preservesHistoricalPresentation =
+                loadedActiveStreamID?.isEmpty != false
+                    && !pendingLatestWindowActivation
+                    && (
+                        didApplyRequestedHistoricalWindow
+                            || (
+                                isShowingHistoricalMessageWindow
+                                    && expectedResponseCompletionTrigger == nil
+                                    && resolvedInitialRestorationPosition == nil
+                            )
+                    )
+            // SCROLLTRACE
+            ChatScrollTrace.log(
+                "vm.loadMessages.landed activeStream=\(loadedActiveStreamID ?? "nil") didApplyHistorical=\(didApplyRequestedHistoricalWindow) pendingActivation=\(pendingLatestWindowActivation) preserves=\(preservesHistoricalPresentation) loadedCount=\(boundedReloadedWindow.messages.count) loadedOffset=\(boundedReloadedWindow.messageOffset)"
+            )
+            let fulfillsPendingLatestWindowActivation =
+                pendingLatestWindowActivation
+            latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                offset: boundedReloadedWindow.messageOffset,
+                hasOlderMessages: boundedAuthoritativeHasOlderMessages
+            )
+            if preservesHistoricalPresentation {
+                retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                    messages: boundedReloadedWindow.messages,
+                    offset: boundedReloadedWindow.messageOffset,
+                    hasOlderMessages: boundedAuthoritativeHasOlderMessages,
+                    completedToolCallGroups: latestCompletedToolCallGroups,
+                    completedReasoningGroups: [],
+                    hadAssistantResponseAfterLatestUser:
+                        latestHadAssistantResponseAfterLatestUser,
+                    compressionAnchorMetadata:
+                        CompressionAnchorMetadata(from: session)
+                )
+            } else {
+                // SCROLLTRACE
+                ChatScrollTrace.log(
+                    "vm.loadMessages.REPLACE wasHistorical=\(isShowingHistoricalMessageWindow) newCount=\(boundedReloadedWindow.messages.count) newOffset=\(boundedReloadedWindow.messageOffset)"
+                )
+                pendingLatestWindowActivation = false
+                retainedLatestTranscriptSnapshot = nil
+                isShowingHistoricalMessageWindow = false
+                applyReloadedMessages(
+                    boundedReloadedWindow.messages,
+                    reloadedMessagesOffset: boundedReloadedWindow.messageOffset,
+                    reloadedHasOlderMessages:
+                        boundedAuthoritativeHasOlderMessages,
+                    previousMessages: previousMessages,
+                    previousMessagesOffset: previousMessagesOffset
+                )
+                applyCompressionAnchorMetadata(from: session)
+                emitTranscriptScrollPositionRebaseIfTargetsAreDisplayed(
+                    completionScrollPositionRebaseMappings
+                )
+                latestServerLoadHadAssistantResponseAfterLatestUser =
+                    latestHadAssistantResponseAfterLatestUser
+                setCompletedToolCallGroups(latestCompletedToolCallGroups)
+                completedReasoningGroups = []
+                if fulfillsPendingLatestWindowActivation {
+                    streamingScrollTrigger += 1
+                }
+            }
+            if renderedCacheFirst && !preservesHistoricalPresentation {
                 // The taller server transcript has now replaced the lighter cache-first
                 // render; signal the view to re-pin to the bottom without a visible jump.
                 cacheFirstReconcileScrollToken += 1
             }
-            latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
-                in: messages
-            )
-            responseCompletionNeedsTranscriptRefresh = false
             isViewingCachedData = false
             contextWindowSnapshot = ContextWindowSnapshot(
                 contextLength: session?.contextLength,
@@ -1243,13 +1651,23 @@ final class ChatViewModel {
             )
             if let modelContext {
                 do {
-                    try CacheStore.cacheMessages(
-                        messages,
-                        serverURL: server,
-                        sessionID: sessionID,
-                        messageOffset: messagesOffset,
-                        in: modelContext
+                    let boundedCacheWindow = Self.boundedMessageWindow(
+                        reloadedMessages,
+                        messageOffset: authoritativeOffset,
+                        maximumCount: CachePolicy.maxMessagesPerSession
                     )
+                    if boundedCacheWindow.messages.isEmpty
+                        || Self.containsRenderableTranscriptMessage(
+                            boundedCacheWindow.messages
+                        ) {
+                        try CacheStore.cacheMessages(
+                            boundedCacheWindow.messages,
+                            serverURL: server,
+                            sessionID: sessionID,
+                            messageOffset: boundedCacheWindow.messageOffset,
+                            in: modelContext
+                        )
+                    }
                 } catch {
                     cacheErrorMessage = error.localizedDescription
                 }
@@ -1257,12 +1675,6 @@ final class ChatViewModel {
             if let title = session?.title {
                 displayTitle = Self.displayTitle(from: title)
             }
-            setCompletedToolCallGroups(ToolCallGroup.groups(
-                persistedToolCalls: session?.toolCalls ?? [],
-                messages: messages,
-                messageOffset: messagesOffset
-            ))
-            completedReasoningGroups = []
             liveToolCalls = []
             liveReasoningText = ""
             pinnedLocalNotices = []
@@ -1275,9 +1687,50 @@ final class ChatViewModel {
                 usedCacheFallback: false
             )
         } catch {
+            if let restoredPosition = await restorationLoadTask?.value {
+                resolvedInitialRestorationPosition = restoredPosition
+            }
+            let didApplyRequestedHistoricalWindow =
+                resolvedInitialRestorationPosition.map { position in
+                    isShowingHistoricalMessageWindow
+                        && Self.messageWindow(
+                            messages,
+                            messageOffset: messagesOffset,
+                            contains: position
+                        )
+                } ?? false
+            let didActivateLatestWithoutSubsequentMutation =
+                latestWindowActivationGeneration
+                    != loadLatestWindowActivationGeneration
+                    && latestWindowActivationTranscriptMutationGeneration
+                        == transcriptMutationGeneration
+            guard completionRefreshIsCurrent(
+                expectedTrigger: expectedResponseCompletionTrigger,
+                transcriptMutationGeneration: loadTranscriptMutationGeneration
+            ) || (
+                expectedResponseCompletionTrigger == nil
+                    && (
+                        didApplyRequestedHistoricalWindow
+                            || didActivateLatestWithoutSubsequentMutation
+                    )
+            ) else {
+                return
+            }
             lastError = error
             latestServerLoadHadAssistantResponseAfterLatestUser = false
-            if CacheFallbackPolicy.shouldUseCache(for: error), let modelContext {
+            if isShowingHistoricalMessageWindow {
+                isViewingCachedData = true
+                errorMessage = nil
+                streamCoordinator.reconcileSessionLoad(
+                    loadedActiveStreamID: nil,
+                    preparation: streamLoadPreparation,
+                    usedCacheFallback: true
+                )
+                return
+            }
+            if allowsCacheFallback,
+               CacheFallbackPolicy.shouldUseCache(for: error),
+               let modelContext {
                 do {
                     let cachedWindow = try CacheStore.cachedMessageWindow(
                         serverURL: server,
@@ -1286,15 +1739,20 @@ final class ChatViewModel {
                     )
                     let cachedMessages = cachedWindow.messages
                     if !cachedMessages.isEmpty {
+                        retainedLatestTranscriptSnapshot = nil
+                        isShowingHistoricalMessageWindow = false
                         clearCompressionAnchorMetadata()
                         messages = cachedMessages
                         latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
                             in: messages
                         )
-                        responseCompletionNeedsTranscriptRefresh = false
                         messagesOffset = renderedCacheFirst
                             ? messagesOffset
                             : cachedWindow.messageOffset
+                        latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                            offset: messagesOffset,
+                            hasOlderMessages: messagesOffset > 0
+                        )
                         hasOlderMessages = false
                         isViewingCachedData = true
                         contextWindowSnapshot = nil
@@ -1318,7 +1776,8 @@ final class ChatViewModel {
                             revertCacheFirstPlaceholder(
                                 cacheFirstPlaceholder,
                                 to: previousMessages,
-                                previousMessagesOffset: previousMessagesOffset
+                                previousMessagesOffset: previousMessagesOffset,
+                                previousAuthoritativeWindow: previousAuthoritativeWindow
                             )
                         }
                         isViewingCachedData = false
@@ -1329,7 +1788,8 @@ final class ChatViewModel {
                         revertCacheFirstPlaceholder(
                             cacheFirstPlaceholder,
                             to: previousMessages,
-                            previousMessagesOffset: previousMessagesOffset
+                            previousMessagesOffset: previousMessagesOffset,
+                            previousAuthoritativeWindow: previousAuthoritativeWindow
                         )
                     }
                     cacheErrorMessage = error.localizedDescription
@@ -1341,13 +1801,560 @@ final class ChatViewModel {
                     revertCacheFirstPlaceholder(
                         cacheFirstPlaceholder,
                         to: previousMessages,
-                        previousMessagesOffset: previousMessagesOffset
+                        previousMessagesOffset: previousMessagesOffset,
+                        previousAuthoritativeWindow: previousAuthoritativeWindow
                     )
                 }
                 isViewingCachedData = false
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// Invalidates an in-flight one-shot saved-position request without
+    /// disturbing a historical window the reader already chose to view.
+    func cancelInitialRestorationRequest() {
+        initialRestorationRequestTask?.cancel()
+        initialRestorationRequestTask = nil
+        initialRestorationRequestGeneration &+= 1
+    }
+
+    /// Swaps a temporary historical restoration page back to the retained true
+    /// tail. This is synchronous so an optimistic send can never append to an
+    /// old page and pretend that page is the end of the session.
+    @discardableResult
+    func activateLatestMessageWindowIfNeeded() -> Bool {
+        cancelInitialRestorationRequest()
+        guard let snapshot = retainedLatestTranscriptSnapshot else {
+            if isShowingHistoricalMessageWindow {
+                // SCROLLTRACE
+                ChatScrollTrace.log("vm.activateLatest.pending (no snapshot)")
+                pendingLatestWindowActivation = true
+                latestWindowActivationGeneration &+= 1
+                latestWindowActivationTranscriptMutationGeneration =
+                    transcriptMutationGeneration
+            }
+            return false
+        }
+
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "vm.activateLatest.apply count=\(snapshot.messages.count) offset=\(snapshot.offset) wasHistorical=\(isShowingHistoricalMessageWindow)"
+        )
+        pendingLatestWindowActivation = false
+        retainedLatestTranscriptSnapshot = nil
+        isShowingHistoricalMessageWindow = false
+        resetPendingStreamingContentBuffers()
+        // Recompute the card only after the latest rows and absolute offset are
+        // active. Applying fresh compression metadata to the historical window
+        // would insert a card underneath the saved viewport during the swap.
+        compressionAnchorMetadata = nil
+        messages = snapshot.messages
+        messagesOffset = snapshot.offset
+        compressionAnchorMetadata = snapshot.compressionAnchorMetadata
+        recomputeCompressionReferenceCard()
+        hasOlderMessages = snapshot.hasOlderMessages
+        latestServerLoadHadAssistantResponseAfterLatestUser =
+            snapshot.hadAssistantResponseAfterLatestUser
+        setCompletedToolCallGroups(snapshot.completedToolCallGroups)
+        completedReasoningGroups = snapshot.completedReasoningGroups
+        latestWindowActivationGeneration &+= 1
+        latestWindowActivationTranscriptMutationGeneration =
+            transcriptMutationGeneration
+        return true
+    }
+
+    /// Persists the bounded window containing the position the reader just
+    /// committed, keeping the anchor and its rows available for the next open.
+    @discardableResult
+    func cacheCurrentRestorationMessageWindow(
+        containing position: ChatTranscriptScrollPosition,
+        modelContext: ModelContext
+    ) -> Bool {
+        guard let sessionID,
+              !position.hasTransientMessageIdentity,
+              Self.messageWindow(
+                  messages,
+                  messageOffset: messagesOffset,
+                  contains: position
+              ) else {
+            return false
+        }
+
+        do {
+            try CacheStore.cacheRestorationMessageWindow(
+                messages,
+                serverURL: server,
+                sessionID: sessionID,
+                messageOffset: messagesOffset,
+                position: position,
+                in: modelContext
+            )
+            return true
+        } catch {
+            cacheErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func loadInitialRestorationMessageWindow(
+        containing position: ChatTranscriptScrollPosition,
+        sessionID: String,
+        modelContext: ModelContext?,
+        expectedRequestGeneration: Int
+    ) async -> ChatTranscriptScrollPosition? {
+        guard expectedRequestGeneration == initialRestorationRequestGeneration,
+              !Task.isCancelled,
+              activeStreamID == nil,
+              !Self.messageWindow(
+                  messages,
+                  messageOffset: messagesOffset,
+                  contains: position
+              ),
+              let messageBefore = Self.restorationMessageBefore(for: position)
+        else {
+            return nil
+        }
+
+        let expectedTranscriptMutationGeneration = transcriptMutationGeneration
+
+        let requestTask = Task<ChatTranscriptScrollPosition?, Error> {
+            @MainActor in
+            let response = try await client.session(
+                id: sessionID,
+                includeMessages: true,
+                messageLimit: Self.restorationMessageWindowLimit,
+                messageBefore: messageBefore
+            )
+            guard expectedRequestGeneration == initialRestorationRequestGeneration,
+                  !Task.isCancelled,
+                  expectedTranscriptMutationGeneration == transcriptMutationGeneration,
+                  activeStreamID == nil,
+                  let session = response.session,
+                  session.activeStreamId?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty != false
+            else {
+                return nil
+            }
+
+            let loadedMessages = session.messages ?? []
+            guard let loadedOffset = Self.resolvedRestorationMessagesOffset(
+                from: session,
+                loadedMessageCount: loadedMessages.count,
+                messageBefore: messageBefore
+            ) else {
+                return nil
+            }
+            let exactHistoricalWindow = Self.restorationMessageWindow(
+                loadedMessages,
+                messageOffset: loadedOffset,
+                containing: position,
+                maximumCount: Self.retainedRestorationMessageWindowLimit
+            )
+            let canonicalPosition: ChatTranscriptScrollPosition
+            if exactHistoricalWindow != nil {
+                canonicalPosition = position
+            } else {
+                switch Self.transientRestorationMigration(
+                    position,
+                    messages: loadedMessages,
+                    messageOffset: loadedOffset,
+                    reachesAuthoritativeSessionEnd:
+                        session.messageCount.map {
+                            loadedOffset + loadedMessages.count >= max(0, $0)
+                        } ?? false
+                ) {
+                case .migrated(let recoveredPosition):
+                    canonicalPosition = recoveredPosition
+                case .retire(let reason):
+                    emitTranscriptScrollPositionRetirement(
+                        for: position,
+                        reason: reason
+                    )
+                    return nil
+                case .inconclusive:
+                    return nil
+                }
+            }
+            guard let historicalWindow = exactHistoricalWindow
+                    ?? Self.restorationMessageWindow(
+                        loadedMessages,
+                        messageOffset: loadedOffset,
+                        containing: canonicalPosition,
+                        maximumCount:
+                            Self.retainedRestorationMessageWindowLimit
+                    )
+            else {
+                return nil
+            }
+
+            let latestSnapshot: LatestTranscriptSnapshot?
+            if let retainedLatestTranscriptSnapshot {
+                latestSnapshot = retainedLatestTranscriptSnapshot
+            } else if !messages.isEmpty,
+                      !isShowingHistoricalMessageWindow {
+                latestSnapshot = LatestTranscriptSnapshot(
+                        messages: messages,
+                        offset: messagesOffset,
+                        hasOlderMessages: hasOlderMessages,
+                        completedToolCallGroups: completedToolCallGroups,
+                        completedReasoningGroups: completedReasoningGroups,
+                        hadAssistantResponseAfterLatestUser:
+                            latestServerLoadHadAssistantResponseAfterLatestUser,
+                        compressionAnchorMetadata:
+                            compressionAnchorMetadata
+                    )
+            } else {
+                latestSnapshot = nil
+            }
+            let historicalHasOlderMessages =
+                historicalWindow.messageOffset > 0
+                    || session.messagesTruncated == true
+            let historicalToolCalls = Self.boundedPersistedToolCalls(
+                session.toolCalls ?? [],
+                messageOffset: historicalWindow.messageOffset,
+                messageCount: historicalWindow.messages.count
+            )
+
+            // SCROLLTRACE
+            ChatScrollTrace.log(
+                "vm.restorationWindow.applied count=\(historicalWindow.messages.count) offset=\(historicalWindow.messageOffset)"
+            )
+            retainedLatestTranscriptSnapshot = latestSnapshot
+            isShowingHistoricalMessageWindow = true
+            messages = historicalWindow.messages
+            messagesOffset = historicalWindow.messageOffset
+            hasOlderMessages = historicalHasOlderMessages
+            latestServerLoadHadAssistantResponseAfterLatestUser =
+                Self.hasAssistantResponseAfterLatestUser(in: messages)
+            setCompletedToolCallGroups(ToolCallGroup.groups(
+                persistedToolCalls: historicalToolCalls,
+                messages: messages,
+                messageOffset: messagesOffset
+            ))
+            completedReasoningGroups = []
+            if let modelContext {
+                do {
+                    try CacheStore.cacheRestorationMessageWindow(
+                        historicalWindow.messages,
+                        serverURL: server,
+                        sessionID: sessionID,
+                        messageOffset: historicalWindow.messageOffset,
+                        position: canonicalPosition,
+                        in: modelContext
+                    )
+                } catch {
+                    cacheErrorMessage = error.localizedDescription
+                }
+            }
+            if canonicalPosition != position {
+                emitTranscriptScrollPositionRebase(
+                    mappings: [
+                        ChatTranscriptScrollPositionRebaseMapping(
+                            sourceRenderID: position.renderID,
+                            sourceMessageID: position.messageID,
+                            targetRenderID: canonicalPosition.renderID,
+                            targetMessageID: canonicalPosition.messageID
+                        )
+                    ]
+                )
+            }
+            return canonicalPosition
+        }
+        initialRestorationRequestTask = requestTask
+        defer {
+            if expectedRequestGeneration == initialRestorationRequestGeneration {
+                initialRestorationRequestTask = nil
+            }
+        }
+
+        do {
+            return try await withTaskCancellationHandler {
+                try await requestTask.value
+            } onCancel: {
+                requestTask.cancel()
+            }
+        } catch {
+            // Failure of this optional one-shot lookup must not turn a usable
+            // cached/session tail into an error or start pagination retries.
+            return nil
+        }
+    }
+
+    nonisolated static func restorationMessageBefore(
+        for position: ChatTranscriptScrollPosition
+    ) -> Int? {
+        guard let absoluteIndex = absoluteMessageIndex(from: position.renderID) else {
+            return nil
+        }
+
+        let requestedAdvance = 1 + restorationForwardContext
+        guard absoluteIndex <= Int.max - requestedAdvance else {
+            return Int.max
+        }
+        return absoluteIndex + requestedAdvance
+    }
+
+    nonisolated private static func transientRestorationMigration(
+        _ position: ChatTranscriptScrollPosition,
+        messages: [ChatMessage],
+        messageOffset: Int,
+        reachesAuthoritativeSessionEnd: Bool
+    ) -> TransientRestorationMigrationOutcome {
+        guard let sourceMessageID = position.messageID?
+                .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return .inconclusive
+        }
+        if sourceMessageID.hasPrefix("stream-") {
+            return transientAssistantRestorationMigration(
+                position,
+                messages: messages,
+                messageOffset: messageOffset,
+                reachesAuthoritativeSessionEnd:
+                    reachesAuthoritativeSessionEnd
+            )
+        }
+        if sourceMessageID.hasPrefix("local-"),
+           UUID(uuidString: String(sourceMessageID.dropFirst("local-".count)))
+            != nil {
+            return transientUserRestorationMigration(
+                position,
+                messages: messages,
+                messageOffset: messageOffset,
+                reachesAuthoritativeSessionEnd:
+                    reachesAuthoritativeSessionEnd
+            )
+        }
+        return .inconclusive
+    }
+
+    /// Migrates a viewport captured against the ephemeral assistant row used
+    /// while streaming. A completed tool turn can insert raw tool rows at the
+    /// stale absolute index, so search forward only within that same turn. More
+    /// than one assistant before the next user boundary is ambiguous and must
+    /// retain the existing fail-to-latest behavior.
+    nonisolated private static func transientAssistantRestorationMigration(
+        _ position: ChatTranscriptScrollPosition,
+        messages: [ChatMessage],
+        messageOffset: Int,
+        reachesAuthoritativeSessionEnd: Bool
+    ) -> TransientRestorationMigrationOutcome {
+        guard let sourceMessageID = position.messageID?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              sourceMessageID.hasPrefix("stream-"),
+              let sourceAbsoluteIndex = absoluteMessageIndex(
+                from: position.renderID
+              )
+        else {
+            return .inconclusive
+        }
+
+        let resolvedOffset = max(0, messageOffset)
+        guard sourceAbsoluteIndex >= resolvedOffset else {
+            return .inconclusive
+        }
+        let startIndex = sourceAbsoluteIndex - resolvedOffset
+        guard messages.indices.contains(startIndex) else {
+            return .inconclusive
+        }
+
+        var assistantCandidateIndices: [Int] = []
+        var encounteredNextUserBoundary = false
+        for loadedIndex in startIndex..<messages.count {
+            let message = messages[loadedIndex]
+            if TranscriptTurnClassifier.isUserTurnBoundary(message) {
+                encounteredNextUserBoundary = true
+                break
+            }
+            guard message.role == "assistant",
+                  isRenderableTranscriptMessage(message) else {
+                continue
+            }
+            assistantCandidateIndices.append(loadedIndex)
+        }
+
+        guard encounteredNextUserBoundary
+                || reachesAuthoritativeSessionEnd else {
+            return .inconclusive
+        }
+        guard assistantCandidateIndices.count <= 1 else {
+            return .retire(.ambiguousAuthoritativeAssistants)
+        }
+        guard let assistantCandidateIndex = assistantCandidateIndices.first else {
+            return .retire(.missingAuthoritativeAssistant)
+        }
+        let targetMessage = messages[assistantCandidateIndex]
+        let targetMessageID = ChatTranscriptMessageIdentity.resolve(
+            for: targetMessage
+        )
+        guard !targetMessageID.hasPrefix("stream-") else {
+            return .inconclusive
+        }
+
+        return .migrated(ChatTranscriptScrollPosition(
+            renderID:
+                "transcript:\(resolvedOffset + assistantCandidateIndex)",
+            messageID: targetMessageID,
+            offsetFromRowTop: position.offsetFromRowTop,
+            coordinateSpaceVersion: position.coordinateSpaceVersion
+        ))
+    }
+
+    /// Optimistic user rows use a UUID-backed `local-*` identity. The first
+    /// authoritative user boundary at or after that raw position is the only
+    /// safe replacement; if the bounded page ends before either that boundary
+    /// or the session end, preserve the anchor for a later attempt.
+    nonisolated private static func transientUserRestorationMigration(
+        _ position: ChatTranscriptScrollPosition,
+        messages: [ChatMessage],
+        messageOffset: Int,
+        reachesAuthoritativeSessionEnd: Bool
+    ) -> TransientRestorationMigrationOutcome {
+        guard let sourceAbsoluteIndex = absoluteMessageIndex(
+            from: position.renderID
+        ) else {
+            return .inconclusive
+        }
+        let resolvedOffset = max(0, messageOffset)
+        guard sourceAbsoluteIndex >= resolvedOffset else {
+            return .inconclusive
+        }
+        let startIndex = sourceAbsoluteIndex - resolvedOffset
+        guard messages.indices.contains(startIndex) else {
+            return .inconclusive
+        }
+
+        if let userIndex = (startIndex..<messages.count).first(where: {
+            TranscriptTurnClassifier.isUserTurnBoundary(messages[$0])
+        }) {
+            let targetMessageID = ChatTranscriptMessageIdentity.resolve(
+                for: messages[userIndex]
+            )
+            guard !targetMessageID.hasPrefix("local-") else {
+                return .inconclusive
+            }
+            return .migrated(ChatTranscriptScrollPosition(
+                renderID: "transcript:\(resolvedOffset + userIndex)",
+                messageID: targetMessageID,
+                offsetFromRowTop: position.offsetFromRowTop,
+                coordinateSpaceVersion: position.coordinateSpaceVersion
+            ))
+        }
+
+        return reachesAuthoritativeSessionEnd
+            ? .retire(.missingAuthoritativeUser)
+            : .inconclusive
+    }
+
+    private func emitTranscriptScrollPositionRebase(
+        mappings: [ChatTranscriptScrollPositionRebaseMapping]
+    ) {
+        guard !mappings.isEmpty else { return }
+        transcriptScrollPositionEventGeneration += 1
+        transcriptScrollPositionRebaseEvent =
+            ChatTranscriptScrollPositionRebaseEvent(
+                generation: transcriptScrollPositionEventGeneration,
+                mappings: mappings
+            )
+    }
+
+    private func emitTranscriptScrollPositionRetirement(
+        for position: ChatTranscriptScrollPosition,
+        reason: ChatTranscriptScrollPositionRetirementReason
+    ) {
+        transcriptScrollPositionEventGeneration += 1
+        transcriptScrollPositionRetirementEvent =
+            ChatTranscriptScrollPositionRetirementEvent(
+                generation: transcriptScrollPositionEventGeneration,
+                renderID: position.renderID,
+                messageID: position.messageID,
+                reason: reason
+            )
+    }
+
+    private func emitTranscriptScrollPositionRebaseIfTargetsAreDisplayed(
+        _ mappings: [ChatTranscriptScrollPositionRebaseMapping]
+    ) {
+        let displayedMappings = mappings.filter { mapping in
+            displayedTranscriptMessages.contains(where: {
+                $0.renderID == mapping.targetRenderID
+                    && $0.persistenceMessageID == mapping.targetMessageID
+            })
+        }
+        emitTranscriptScrollPositionRebase(mappings: displayedMappings)
+    }
+
+    nonisolated static func messageWindow(
+        _ messages: [ChatMessage],
+        messageOffset: Int,
+        contains position: ChatTranscriptScrollPosition
+    ) -> Bool {
+        let identities = transcriptMessages(
+            from: messages,
+            messageOffset: messageOffset
+        ).map {
+            ChatTranscriptRowIdentity(
+                renderID: $0.renderID,
+                messageID: $0.persistenceMessageID
+            )
+        }
+        return ChatTranscriptReadingPositionResolver.matchingRowIndex(
+            for: position,
+            identities: identities
+        ) != nil
+    }
+
+    nonisolated static func restorationMessageWindow(
+        _ messages: [ChatMessage],
+        messageOffset: Int,
+        containing position: ChatTranscriptScrollPosition,
+        maximumCount: Int
+    ) -> (messages: [ChatMessage], messageOffset: Int)? {
+        guard maximumCount > 0 else { return nil }
+
+        let transcript = transcriptMessages(
+            from: messages,
+            messageOffset: messageOffset
+        )
+        let identities = transcript.map {
+            ChatTranscriptRowIdentity(
+                renderID: $0.renderID,
+                messageID: $0.persistenceMessageID
+            )
+        }
+        guard let matchingTranscriptIndex =
+                ChatTranscriptReadingPositionResolver.matchingRowIndex(
+                    for: position,
+                    identities: identities
+                )
+        else {
+            return nil
+        }
+
+        guard messages.count > maximumCount else {
+            return (messages, max(0, messageOffset))
+        }
+
+        let matchingLoadedIndex = transcript[matchingTranscriptIndex].loadedIndex
+        let maximumStartIndex = messages.count - maximumCount
+        let preferredStartIndex = max(
+            0,
+            matchingLoadedIndex - (maximumCount / 2)
+        )
+        let startIndex = min(preferredStartIndex, maximumStartIndex)
+        let endIndex = startIndex + maximumCount
+        let boundedMessages = Array(messages[startIndex..<endIndex])
+        let boundedOffset = max(0, messageOffset) + startIndex
+
+        guard messageWindow(
+            boundedMessages,
+            messageOffset: boundedOffset,
+            contains: position
+        ) else {
+            return nil
+        }
+        return (boundedMessages, boundedOffset)
     }
 
     /// Performs only the fast, local portion of an existing session's first
@@ -1384,30 +2391,154 @@ final class ChatViewModel {
         modelContext: ModelContext,
         initialScrollPosition: ChatTranscriptScrollPosition?
     ) -> [ChatMessage] {
-        let cachedMessages: [ChatMessage]
-        let cachedMessageOffset: Int
+        let cachedWindow: CachedMessageWindow
+        let restorationWindow: CachedMessageWindow?
         do {
-            let cachedWindow = try CacheStore.cachedMessageWindow(
+            cachedWindow = try CacheStore.cachedMessageWindow(
                 serverURL: server,
                 sessionID: sessionID,
                 in: modelContext
             )
-            cachedMessages = cachedWindow.messages
-            cachedMessageOffset = Self.resolvedCachedMessageOffset(
-                for: cachedWindow,
-                restoring: initialScrollPosition
-            )
+            if let initialScrollPosition,
+               !initialScrollPosition.hasTransientMessageIdentity {
+                restorationWindow =
+                    try CacheStore.cachedRestorationMessageWindow(
+                        serverURL: server,
+                        sessionID: sessionID,
+                        position: initialScrollPosition,
+                        in: modelContext
+                    )
+            } else {
+                restorationWindow = nil
+            }
         } catch {
             // A cache read failure must not block the normal network load; fall back
             // to the existing skeleton-until-network behavior.
             return []
         }
 
-        guard !cachedMessages.isEmpty else { return [] }
+        let cachedMessages = cachedWindow.messages
+        let cachedMessageOffset = Self.resolvedCachedMessageOffset(
+            for: cachedWindow,
+            restoring: initialScrollPosition
+        )
+        if !cachedMessages.isEmpty {
+            retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                messages: cachedMessages,
+                offset: cachedMessageOffset,
+                hasOlderMessages: cachedMessageOffset > 0,
+                completedToolCallGroups: [],
+                completedReasoningGroups: [],
+                hadAssistantResponseAfterLatestUser:
+                    Self.hasAssistantResponseAfterLatestUser(
+                        in: cachedMessages
+                    ),
+                compressionAnchorMetadata: compressionAnchorMetadata
+            )
+            latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                offset: cachedMessageOffset,
+                hasOlderMessages: cachedMessageOffset > 0
+            )
+        }
 
+        if let initialScrollPosition,
+           !initialScrollPosition.hasTransientMessageIdentity,
+           let restorationWindow,
+           Self.messageWindow(
+               restorationWindow.messages,
+               messageOffset: restorationWindow.messageOffset,
+               contains: initialScrollPosition
+           ) {
+            // SCROLLTRACE
+            ChatScrollTrace.log(
+                "vm.cacheFirst.restorationBlob count=\(restorationWindow.messages.count) offset=\(restorationWindow.messageOffset)"
+            )
+            messages = restorationWindow.messages
+            messagesOffset = restorationWindow.messageOffset
+            hasOlderMessages = restorationWindow.messageOffset > 0
+            isShowingHistoricalMessageWindow = true
+            isViewingCachedData = false
+            return restorationWindow.messages
+        }
+
+        if let initialScrollPosition,
+           !cachedMessages.isEmpty,
+           case .migrated(let canonicalPosition) =
+               Self.transientRestorationMigration(
+                   initialScrollPosition,
+                   messages: cachedMessages,
+                   messageOffset: cachedMessageOffset,
+                   reachesAuthoritativeSessionEnd:
+                       cachedWindow.knownMessageCount.map {
+                           cachedMessageOffset + cachedMessages.count
+                               >= max(0, $0)
+                       } ?? false
+               ),
+           let canonicalWindow = Self.restorationMessageWindow(
+               cachedMessages,
+               messageOffset: cachedMessageOffset,
+               containing: canonicalPosition,
+               maximumCount: Self.retainedRestorationMessageWindowLimit
+           ) {
+            messages = canonicalWindow.messages
+            messagesOffset = canonicalWindow.messageOffset
+            hasOlderMessages = canonicalWindow.messageOffset > 0
+            isShowingHistoricalMessageWindow = true
+            isViewingCachedData = false
+            emitTranscriptScrollPositionRebase(
+                mappings: [
+                    ChatTranscriptScrollPositionRebaseMapping(
+                        sourceRenderID: initialScrollPosition.renderID,
+                        sourceMessageID: initialScrollPosition.messageID,
+                        targetRenderID: canonicalPosition.renderID,
+                        targetMessageID: canonicalPosition.messageID
+                    )
+                ]
+            )
+            return canonicalWindow.messages
+        }
+
+        guard !cachedMessages.isEmpty else { return [] }
+        if let initialScrollPosition,
+           !Self.messageWindow(
+               cachedMessages,
+               messageOffset: cachedMessageOffset,
+               contains: initialScrollPosition
+           ) {
+            // SCROLLTRACE
+            ChatScrollTrace.log(
+                "vm.cacheFirst.anchorNotInCache saved=\(initialScrollPosition.renderID) cachedCount=\(cachedMessages.count) cachedOffset=\(cachedMessageOffset)"
+            )
+            // Keep the newest cache ready for send/jump-to-latest, but do not
+            // paint it underneath a saved position that belongs to another
+            // bounded window.
+            isShowingHistoricalMessageWindow = false
+            hasOlderMessages = false
+            isViewingCachedData = false
+            return []
+        }
+
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "vm.cacheFirst.ordinaryCache count=\(cachedMessages.count) offset=\(cachedMessageOffset) labelledHistorical=\(initialScrollPosition != nil && initialScrollPosition?.hasTransientMessageIdentity == false)"
+        )
         messages = cachedMessages
         messagesOffset = cachedMessageOffset
-        hasOlderMessages = false
+        if let initialScrollPosition,
+           !initialScrollPosition.hasTransientMessageIdentity {
+            // A cache window that already contains the saved row is the
+            // reader's active historical presentation, even when it came from
+            // the ordinary latest-message cache. Keep that exact window stable
+            // while the authoritative tail refreshes offscreen; replacing it
+            // here makes the restored viewport briefly point into unrelated
+            // content before the restoration lock corrects it.
+            isShowingHistoricalMessageWindow = true
+            hasOlderMessages = cachedMessageOffset > 0
+        } else {
+            retainedLatestTranscriptSnapshot = nil
+            isShowingHistoricalMessageWindow = false
+            hasOlderMessages = false
+        }
         isViewingCachedData = false
         return cachedMessages
     }
@@ -1464,7 +2595,8 @@ final class ChatViewModel {
     private func revertCacheFirstPlaceholder(
         _ placeholder: [ChatMessage],
         to previousMessages: [ChatMessage],
-        previousMessagesOffset: Int
+        previousMessagesOffset: Int,
+        previousAuthoritativeWindow: AuthoritativeMessageWindow?
     ) {
         // Only undo the cache-first paint if nothing mutated the transcript since the
         // prime (e.g. an optimistic send during the load window) — otherwise we'd wipe
@@ -1472,6 +2604,7 @@ final class ChatViewModel {
         guard messages == placeholder else { return }
         messages = previousMessages
         messagesOffset = previousMessagesOffset
+        latestAuthoritativeWindow = previousAuthoritativeWindow
         hasOlderMessages = previousMessagesOffset > 0
     }
 
@@ -1519,7 +2652,6 @@ final class ChatViewModel {
             latestServerLoadHadAssistantResponseAfterLatestUser = Self.hasAssistantResponseAfterLatestUser(
                 in: messages
             )
-            responseCompletionNeedsTranscriptRefresh = false
             updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
             isViewingCachedData = false
             contextWindowSnapshot = ContextWindowSnapshot(
@@ -1538,25 +2670,15 @@ final class ChatViewModel {
             currentModelProvider = session.modelProvider ?? currentModelProvider
             currentProfile = session.profile ?? currentProfile
             setCompletedToolCallGroups(ToolCallGroup.groups(
-                persistedToolCalls: session.toolCalls ?? [],
+                persistedToolCalls: Self.boundedPersistedToolCalls(
+                    session.toolCalls ?? [],
+                    messageOffset: messagesOffset,
+                    messageCount: messages.count
+                ),
                 messages: messages,
                 messageOffset: messagesOffset
             ))
             completedReasoningGroups = []
-
-            if let modelContext {
-                do {
-                    try CacheStore.cacheMessages(
-                        messages,
-                        serverURL: server,
-                        sessionID: sessionID,
-                        messageOffset: messagesOffset,
-                        in: modelContext
-                    )
-                } catch {
-                    cacheErrorMessage = error.localizedDescription
-                }
-            }
 
             return didAddMessages
         } catch {
@@ -1634,29 +2756,454 @@ final class ChatViewModel {
 
     private func applyReloadedMessages(
         _ reloadedMessages: [ChatMessage],
-        from session: SessionDetail?,
+        reloadedMessagesOffset: Int,
+        reloadedHasOlderMessages: Bool,
         previousMessages: [ChatMessage],
         previousMessagesOffset: Int
     ) {
-        let reloadedMessagesOffset = Self.resolvedMessagesOffset(
-            from: session,
-            loadedMessageCount: reloadedMessages.count
-        )
-
+        let candidateMessages: [ChatMessage]
+        let candidateOffset: Int
+        let candidateHasOlderMessages: Bool
         if let expandedMessages = Self.mergingReloadedMessages(
             reloadedMessages,
             intoCurrentMessages: previousMessages,
             currentMessagesOffset: previousMessagesOffset,
             reloadedMessagesOffset: reloadedMessagesOffset
         ) {
-            messages = expandedMessages
-            messagesOffset = previousMessagesOffset
-            hasOlderMessages = previousMessagesOffset > 0
-            return
+            candidateMessages = expandedMessages
+            candidateOffset = previousMessagesOffset
+            candidateHasOlderMessages = previousMessagesOffset > 0
+        } else {
+            candidateMessages = reloadedMessages
+            candidateOffset = reloadedMessagesOffset
+            candidateHasOlderMessages = reloadedHasOlderMessages
         }
 
-        messages = reloadedMessages
-        updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
+        let boundedWindow = Self.boundedAutomaticMessageWindow(
+            candidateMessages,
+            messageOffset: candidateOffset
+        )
+        messages = boundedWindow.messages
+        messagesOffset = boundedWindow.messageOffset
+        hasOlderMessages = messagesOffset > 0
+            || candidateHasOlderMessages
+    }
+
+    nonisolated static func boundedAutomaticMessageWindow(
+        _ messages: [ChatMessage],
+        messageOffset: Int
+    ) -> (messages: [ChatMessage], messageOffset: Int) {
+        boundedMessageWindow(
+            messages,
+            messageOffset: messageOffset,
+            maximumCount: automaticMessageWindowLimit
+        )
+    }
+
+    nonisolated static func boundedMessageWindow(
+        _ messages: [ChatMessage],
+        messageOffset: Int,
+        maximumCount: Int
+    ) -> (messages: [ChatMessage], messageOffset: Int) {
+        let resolvedMessageOffset = max(0, messageOffset)
+        guard maximumCount > 0 else {
+            return ([], resolvedMessageOffset + messages.count)
+        }
+
+        let droppedMessageCount = max(
+            0,
+            messages.count - maximumCount
+        )
+        guard droppedMessageCount > 0 else {
+            return (messages, resolvedMessageOffset)
+        }
+
+        // Keep every retained window contiguous so `messageOffset + index`
+        // remains the true server index for edits, regeneration, caching, and
+        // subsequent optimistic appends. Leading filtered tool rows inside
+        // the preferred suffix may be dropped only when a later renderable row
+        // gives us another valid contiguous suffix.
+        if let firstRenderableIndex = messages[droppedMessageCount...]
+            .firstIndex(where: Self.isRenderableTranscriptMessage) {
+            return (
+                Array(messages[firstRenderableIndex...]),
+                resolvedMessageOffset + firstRenderableIndex
+            )
+        }
+
+        // A tool-only tail cannot be compacted to an older anchor without
+        // creating a gap in absolute indexes. Retain the bounded raw suffix;
+        // completion/cache callers separately reject a suffix that no longer
+        // contains the current renderable turn.
+        return (
+            Array(messages.dropFirst(droppedMessageCount)),
+            resolvedMessageOffset + droppedMessageCount
+        )
+    }
+
+    nonisolated private static func isRenderableTranscriptMessage(
+        _ message: ChatMessage
+    ) -> Bool {
+        message.role != "tool"
+            && !TranscriptTurnClassifier.isToolResultOnlyMessage(message)
+    }
+
+    nonisolated private static func containsRenderableTranscriptMessage(
+        _ messages: [ChatMessage]
+    ) -> Bool {
+        messages.contains(where: isRenderableTranscriptMessage)
+    }
+
+    private func completionRefreshStateIsCurrent(
+        expectedTrigger: Int?
+    ) -> Bool {
+        guard let expectedTrigger else { return true }
+
+        return responseCompletionHapticTrigger == expectedTrigger
+            && activeStreamID == nil
+            && !isStartingChat
+    }
+
+    private func completionRefreshIsCurrent(
+        expectedTrigger: Int?,
+        transcriptMutationGeneration: Int
+    ) -> Bool {
+        completionRefreshStateIsCurrent(expectedTrigger: expectedTrigger)
+            && self.transcriptMutationGeneration == transcriptMutationGeneration
+    }
+
+    nonisolated static func reloadedMessagesContainCurrentCompletedTurn(
+        _ reloadedMessages: [ChatMessage],
+        reloadedMessagesOffset: Int,
+        currentMessages: [ChatMessage],
+        currentMessagesOffset: Int
+    ) -> Bool {
+        guard let currentUserIndex = currentMessages.lastIndex(where: {
+            TranscriptTurnClassifier.isUserTurnBoundary($0)
+        }) else {
+            return true
+        }
+
+        let currentUser = currentMessages[currentUserIndex]
+        let currentUserPositionIsEstablished = currentMessagesOffset > 0
+            || currentMessages[..<currentUserIndex].contains(where: {
+                TranscriptTurnClassifier.isUserTurnBoundary($0)
+            })
+        guard let reloadedUserIndex = reloadedMessages.lastIndex(where: {
+            TranscriptTurnClassifier.isUserTurnBoundary($0)
+        }),
+              completionUserMessagesMatch(
+                reloadedMessages[reloadedUserIndex],
+                loadedAbsoluteIndex: max(0, reloadedMessagesOffset)
+                    + reloadedUserIndex,
+                currentUser,
+                currentAbsoluteIndex: max(0, currentMessagesOffset)
+                    + currentUserIndex,
+                requireAbsolutePositionMatch:
+                    currentUserPositionIsEstablished
+              )
+        else {
+            return false
+        }
+
+        let currentAssistant = currentMessages[
+            currentMessages.index(after: currentUserIndex)...
+        ].last(where: { $0.role == "assistant" })
+        guard let currentAssistant else {
+            return true
+        }
+
+        let reloadedAssistant = reloadedMessages[
+            reloadedMessages.index(after: reloadedUserIndex)...
+        ].last(where: { $0.role == "assistant" })
+        guard let reloadedAssistant else {
+            return false
+        }
+        return completionAssistantMessagesMatch(
+            reloadedAssistant,
+            currentAssistant
+        )
+    }
+
+    /// Resolves durable replacements for both optimistic rows from the same
+    /// completed-turn evidence used to accept an authoritative reload. Raw
+    /// indexes intentionally come from each window independently because
+    /// persisted tool rows can shift the final assistant forward.
+    nonisolated private static func completedTurnScrollPositionRebaseMappings(
+        authoritativeMessages: [ChatMessage],
+        authoritativeMessagesOffset: Int,
+        currentMessages: [ChatMessage],
+        currentMessagesOffset: Int
+    ) -> [ChatTranscriptScrollPositionRebaseMapping] {
+        guard reloadedMessagesContainCurrentCompletedTurn(
+            authoritativeMessages,
+            reloadedMessagesOffset: authoritativeMessagesOffset,
+            currentMessages: currentMessages,
+            currentMessagesOffset: currentMessagesOffset
+        ),
+        let currentUserIndex = currentMessages.lastIndex(where: {
+            TranscriptTurnClassifier.isUserTurnBoundary($0)
+        }),
+        let authoritativeUserIndex = authoritativeMessages.lastIndex(where: {
+            TranscriptTurnClassifier.isUserTurnBoundary($0)
+        })
+        else {
+            return []
+        }
+
+        let resolvedCurrentOffset = max(0, currentMessagesOffset)
+        let resolvedAuthoritativeOffset = max(
+            0,
+            authoritativeMessagesOffset
+        )
+        var mappings: [ChatTranscriptScrollPositionRebaseMapping] = []
+
+        if let sourceUserMessageID = currentMessages[currentUserIndex]
+            .messageId?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           sourceUserMessageID.hasPrefix("local-") {
+            let targetUserMessageID = ChatTranscriptMessageIdentity.resolve(
+                for: authoritativeMessages[authoritativeUserIndex]
+            )
+            if !targetUserMessageID.hasPrefix("local-") {
+                let mapping = ChatTranscriptScrollPositionRebaseMapping(
+                    sourceRenderID:
+                        "transcript:\(resolvedCurrentOffset + currentUserIndex)",
+                    sourceMessageID: sourceUserMessageID,
+                    targetRenderID:
+                        "transcript:\(resolvedAuthoritativeOffset + authoritativeUserIndex)",
+                    targetMessageID: targetUserMessageID
+                )
+                if mapping.sourceRenderID != mapping.targetRenderID
+                    || mapping.sourceMessageID != mapping.targetMessageID {
+                    mappings.append(mapping)
+                }
+            }
+        }
+
+        if let currentAssistantIndex = currentMessages.indices.last(where: {
+            $0 > currentUserIndex
+                && currentMessages[$0].role == "assistant"
+        }),
+        let sourceAssistantMessageID = currentMessages[currentAssistantIndex]
+            .messageId?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+        sourceAssistantMessageID.hasPrefix("stream-"),
+        let authoritativeAssistantIndex =
+            authoritativeMessages.indices.last(where: {
+                $0 > authoritativeUserIndex
+                    && authoritativeMessages[$0].role == "assistant"
+            }) {
+            let authoritativeAssistant =
+                authoritativeMessages[authoritativeAssistantIndex]
+            if completionAssistantMessagesMatch(
+                authoritativeAssistant,
+                currentMessages[currentAssistantIndex]
+            ) {
+                let targetAssistantMessageID =
+                    ChatTranscriptMessageIdentity.resolve(
+                        for: authoritativeAssistant
+                    )
+                if !targetAssistantMessageID.hasPrefix("stream-") {
+                    let mapping =
+                        ChatTranscriptScrollPositionRebaseMapping(
+                            sourceRenderID:
+                                "transcript:\(resolvedCurrentOffset + currentAssistantIndex)",
+                            sourceMessageID: sourceAssistantMessageID,
+                            targetRenderID:
+                                "transcript:\(resolvedAuthoritativeOffset + authoritativeAssistantIndex)",
+                            targetMessageID: targetAssistantMessageID
+                        )
+                    if mapping.sourceRenderID != mapping.targetRenderID
+                        || mapping.sourceMessageID
+                            != mapping.targetMessageID {
+                        mappings.append(mapping)
+                    }
+                }
+            }
+        }
+
+        return mappings
+    }
+
+    nonisolated private static func completionUserMessagesMatch(
+        _ loaded: ChatMessage,
+        loadedAbsoluteIndex: Int,
+        _ current: ChatMessage,
+        currentAbsoluteIndex: Int,
+        requireAbsolutePositionMatch: Bool
+    ) -> Bool {
+        guard loaded.role == current.role else { return false }
+
+        let loadedID = loaded.messageId?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let currentID = current.messageId?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let loadedID, !loadedID.isEmpty, loadedID == currentID {
+            return true
+        }
+        if let loadedID, !loadedID.isEmpty,
+           let currentID, !currentID.isEmpty,
+           !currentID.hasPrefix("local-") {
+            return false
+        }
+
+        // A persisted user row replaces the optimistic local row at the same
+        // raw transcript position. Position is the monotonic evidence that a
+        // repeated short prompt ("yes", "merge", etc.) belongs to this turn.
+        //
+        // Do not use timestamp proximity here. Upstream may omit timestamps,
+        // and deferred persistence stamps an otherwise timestamp-less user row
+        // when a long response finishes, so a valid row can be minutes newer
+        // than its optimistic counterpart. A view model with no prior user turn
+        // and offset zero has no established absolute position yet; in that
+        // first-window case the user and assistant payload checks remain the
+        // available completion evidence.
+        guard !requireAbsolutePositionMatch
+                || loadedAbsoluteIndex == currentAbsoluteIndex
+        else {
+            return false
+        }
+
+        guard normalizedUserMessageContent(loaded.content)
+            == normalizedUserMessageContent(current.content)
+        else {
+            return false
+        }
+
+        let currentAttachments = attachmentKeys(for: current)
+        if !currentAttachments.isEmpty,
+           !attachmentKeys(for: loaded).isSuperset(of: currentAttachments) {
+            return false
+        }
+
+        return true
+    }
+
+    nonisolated private static func completionAssistantMessagesMatch(
+        _ loaded: ChatMessage,
+        _ current: ChatMessage
+    ) -> Bool {
+        guard loaded.role == current.role else { return false }
+
+        let loadedID = loaded.messageId?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let currentID = current.messageId?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if let loadedID, !loadedID.isEmpty, loadedID == currentID {
+            return true
+        }
+        if let loadedID, !loadedID.isEmpty,
+           let currentID, !currentID.isEmpty,
+           !currentID.hasPrefix("stream-") {
+            return false
+        }
+
+        let loadedContent = loaded.content?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentContent = current.content?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if currentID?.hasPrefix("stream-") == true,
+           !assistantHasMeaningfulCompletionPayload(
+                current,
+                trimmedContent: currentContent
+           ) {
+            // Tool/reasoning events create an empty ephemeral assistant row
+            // before their payload is persisted into the completed transcript.
+            // Treat only that truly payload-less stream row as a placeholder;
+            // empty rows carrying different tool metadata must still reject.
+            return assistantHasMeaningfulCompletionPayload(
+                loaded,
+                trimmedContent: loadedContent
+            )
+        }
+        if let loadedContent, !loadedContent.isEmpty,
+           let currentContent, !currentContent.isEmpty {
+            // The live row can still contain only the streamed prefix when
+            // `done.session` arrives with the persisted full answer.
+            return loadedContent == currentContent
+                || loadedContent.hasPrefix(currentContent)
+                || currentContent.hasPrefix(loadedContent)
+        }
+
+        var matchedNonTextPayload = false
+        if let currentToolCalls = current.toolCalls, !currentToolCalls.isEmpty {
+            guard loaded.toolCalls == currentToolCalls else { return false }
+            matchedNonTextPayload = true
+        }
+        if let currentContentParts = current.contentParts,
+           !currentContentParts.isEmpty {
+            guard loaded.contentParts == currentContentParts else {
+                return false
+            }
+            matchedNonTextPayload = true
+        }
+        if let currentReasoning = current.reasoning?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !currentReasoning.isEmpty {
+            guard let loadedReasoning = loaded.reasoning?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  loadedReasoning == currentReasoning
+                    || loadedReasoning.hasPrefix(currentReasoning)
+                    || currentReasoning.hasPrefix(loadedReasoning)
+            else {
+                return false
+            }
+            matchedNonTextPayload = true
+        }
+        let currentAttachments = attachmentKeys(for: current)
+        if !currentAttachments.isEmpty {
+            guard attachmentKeys(for: loaded)
+                .isSuperset(of: currentAttachments)
+            else {
+                return false
+            }
+            matchedNonTextPayload = true
+        }
+
+        return matchedNonTextPayload
+    }
+
+    nonisolated private static func assistantHasMeaningfulCompletionPayload(
+        _ message: ChatMessage,
+        trimmedContent: String?
+    ) -> Bool {
+        if let trimmedContent, !trimmedContent.isEmpty {
+            return true
+        }
+        if message.toolCalls?.isEmpty == false
+            || message.contentParts?.isEmpty == false {
+            return true
+        }
+        if let reasoning = message.reasoning?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !reasoning.isEmpty {
+            return true
+        }
+        return !attachmentKeys(for: message).isEmpty
+    }
+
+    nonisolated static func boundedPersistedToolCalls(
+        _ persistedToolCalls: [PersistedToolCall],
+        messageOffset: Int,
+        messageCount: Int
+    ) -> [PersistedToolCall] {
+        guard messageCount > 0, !persistedToolCalls.isEmpty else {
+            return []
+        }
+
+        let retainedStart = max(0, messageOffset)
+        let retainedRange = retainedStart..<(retainedStart + messageCount)
+        return persistedToolCalls
+            .suffix(automaticPersistedToolCallWindowLimit)
+            .filter { persistedToolCall in
+                persistedToolCall.assistantMsgIdx.map(retainedRange.contains)
+                    ?? false
+            }
     }
 
     nonisolated private static func mergingReloadedMessages(
@@ -1685,6 +3232,34 @@ final class ChatViewModel {
         hasOlderMessages = resolvedOffset > 0 || session?.messagesTruncated == true
     }
 
+    private func replaceTranscriptWithAutomaticWindow(
+        from session: SessionDetail
+    ) {
+        cancelInitialRestorationRequest()
+        retainedLatestTranscriptSnapshot = nil
+        isShowingHistoricalMessageWindow = false
+        let loadedMessages = session.messages ?? []
+        let loadedOffset = Self.resolvedMessagesOffset(
+            from: session,
+            loadedMessageCount: loadedMessages.count
+        )
+        let boundedWindow = Self.boundedMessageWindow(
+            loadedMessages,
+            messageOffset: loadedOffset,
+            maximumCount: Self.automaticMessageWindowLimit
+        )
+        let resolvedHasOlderMessages = boundedWindow.messageOffset > 0
+            || session.messagesTruncated == true
+
+        messages = boundedWindow.messages
+        messagesOffset = boundedWindow.messageOffset
+        hasOlderMessages = resolvedHasOlderMessages
+        latestAuthoritativeWindow = AuthoritativeMessageWindow(
+            offset: boundedWindow.messageOffset,
+            hasOlderMessages: resolvedHasOlderMessages
+        )
+    }
+
     nonisolated private static func resolvedMessagesOffset(
         from session: SessionDetail?,
         loadedMessageCount: Int
@@ -1693,13 +3268,35 @@ final class ChatViewModel {
             return max(0, messagesOffset)
         }
 
-        guard session?.messagesTruncated == true,
-              let messageCount = session?.messageCount
-        else {
+        guard let messageCount = session?.messageCount,
+              session?.messagesTruncated == true
+                || messageCount > loadedMessageCount else {
             return 0
         }
 
         return max(0, messageCount - loadedMessageCount)
+    }
+
+    nonisolated private static func resolvedRestorationMessagesOffset(
+        from session: SessionDetail,
+        loadedMessageCount: Int,
+        messageBefore: Int
+    ) -> Int? {
+        if let messagesOffset = session.messagesOffset {
+            return max(0, messagesOffset)
+        }
+
+        // A targeted `msg_before` response is not a tail page. When an older
+        // server omits `_messages_offset`, derive the exclusive slice end from
+        // the request and authoritative total instead of applying the generic
+        // tail fallback.
+        guard let messageCount = session.messageCount else { return nil }
+        let exclusiveEnd = min(
+            max(0, messageBefore),
+            max(0, messageCount)
+        )
+        guard loadedMessageCount <= exclusiveEnd else { return nil }
+        return exclusiveEnd - loadedMessageCount
     }
 
     nonisolated private static func mergingLoadedMessages(
@@ -2157,6 +3754,14 @@ final class ChatViewModel {
         attachmentsToRestoreOnFailure: [PendingAttachment],
         modelContext: ModelContext?
     ) async -> Bool {
+        guard !isShowingHistoricalMessageWindow
+            || retainedLatestTranscriptSnapshot != nil else {
+            sendErrorMessage = String(
+                localized: "Wait for the latest messages to finish loading."
+            )
+            return false
+        }
+
         isStartingChat = true
         sendErrorMessage = nil
         lastError = nil
@@ -2167,8 +3772,9 @@ final class ChatViewModel {
         reasoningAnchorMessageID = nil
         toolCallAnchorMessageID = nil
         streamCoordinator.prepareForNewResponse()
-        responseCompletionNeedsTranscriptRefresh = false
         defer { isStartingChat = false }
+
+        collapseToLatestAuthoritativeWindowIfNeeded()
 
         let optimisticMessage = ChatMessage(
             role: "user",
@@ -2340,14 +3946,18 @@ final class ChatViewModel {
     }
 
     private func cacheCurrentMessages(sessionID: String, modelContext: ModelContext?) {
-        guard let modelContext else { return }
+        guard let modelContext,
+              let cacheWindow = currentAuthoritativeCacheWindow()
+        else {
+            return
+        }
 
         do {
             try CacheStore.cacheMessages(
-                messages,
+                cacheWindow.messages,
                 serverURL: server,
                 sessionID: sessionID,
-                messageOffset: messagesOffset,
+                messageOffset: cacheWindow.offset,
                 in: modelContext
             )
         } catch {
@@ -2355,12 +3965,109 @@ final class ChatViewModel {
         }
     }
 
+    private func collapseToLatestAuthoritativeWindowIfNeeded() {
+        activateLatestMessageWindowIfNeeded()
+        guard messages.count > Self.automaticMessageWindowLimit else { return }
+
+        if let window = latestAuthoritativeWindow {
+            let dropCount = window.offset - messagesOffset
+            if dropCount > 0, dropCount < messages.count {
+                resetPendingStreamingContentBuffers()
+                messages = Array(messages.dropFirst(dropCount))
+                messagesOffset = window.offset
+                hasOlderMessages = window.hasOlderMessages
+                return
+            }
+
+            if dropCount < 0 || dropCount >= messages.count {
+                latestAuthoritativeWindow = nil
+            }
+        }
+
+        let boundedWindow = Self.boundedAutomaticMessageWindow(
+            messages,
+            messageOffset: messagesOffset
+        )
+        messages = boundedWindow.messages
+        messagesOffset = boundedWindow.messageOffset
+        hasOlderMessages = messagesOffset > 0
+    }
+
+    private func currentAuthoritativeCacheWindow() -> (
+        messages: [ChatMessage],
+        offset: Int
+    )? {
+        if let retainedLatestTranscriptSnapshot {
+            let boundedWindow = Self.boundedMessageWindow(
+                retainedLatestTranscriptSnapshot.messages,
+                messageOffset: retainedLatestTranscriptSnapshot.offset,
+                maximumCount: CachePolicy.maxMessagesPerSession
+            )
+            guard boundedWindow.messages.isEmpty
+                || Self.containsRenderableTranscriptMessage(
+                    boundedWindow.messages
+                )
+            else {
+                return nil
+            }
+            return (
+                boundedWindow.messages,
+                boundedWindow.messageOffset
+            )
+        }
+
+        if let window = latestAuthoritativeWindow {
+            let startIndex = window.offset - messagesOffset
+            if startIndex >= 0, startIndex < messages.count {
+                let boundedWindow = Self.boundedMessageWindow(
+                    Array(messages.dropFirst(startIndex)),
+                    messageOffset: window.offset,
+                    maximumCount: CachePolicy.maxMessagesPerSession
+                )
+                guard boundedWindow.messages.isEmpty
+                    || Self.containsRenderableTranscriptMessage(
+                        boundedWindow.messages
+                    )
+                else {
+                    return nil
+                }
+                return (
+                    boundedWindow.messages,
+                    boundedWindow.messageOffset
+                )
+            }
+
+            latestAuthoritativeWindow = nil
+        }
+
+        let boundedWindow = Self.boundedMessageWindow(
+            messages,
+            messageOffset: messagesOffset,
+            maximumCount: CachePolicy.maxMessagesPerSession
+        )
+        guard boundedWindow.messages.isEmpty
+            || Self.containsRenderableTranscriptMessage(
+                boundedWindow.messages
+            )
+        else {
+            return nil
+        }
+        return (
+            boundedWindow.messages,
+            boundedWindow.messageOffset
+        )
+    }
+
     func clearTranscript() {
+        cancelInitialRestorationRequest()
         cancelPendingStreamingScrollTrigger()
         resetPendingStreamingContentBuffers()
         clearCompressionAnchorMetadata()
         messages = []
         messagesOffset = 0
+        latestAuthoritativeWindow = nil
+        retainedLatestTranscriptSnapshot = nil
+        isShowingHistoricalMessageWindow = false
         hasOlderMessages = false
         setCompletedToolCallGroups([])
         completedReasoningGroups = []
@@ -3014,8 +4721,7 @@ final class ChatViewModel {
             }
 
             applyCompressionAnchorMetadata(from: session)
-            messages = session.messages ?? []
-            updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
+            replaceTranscriptWithAutomaticWindow(from: session)
             isViewingCachedData = false
             let snapshot = ContextWindowSnapshot(
                 contextLength: session.contextLength,
@@ -3034,7 +4740,11 @@ final class ChatViewModel {
             currentModelProvider = session.modelProvider ?? currentModelProvider
             currentProfile = session.profile ?? currentProfile
             setCompletedToolCallGroups(ToolCallGroup.groups(
-                persistedToolCalls: session.toolCalls ?? [],
+                persistedToolCalls: Self.boundedPersistedToolCalls(
+                    session.toolCalls ?? [],
+                    messageOffset: messagesOffset,
+                    messageCount: messages.count
+                ),
                 messages: messages,
                 messageOffset: messagesOffset
             ))
@@ -3045,7 +4755,6 @@ final class ChatViewModel {
             toolCallAnchorMessageID = nil
             reasoningAnchorMessageID = nil
             streamCoordinator.prepareForNewResponse()
-            responseCompletionNeedsTranscriptRefresh = false
             attachmentCoordinator.removeAllLocalPreviews()
 
             let headline = response.summary?.headline?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3134,7 +4843,6 @@ final class ChatViewModel {
         reasoningAnchorMessageID = nil
         toolCallAnchorMessageID = nil
         streamCoordinator.prepareForNewResponse()
-        responseCompletionNeedsTranscriptRefresh = false
         defer { isStartingChat = false }
 
         do {
@@ -3157,10 +4865,13 @@ final class ChatViewModel {
                 messageLimit: Self.messagePageLimit
             )
             if let session = sessionResponse.session {
-                messages = session.messages ?? []
-                updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
+                replaceTranscriptWithAutomaticWindow(from: session)
                 setCompletedToolCallGroups(ToolCallGroup.groups(
-                    persistedToolCalls: session.toolCalls ?? [],
+                    persistedToolCalls: Self.boundedPersistedToolCalls(
+                        session.toolCalls ?? [],
+                        messageOffset: messagesOffset,
+                        messageCount: messages.count
+                    ),
                     messages: messages,
                     messageOffset: messagesOffset
                 ))
@@ -3275,21 +4986,88 @@ final class ChatViewModel {
     private func appendLocalMessage(_ text: String, role: String, idPrefix: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        guard !isShowingHistoricalMessageWindow
+            || retainedLatestTranscriptSnapshot != nil else {
+            return nil
+        }
 
         let messageID = "\(idPrefix)-\(UUID().uuidString)"
-        messages.append(
-            ChatMessage(
-                role: role,
-                content: trimmed,
-                timestamp: Date().timeIntervalSince1970,
-                messageId: messageID
-            )
+        let localMessage = ChatMessage(
+            role: role,
+            content: trimmed,
+            timestamp: Date().timeIntervalSince1970,
+            messageId: messageID
         )
+
+        // Local slash/background rows are newest content and belong to the
+        // latest window. While the reader is on a restored historical window,
+        // route them into the retained latest snapshot instead of activating
+        // it: activation replaces the displayed window underneath the reader,
+        // which is exactly the mid-read viewport jump this feature must never
+        // cause. The rows become visible with the next explicit send or
+        // jump-to-latest.
+        if isShowingHistoricalMessageWindow,
+           let snapshot = retainedLatestTranscriptSnapshot {
+            // SCROLLTRACE
+            ChatScrollTrace.log(
+                "vm.appendLocal.retained id=\(messageID) role=\(role)"
+            )
+            let retainedMessages = snapshot.messages + [localMessage]
+            retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                messages: retainedMessages,
+                offset: snapshot.offset,
+                hasOlderMessages: snapshot.hasOlderMessages,
+                completedToolCallGroups: snapshot.completedToolCallGroups,
+                completedReasoningGroups: snapshot.completedReasoningGroups,
+                hadAssistantResponseAfterLatestUser:
+                    Self.hasAssistantResponseAfterLatestUser(
+                        in: retainedMessages
+                    ),
+                compressionAnchorMetadata: snapshot.compressionAnchorMetadata
+            )
+            return messageID
+        }
+
+        activateLatestMessageWindowIfNeeded()
+        messages.append(localMessage)
         scheduleStreamingScrollTrigger()
         return messageID
     }
 
     private func updateLocalMessage(id: String, content: String) {
+        if isShowingHistoricalMessageWindow,
+           let snapshot = retainedLatestTranscriptSnapshot,
+           let retainedIndex = snapshot.messages.firstIndex(where: {
+               $0.messageId == id
+           }) {
+            let existing = snapshot.messages[retainedIndex]
+            var retainedMessages = snapshot.messages
+            retainedMessages[retainedIndex] = ChatMessage(
+                role: existing.role,
+                content: content,
+                timestamp: existing.timestamp,
+                messageId: existing.messageId,
+                name: existing.name,
+                toolCallId: existing.toolCallId,
+                toolUseId: existing.toolUseId,
+                toolCalls: existing.toolCalls,
+                contentParts: existing.contentParts,
+                reasoning: existing.reasoning,
+                attachments: existing.attachments
+            )
+            retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                messages: retainedMessages,
+                offset: snapshot.offset,
+                hasOlderMessages: snapshot.hasOlderMessages,
+                completedToolCallGroups: snapshot.completedToolCallGroups,
+                completedReasoningGroups: snapshot.completedReasoningGroups,
+                hadAssistantResponseAfterLatestUser:
+                    snapshot.hadAssistantResponseAfterLatestUser,
+                compressionAnchorMetadata: snapshot.compressionAnchorMetadata
+            )
+            return
+        }
+
         guard let index = messages.firstIndex(where: { $0.messageId == id }) else { return }
         let existing = messages[index]
         messages[index] = ChatMessage(
@@ -3413,10 +5191,13 @@ final class ChatViewModel {
 
             // Update local state from the truncated response
             if let session = truncateResponse.session {
-                messages = session.messages ?? []
-                updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
+                replaceTranscriptWithAutomaticWindow(from: session)
                 setCompletedToolCallGroups(ToolCallGroup.groups(
-                    persistedToolCalls: session.toolCalls ?? [],
+                    persistedToolCalls: Self.boundedPersistedToolCalls(
+                        session.toolCalls ?? [],
+                        messageOffset: messagesOffset,
+                        messageCount: messages.count
+                    ),
                     messages: messages,
                     messageOffset: messagesOffset
                 ))
@@ -3426,19 +5207,10 @@ final class ChatViewModel {
                 toolCallAnchorMessageID = nil
                 reasoningAnchorMessageID = nil
 
-                if let modelContext {
-                    do {
-                        try CacheStore.cacheMessages(
-                            messages,
-                            serverURL: server,
-                            sessionID: sessionID,
-                            messageOffset: messagesOffset,
-                            in: modelContext
-                        )
-                    } catch {
-                        cacheErrorMessage = error.localizedDescription
-                    }
-                }
+                cacheCurrentMessages(
+                    sessionID: sessionID,
+                    modelContext: modelContext
+                )
             }
 
             // Now send the edited text through the normal chat flow
@@ -3468,9 +5240,12 @@ final class ChatViewModel {
                     messageId: "local-\(UUID().uuidString)"
                 )
             )
+            cacheCurrentMessages(
+                sessionID: sessionID,
+                modelContext: modelContext
+            )
 
             streamCoordinator.prepareForNewResponse()
-            responseCompletionNeedsTranscriptRefresh = false
             streamCoordinator.start(streamID: streamID)
             return true
         } catch {
@@ -3522,10 +5297,13 @@ final class ChatViewModel {
             )
 
             if let session = truncateResponse.session {
-                messages = session.messages ?? []
-                updateOlderMessagePagination(from: session, loadedMessageCount: messages.count)
+                replaceTranscriptWithAutomaticWindow(from: session)
                 setCompletedToolCallGroups(ToolCallGroup.groups(
-                    persistedToolCalls: session.toolCalls ?? [],
+                    persistedToolCalls: Self.boundedPersistedToolCalls(
+                        session.toolCalls ?? [],
+                        messageOffset: messagesOffset,
+                        messageCount: messages.count
+                    ),
                     messages: messages,
                     messageOffset: messagesOffset
                 ))
@@ -3535,19 +5313,10 @@ final class ChatViewModel {
                 toolCallAnchorMessageID = nil
                 reasoningAnchorMessageID = nil
 
-                if let modelContext {
-                    do {
-                        try CacheStore.cacheMessages(
-                            messages,
-                            serverURL: server,
-                            sessionID: sessionID,
-                            messageOffset: messagesOffset,
-                            in: modelContext
-                        )
-                    } catch {
-                        cacheErrorMessage = error.localizedDescription
-                    }
-                }
+                cacheCurrentMessages(
+                    sessionID: sessionID,
+                    modelContext: modelContext
+                )
             }
 
             let explicitModelPick = explicitModelPickForChatStart()
@@ -3568,7 +5337,6 @@ final class ChatViewModel {
 
             completeExplicitModelPickForChatStart(explicitModelPick)
             streamCoordinator.prepareForNewResponse()
-            responseCompletionNeedsTranscriptRefresh = false
             streamCoordinator.start(streamID: streamID)
             return true
         } catch {
@@ -3783,13 +5551,40 @@ final class ChatViewModel {
               !hasCompletedCurrentResponse
         else { return }
 
+        let boundedWindow = Self.boundedAutomaticMessageWindow(
+            messages,
+            messageOffset: messagesOffset
+        )
+        let didBoundTranscript = boundedWindow.messages.count
+            != messages.count
+            || boundedWindow.messageOffset != messagesOffset
+        let retainedAnchorIDs = Set(
+            boundedWindow.messages.enumerated().map { index, message in
+                TranscriptTurnClassifier.anchorID(
+                    for: message,
+                    at: index,
+                    messageOffset: boundedWindow.messageOffset
+                )
+            }
+        )
+
         ActiveChatStreamSnapshotStore.shared.save(
             ActiveChatStreamSnapshot(
-                messages: messages,
-                messagesOffset: messagesOffset,
+                messages: boundedWindow.messages,
+                messagesOffset: boundedWindow.messageOffset,
                 displayTitle: displayTitle,
-                completedToolCallGroups: completedToolCallGroups,
-                completedReasoningGroups: completedReasoningGroups,
+                completedToolCallGroups: didBoundTranscript
+                    ? completedToolCallGroups.filter {
+                        $0.anchorMessageID.map(retainedAnchorIDs.contains)
+                            ?? false
+                    }
+                    : completedToolCallGroups,
+                completedReasoningGroups: didBoundTranscript
+                    ? completedReasoningGroups.filter {
+                        $0.anchorMessageID.map(retainedAnchorIDs.contains)
+                            ?? false
+                    }
+                    : completedReasoningGroups,
                 liveToolCalls: liveToolCalls,
                 liveReasoningText: liveReasoningText,
                 activeStreamLastEventID: streamCoordinator.lastEventID,
@@ -3808,6 +5603,14 @@ final class ChatViewModel {
 
     @discardableResult
     private func restoreActiveStreamSnapshotIfAvailable(streamID: String) -> String? {
+        // Stream snapshots merge into the latest window. While a restored
+        // historical window is displayed there is nothing safe to merge into;
+        // connecting fresh keeps the reader's viewport untouched.
+        guard !isShowingHistoricalMessageWindow else {
+            // SCROLLTRACE
+            ChatScrollTrace.log("vm.restoreActiveStreamSnapshot.skippedHistorical")
+            return nil
+        }
         guard let sessionID,
               let snapshot = ActiveChatStreamSnapshotStore.shared.snapshot(
                 server: server,
@@ -3817,17 +5620,36 @@ final class ChatViewModel {
         else { return nil }
 
         let merge = Self.mergingLoadedMessages(messages, withActiveStreamSnapshot: snapshot)
-        messages = merge.messages
-        if merge.usedSnapshotMessagesOffset {
-            messagesOffset = snapshot.messagesOffset
-            hasOlderMessages = snapshot.messagesOffset > 0
-        }
+        let mergedHasOlderMessages = hasOlderMessages
+            || snapshot.messagesOffset > 0
+        let mergedOffset = merge.usedSnapshotMessagesOffset
+            ? snapshot.messagesOffset
+            : messagesOffset
+        let boundedMerge = Self.boundedAutomaticMessageWindow(
+            merge.messages,
+            messageOffset: mergedOffset
+        )
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "vm.restoreActiveStreamSnapshot count=\(boundedMerge.messages.count) offset=\(boundedMerge.messageOffset) wasHistorical=\(isShowingHistoricalMessageWindow)"
+        )
+        messages = boundedMerge.messages
+        messagesOffset = boundedMerge.messageOffset
+        hasOlderMessages = boundedMerge.messageOffset > 0
+            || mergedHasOlderMessages
         displayTitle = displayTitle.isEmpty ? snapshot.displayTitle : displayTitle
         setCompletedToolCallGroups(snapshot.completedToolCallGroups)
         completedReasoningGroups = snapshot.completedReasoningGroups
         liveToolCalls = snapshot.liveToolCalls
         liveReasoningText = snapshot.liveReasoningText
-        streamingAssistantMessageID = merge.streamingAssistantMessageID ?? snapshot.streamingAssistantMessageID
+        let restoredStreamingAssistantMessageID =
+            merge.streamingAssistantMessageID
+                ?? snapshot.streamingAssistantMessageID
+        streamingAssistantMessageID = messages.contains(where: {
+            $0.messageId == restoredStreamingAssistantMessageID
+        })
+            ? restoredStreamingAssistantMessageID
+            : Self.latestAssistantMessageID(in: messages)
         toolCallAnchorMessageID = Self.remappedAnchorMessageID(
             snapshot.toolCallAnchorMessageID,
             from: snapshot.streamingAssistantMessageID,
@@ -4050,31 +5872,148 @@ final class ChatViewModel {
         return appendAssistantToken(text)
     }
 
-    private func applyCompletedStreamSession(_ completedSession: SessionDetail) {
+    @discardableResult
+    private func applyCompletedStreamSession(_ completedSession: SessionDetail) -> Bool {
         if let completedSessionID = completedSession.sessionId,
            let sessionID,
            completedSessionID != sessionID {
-            return
+            return false
         }
 
-        applyCompressionAnchorMetadata(from: completedSession)
+        // While a restored historical window is displayed, fresh compression
+        // metadata belongs to the retained latest snapshot. Applying it here
+        // would insert or move a compression card inside the window the reader
+        // is currently viewing.
+        if !isShowingHistoricalMessageWindow {
+            applyCompressionAnchorMetadata(from: completedSession)
+        }
 
         var didApplyCompletedTranscript = false
+        var routedCompletedTranscriptIntoRetainedSnapshot = false
         if let completedMessages = completedSession.messages,
-           !completedMessages.isEmpty {
+           !completedMessages.isEmpty,
+           Self.reloadedMessagesContainCurrentCompletedTurn(
+                completedMessages,
+                reloadedMessagesOffset: Self.resolvedMessagesOffset(
+                    from: completedSession,
+                    loadedMessageCount: completedMessages.count
+                ),
+                currentMessages: messages,
+                currentMessagesOffset: messagesOffset
+           ),
+           let resolution = CompletedTranscriptWindowPolicy.resolve(
+                messagesCount: completedMessages.count,
+                messageCount: completedSession.messageCount,
+                messagesOffset: completedSession.messagesOffset,
+                messagesTruncated: completedSession.messagesTruncated,
+                maximumUnboundedMessages: Self.messagePageLimit
+           ),
+           Self.reloadedMessagesContainCurrentCompletedTurn(
+                Array(completedMessages.dropFirst(resolution.startIndex)),
+                reloadedMessagesOffset: resolution.messageOffset,
+                currentMessages: messages,
+                currentMessagesOffset: messagesOffset
+           ) {
             let previousMessages = messages
             let previousMessagesOffset = messagesOffset
-            let reloadedMessages = Self.mergingLoadedMessages(
-                completedMessages,
-                withCachedLocalOptimisticMessages: messages
+            let selectedMessages = Array(
+                completedMessages.dropFirst(resolution.startIndex)
             )
-            applyReloadedMessages(
-                reloadedMessages,
-                from: completedSession,
-                previousMessages: previousMessages,
-                previousMessagesOffset: previousMessagesOffset
+            let selectedMessagesWithLocalOptimisticRows =
+                Self.mergingLoadedMessages(
+                    selectedMessages,
+                    withCachedLocalOptimisticMessages: messages
+                )
+            let boundedCompletedWindow = Self.boundedMessageWindow(
+                selectedMessagesWithLocalOptimisticRows,
+                messageOffset: resolution.messageOffset,
+                maximumCount: Self.automaticMessageWindowLimit
             )
-            didApplyCompletedTranscript = true
+            if Self.containsRenderableTranscriptMessage(
+                boundedCompletedWindow.messages
+            ),
+               Self.reloadedMessagesContainCurrentCompletedTurn(
+                    boundedCompletedWindow.messages,
+                    reloadedMessagesOffset: boundedCompletedWindow.messageOffset,
+                    currentMessages: messages,
+                    currentMessagesOffset: messagesOffset
+               ) {
+                let authoritativeHasOlderMessages =
+                    resolution.hasOlderMessages
+                        || boundedCompletedWindow.messageOffset > 0
+                if isShowingHistoricalMessageWindow {
+                    // A background stream completed while the reader is on a
+                    // restored historical window. Retain the completed latest
+                    // window offscreen; replacing the displayed window here
+                    // yanked the viewport to unrelated content mid-read.
+                    // SCROLLTRACE
+                    ChatScrollTrace.log(
+                        "vm.completedStream.retained newCount=\(boundedCompletedWindow.messages.count) newOffset=\(boundedCompletedWindow.messageOffset)"
+                    )
+                    retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
+                        messages: boundedCompletedWindow.messages,
+                        offset: boundedCompletedWindow.messageOffset,
+                        hasOlderMessages: authoritativeHasOlderMessages,
+                        completedToolCallGroups: ToolCallGroup.groups(
+                            persistedToolCalls: Self.boundedPersistedToolCalls(
+                                completedSession.toolCalls ?? [],
+                                messageOffset:
+                                    boundedCompletedWindow.messageOffset,
+                                messageCount:
+                                    boundedCompletedWindow.messages.count
+                            ),
+                            messages: boundedCompletedWindow.messages,
+                            messageOffset: boundedCompletedWindow.messageOffset
+                        ),
+                        completedReasoningGroups: [],
+                        hadAssistantResponseAfterLatestUser:
+                            Self.hasAssistantResponseAfterLatestUser(
+                                in: boundedCompletedWindow.messages
+                            ),
+                        compressionAnchorMetadata:
+                            CompressionAnchorMetadata(from: completedSession)
+                    )
+                    latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                        offset: boundedCompletedWindow.messageOffset,
+                        hasOlderMessages: authoritativeHasOlderMessages
+                    )
+                    routedCompletedTranscriptIntoRetainedSnapshot = true
+                    didApplyCompletedTranscript = true
+                } else {
+                    let completionScrollPositionRebaseMappings =
+                        Self.completedTurnScrollPositionRebaseMappings(
+                            authoritativeMessages:
+                                boundedCompletedWindow.messages,
+                            authoritativeMessagesOffset:
+                                boundedCompletedWindow.messageOffset,
+                            currentMessages: messages,
+                            currentMessagesOffset: messagesOffset
+                        )
+                    // SCROLLTRACE
+                    ChatScrollTrace.log(
+                        "vm.completedStream.REPLACE newCount=\(boundedCompletedWindow.messages.count) newOffset=\(boundedCompletedWindow.messageOffset)"
+                    )
+                    cancelInitialRestorationRequest()
+                    retainedLatestTranscriptSnapshot = nil
+                    isShowingHistoricalMessageWindow = false
+                    applyReloadedMessages(
+                        boundedCompletedWindow.messages,
+                        reloadedMessagesOffset:
+                            boundedCompletedWindow.messageOffset,
+                        reloadedHasOlderMessages: authoritativeHasOlderMessages,
+                        previousMessages: previousMessages,
+                        previousMessagesOffset: previousMessagesOffset
+                    )
+                    emitTranscriptScrollPositionRebaseIfTargetsAreDisplayed(
+                        completionScrollPositionRebaseMappings
+                    )
+                    latestAuthoritativeWindow = AuthoritativeMessageWindow(
+                        offset: boundedCompletedWindow.messageOffset,
+                        hasOlderMessages: authoritativeHasOlderMessages
+                    )
+                    didApplyCompletedTranscript = true
+                }
+            }
         }
 
         if let title = completedSession.title {
@@ -4094,9 +6033,18 @@ final class ChatViewModel {
             outputTokens: completedSession.outputTokens,
             estimatedCost: completedSession.estimatedCost
         )
-        if didApplyCompletedTranscript || completedSession.toolCalls != nil {
+        let canApplyStandaloneToolCalls =
+            completedSession.messages?.isEmpty != false
+                && completedSession.toolCalls != nil
+                && !isShowingHistoricalMessageWindow
+        if !routedCompletedTranscriptIntoRetainedSnapshot,
+           didApplyCompletedTranscript || canApplyStandaloneToolCalls {
             let rebuiltToolCallGroups = ToolCallGroup.groups(
-                persistedToolCalls: completedSession.toolCalls ?? [],
+                persistedToolCalls: Self.boundedPersistedToolCalls(
+                    completedSession.toolCalls ?? [],
+                    messageOffset: messagesOffset,
+                    messageCount: messages.count
+                ),
                 messages: messages,
                 messageOffset: messagesOffset
             )
@@ -4122,7 +6070,8 @@ final class ChatViewModel {
             liveToolCalls = []
         }
 
-        if didApplyCompletedTranscript {
+        if didApplyCompletedTranscript,
+           !routedCompletedTranscriptIntoRetainedSnapshot {
             completedReasoningGroups = []
             liveReasoningText = ""
             toolCallAnchorMessageID = nil
@@ -4130,6 +6079,8 @@ final class ChatViewModel {
             attachmentCoordinator.removeAllLocalPreviews()
             scheduleStreamingScrollTrigger()
         }
+
+        return didApplyCompletedTranscript
     }
 
     private func setCompletedToolCallGroups(_ groups: [ToolCallGroup]) {
@@ -5029,13 +6980,14 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     }
 
     func streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: Bool) {
-        responseCompletionNeedsTranscriptRefresh = needsTranscriptRefresh
-        responseCompletionHapticTrigger += 1
+        responseCompletionEvent = ChatResponseCompletionEvent(
+            trigger: responseCompletionHapticTrigger + 1,
+            needsTranscriptRefresh: needsTranscriptRefresh
+        )
     }
 
     func streamCoordinatorDidFinishStream() {
         flushPendingStreamingContent()
-        responseCompletionNeedsTranscriptRefresh = false
     }
 
     func streamCoordinatorDidReceiveErrorMessage(_ message: String) {
@@ -5096,14 +7048,16 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     @discardableResult
     func streamCoordinatorApplyDone(_ payload: DoneStreamEvent) -> Bool {
         flushPendingStreamingContent()
-        let hasCompletedTranscript = payload.session?.messages?.isEmpty == false
+        let didApplyCompletedTranscript: Bool
         if let completedSession = payload.session {
-            applyCompletedStreamSession(completedSession)
+            didApplyCompletedTranscript = applyCompletedStreamSession(completedSession)
+        } else {
+            didApplyCompletedTranscript = false
         }
         if let usage = payload.usage {
             contextWindowSnapshot = usage
         }
-        return hasCompletedTranscript
+        return didApplyCompletedTranscript
     }
 
     func streamCoordinatorApplyApprovalUpdate(_ update: ApprovalPendingResponse) {
@@ -5217,6 +7171,10 @@ struct TranscriptMessage: Identifiable, Equatable {
     let loadedIndex: Int
     let renderID: String
     let anchorID: String
+    /// Stable identity used by viewport persistence. Compute it once when the
+    /// bounded display model is rebuilt rather than hashing message content
+    /// again from scroll/layout callbacks.
+    let persistenceMessageID: String
     let message: ChatMessage
 
     var id: String { renderID }
@@ -5336,16 +7294,36 @@ extension ChatViewModel {
         }
     }
 
-    nonisolated static func transcriptMessages(from messages: [ChatMessage], messageOffset: Int? = nil) -> [TranscriptMessage] {
-        transcriptMessages(from: messages, messageOffset: messageOffset, hidingStreamingAssistantID: nil)
+    nonisolated static func transcriptMessages(
+        from messages: [ChatMessage],
+        messageOffset: Int? = nil,
+        reusing previousTranscriptMessages: [TranscriptMessage] = [],
+        persistenceIdentityResolver: (ChatMessage) -> String =
+            ChatTranscriptMessageIdentity.resolve
+    ) -> [TranscriptMessage] {
+        transcriptMessages(
+            from: messages,
+            messageOffset: messageOffset,
+            hidingStreamingAssistantID: nil,
+            reusing: previousTranscriptMessages,
+            persistenceIdentityResolver: persistenceIdentityResolver
+        )
     }
 
     nonisolated static func transcriptMessages(
         from messages: [ChatMessage],
         messageOffset: Int? = nil,
-        hidingStreamingAssistantID streamingAssistantID: String?
+        hidingStreamingAssistantID streamingAssistantID: String?,
+        reusing previousTranscriptMessages: [TranscriptMessage] = [],
+        persistenceIdentityResolver: (ChatMessage) -> String =
+            ChatTranscriptMessageIdentity.resolve
     ) -> [TranscriptMessage] {
         let offset = max(0, messageOffset ?? 0)
+        let previousMessageByRenderID = Dictionary(
+            uniqueKeysWithValues: previousTranscriptMessages.map {
+                ($0.renderID, $0)
+            }
+        )
         var transcriptMessages: [TranscriptMessage] = []
         transcriptMessages.reserveCapacity(messages.count)
 
@@ -5363,11 +7341,19 @@ extension ChatViewModel {
             )
             let absoluteIndex = offset + loadedIndex
             let renderID = "transcript:\(absoluteIndex)"
+            let persistenceMessageID: String
+            if let previousMessage = previousMessageByRenderID[renderID],
+               previousMessage.message == message {
+                persistenceMessageID = previousMessage.persistenceMessageID
+            } else {
+                persistenceMessageID = persistenceIdentityResolver(message)
+            }
 
             transcriptMessages.append(TranscriptMessage(
                 loadedIndex: loadedIndex,
                 renderID: renderID,
                 anchorID: anchorID,
+                persistenceMessageID: persistenceMessageID,
                 message: message
             ))
         }

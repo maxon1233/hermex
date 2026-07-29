@@ -108,7 +108,7 @@ struct ChatTranscriptScrollPosition: Codable, Equatable {
 /// leaves the foreground.
 final class ChatTranscriptScrollPositionRecorder {
     private(set) var latestPosition: ChatTranscriptScrollPosition?
-    private var persistedPosition: ChatTranscriptScrollPosition?
+    private(set) var persistedPosition: ChatTranscriptScrollPosition?
     private let writer: (ChatTranscriptScrollPosition) -> Void
 
     init(
@@ -125,16 +125,75 @@ final class ChatTranscriptScrollPositionRecorder {
         latestPosition = position
     }
 
+    /// Drops viewport samples captured while an attempted restoration was
+    /// laying out its fallback content. The last successfully persisted reader
+    /// position remains eligible for a later restoration attempt.
+    func discardUnpersistedPosition() {
+        latestPosition = persistedPosition
+    }
+
+    /// Resets recorder bookkeeping after the caller explicitly removes an
+    /// unrecoverable persisted anchor from its backing store.
+    func resetPosition(_ position: ChatTranscriptScrollPosition?) {
+        latestPosition = position
+        persistedPosition = position
+    }
+
+    /// Replaces a stale row identity with its authoritative equivalent while
+    /// preserving the exact pixel offset the reader had within that row.
+    ///
+    /// Completion reconciliation uses this when a temporary `stream-*` row is
+    /// replaced by the server's persisted assistant message.
+    @discardableResult
+    func rebasePosition(
+        sourceRenderID: String,
+        sourceMessageID: String?,
+        targetRenderID: String,
+        targetMessageID: String?
+    ) -> ChatTranscriptScrollPosition? {
+        guard let latestPosition,
+              latestPosition.renderID == sourceRenderID,
+              latestPosition.messageID == sourceMessageID else {
+            return nil
+        }
+
+        let rebasedPosition = ChatTranscriptScrollPosition(
+            renderID: targetRenderID,
+            messageID: targetMessageID,
+            offsetFromRowTop: latestPosition.offsetFromRowTop,
+            coordinateSpaceVersion: latestPosition.coordinateSpaceVersion
+        )
+        self.latestPosition = rebasedPosition
+        writer(rebasedPosition)
+        persistedPosition = rebasedPosition
+        return rebasedPosition
+    }
+
     @discardableResult
     func flush() -> Bool {
         guard let latestPosition,
-              latestPosition != persistedPosition else {
+              latestPosition != persistedPosition,
+              !Self.hasTransientMessageIdentity(latestPosition) else {
             return false
         }
 
         writer(latestPosition)
         persistedPosition = latestPosition
         return true
+    }
+
+    private static func hasTransientMessageIdentity(
+        _ position: ChatTranscriptScrollPosition
+    ) -> Bool {
+        position.hasTransientMessageIdentity
+    }
+}
+
+extension ChatTranscriptScrollPosition {
+    var hasTransientMessageIdentity: Bool {
+        guard let messageID else { return false }
+        return messageID.hasPrefix("stream-")
+            || messageID.hasPrefix("local-")
     }
 }
 
@@ -309,16 +368,33 @@ enum ChatTranscriptReadingPositionResolver {
             }
         }
 
-        // Fingerprints are deterministic but not guaranteed unique. The
-        // absolute render ID survives page-window changes, so require both for
-        // fallback identities even if the currently loaded page happens to
-        // contain only one matching fingerprint. Otherwise a newer duplicate
-        // can prevent loading the older persisted row.
+        // Fingerprints are deterministic but not guaranteed unique. Prefer the
+        // exact raw index, then tolerate only a small authoritative index shift
+        // when the fingerprint is unique. Server reconciliation can insert
+        // hidden tool-result rows ahead of an existing assistant; an unlimited
+        // identity-only fallback could instead choose a distant duplicate.
         if messageID.hasPrefix("fingerprint:") {
-            return identities.firstIndex {
+            if let exactIndex = identities.firstIndex(where: {
                 $0.messageID == messageID
                     && $0.renderID == position.renderID
+            }) {
+                return exactIndex
             }
+
+            let matchingIndices = identities.indices.filter {
+                identities[$0].messageID == messageID
+            }
+            guard matchingIndices.count == 1,
+                  let savedAbsoluteIndex = absoluteTranscriptIndex(
+                      from: position.renderID
+                  ),
+                  let candidateAbsoluteIndex = absoluteTranscriptIndex(
+                      from: identities[matchingIndices[0]].renderID
+                  ),
+                  abs(candidateAbsoluteIndex - savedAbsoluteIndex) <= 50 else {
+                return nil
+            }
+            return matchingIndices[0]
         }
 
         let matchingIndices = identities.indices.filter {
@@ -331,6 +407,12 @@ enum ChatTranscriptReadingPositionResolver {
         return matchingIndices.first {
             identities[$0].renderID == position.renderID
         }
+    }
+
+    private static func absoluteTranscriptIndex(from renderID: String) -> Int? {
+        let prefix = "transcript:"
+        guard renderID.hasPrefix(prefix) else { return nil }
+        return Int(renderID.dropFirst(prefix.count))
     }
 
     /// Clamps an offset expressed in the scroll view's visible-content
@@ -427,3 +509,26 @@ enum ChatInitialScrollResolutionPolicy {
         !isLoading || requestedPositionIsDisplayed != false
     }
 }
+
+// SCROLLTRACE: temporary diagnostic tracing for the WHOOP restoration jump.
+// Compile-gated to DEBUG; strip before publishing.
+#if DEBUG
+import os
+
+enum ChatScrollTrace {
+    static let logger = Logger(
+        subsystem: "hermex.scrolltrace",
+        category: "restore"
+    )
+
+    static func log(_ message: @autoclosure () -> String) {
+        let text = message()
+        logger.info("\(text, privacy: .public)")
+    }
+}
+#else
+enum ChatScrollTrace {
+    @inline(__always)
+    static func log(_ message: @autoclosure () -> String) {}
+}
+#endif

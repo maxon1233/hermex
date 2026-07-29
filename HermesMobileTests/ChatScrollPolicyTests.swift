@@ -1,7 +1,40 @@
 import XCTest
+import UIKit
 @testable import HermesMobile
 
 final class ChatScrollPolicyTests: XCTestCase {
+    @MainActor
+    func testViewportControllerReadsCurrentGeometryBeforeRestorationCorrection() {
+        let scrollView = UIScrollView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 400)
+        )
+        scrollView.contentInset = UIEdgeInsets(
+            top: 10,
+            left: 0,
+            bottom: 20,
+            right: 0
+        )
+        scrollView.contentSize = CGSize(width: 320, height: 1_000)
+        scrollView.contentOffset = CGPoint(x: 0, y: 90)
+
+        let controller = ChatScrollViewportController()
+        controller.attach(to: scrollView)
+        XCTAssertEqual(controller.latestSnapshot?.contentHeight, 1_000)
+        XCTAssertEqual(controller.latestSnapshot?.visibleContentOffsetY, 100)
+
+        // Model a row-frame callback arriving before the observer has copied
+        // the matching UIKit content-size/offset change.
+        scrollView.contentSize = CGSize(width: 320, height: 1_400)
+        scrollView.contentOffset = CGPoint(x: 0, y: 190)
+        XCTAssertEqual(controller.latestSnapshot?.contentHeight, 1_000)
+
+        let currentSnapshot = controller.currentSnapshot()
+
+        XCTAssertEqual(currentSnapshot?.contentHeight, 1_400)
+        XCTAssertEqual(currentSnapshot?.visibleContentOffsetY, 200)
+        XCTAssertEqual(controller.latestSnapshot, currentSnapshot)
+    }
+
     func testExistingTranscriptUsesBottomAsItsInitialLayoutAnchor() {
         XCTAssertEqual(ChatScrollPolicy.initialTranscriptAnchor, .bottom)
     }
@@ -213,6 +246,146 @@ final class ChatScrollPolicyTests: XCTestCase {
 
         XCTAssertFalse(recorder.flush())
         XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testDiscardUnpersistedPositionProtectsLastKnownGoodAnchor() {
+        let persistedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:8",
+            messageID: "message-8",
+            offsetFromRowTop: 63
+        )
+        let fallbackSample = ChatTranscriptScrollPosition(
+            renderID: "transcript:40",
+            messageID: "message-40",
+            offsetFromRowTop: 0
+        )
+        let readerPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:42",
+            messageID: "message-42",
+            offsetFromRowTop: 81.5
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: persistedPosition,
+            writer: { writes.append($0) }
+        )
+
+        recorder.record(fallbackSample)
+        recorder.discardUnpersistedPosition()
+
+        XCTAssertEqual(recorder.latestPosition, persistedPosition)
+        XCTAssertFalse(recorder.flush())
+        XCTAssertTrue(writes.isEmpty)
+
+        recorder.record(readerPosition)
+
+        XCTAssertTrue(recorder.flush())
+        XCTAssertEqual(writes, [readerPosition])
+    }
+
+    func testFlushRefusesKnownTransientRowIdentitiesWithoutAdvancingPersistence() {
+        let persistedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:8",
+            messageID: "message-8",
+            offsetFromRowTop: 63
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: persistedPosition,
+            writer: { writes.append($0) }
+        )
+
+        for messageID in ["stream-response", "local-user"] {
+            recorder.record(ChatTranscriptScrollPosition(
+                renderID: "transcript:40",
+                messageID: messageID,
+                offsetFromRowTop: 0
+            ))
+
+            XCTAssertFalse(recorder.flush())
+            XCTAssertTrue(writes.isEmpty)
+
+            recorder.discardUnpersistedPosition()
+            XCTAssertEqual(recorder.latestPosition, persistedPosition)
+        }
+
+        let stablePosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:42",
+            messageID: "message-42",
+            offsetFromRowTop: 81.5
+        )
+        recorder.record(stablePosition)
+
+        XCTAssertTrue(recorder.flush())
+        XCTAssertEqual(writes, [stablePosition])
+    }
+
+    func testRebaseReplacesTransientIdentityAndPreservesPixelOffset() {
+        let transientPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:2348",
+            messageID: "stream-response",
+            offsetFromRowTop: 119.333
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: transientPosition,
+            writer: { writes.append($0) }
+        )
+
+        let rebased = recorder.rebasePosition(
+            sourceRenderID: "transcript:2348",
+            sourceMessageID: "stream-response",
+            targetRenderID: "transcript:2350",
+            targetMessageID: "fingerprint:authoritative"
+        )
+
+        XCTAssertEqual(rebased?.renderID, "transcript:2350")
+        XCTAssertEqual(rebased?.messageID, "fingerprint:authoritative")
+        XCTAssertEqual(rebased?.offsetFromRowTop, 119.333)
+        XCTAssertEqual(recorder.latestPosition, rebased)
+        XCTAssertEqual(recorder.persistedPosition, rebased)
+        XCTAssertEqual(writes, [rebased!])
+    }
+
+    func testResetPositionRetiresUnrecoverableTransientAnchor() {
+        let transientPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:2348",
+            messageID: "stream-response",
+            offsetFromRowTop: 119
+        )
+        var writes: [ChatTranscriptScrollPosition] = []
+        let recorder = ChatTranscriptScrollPositionRecorder(
+            initialPosition: transientPosition,
+            writer: { writes.append($0) }
+        )
+
+        recorder.resetPosition(nil)
+
+        XCTAssertNil(recorder.latestPosition)
+        XCTAssertNil(recorder.persistedPosition)
+        XCTAssertFalse(recorder.flush())
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testUniqueFingerprintSurvivesSmallInsertedToolRowShift() {
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:2348",
+            messageID: "fingerprint:authoritative",
+            offsetFromRowTop: 19
+        )
+
+        XCTAssertEqual(
+            ChatTranscriptReadingPositionResolver.matchingRowIndex(
+                for: position,
+                identities: [
+                    ChatTranscriptRowIdentity(
+                        renderID: "transcript:2350",
+                        messageID: "fingerprint:authoritative"
+                    )
+                ]
+            ),
+            0
+        )
     }
 
     func testLayoutOnlyChangesDoNotRequestReadingPositionCommit() {
@@ -455,6 +628,38 @@ final class ChatScrollPolicyTests: XCTestCase {
         )
     }
 
+    func testReadingPositionRoundTripsAfterRowLayoutMoves() throws {
+        let savedPosition = try XCTUnwrap(
+            ChatTranscriptReadingPositionResolver.resolve(
+                frames: [
+                    ChatTranscriptRowContentFrame(
+                        renderID: "transcript:12",
+                        messageID: "message-12",
+                        minY: 500,
+                        maxY: 1_220
+                    )
+                ],
+                visibleContentOffsetY: 637.25
+            )
+        )
+
+        XCTAssertEqual(savedPosition.offsetFromRowTop, 137.25)
+        XCTAssertEqual(
+            ChatTranscriptReadingPositionResolver.targetContentOffsetY(
+                for: savedPosition,
+                frames: [
+                    ChatTranscriptRowContentFrame(
+                        renderID: "transcript:9",
+                        messageID: "message-12",
+                        minY: 880,
+                        maxY: 1_600
+                    )
+                ]
+            ),
+            1_017.25
+        )
+    }
+
     func testTranscriptMessageIdentityFingerprintsRowsWhenServerIDIsMissing() {
         let first = ChatMessage(
             role: "assistant",
@@ -662,7 +867,7 @@ final class ChatScrollPolicyTests: XCTestCase {
                 for: position,
                 frames: [
                     ChatTranscriptRowContentFrame(
-                        renderID: "transcript:42",
+                        renderID: "transcript:142",
                         messageID: "fingerprint:duplicate",
                         minY: 220,
                         maxY: 320
