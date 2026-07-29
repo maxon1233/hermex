@@ -192,6 +192,7 @@ final class LocalizationCatalogTests: XCTestCase {
         let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         let strings = try XCTUnwrap(root["strings"] as? [String: Any])
         let boardKeys = [
+            "Board actions for %@",
             "Browse Board",
             "Browse Board: %@",
             "Browsing",
@@ -203,6 +204,7 @@ final class LocalizationCatalogTests: XCTestCase {
             "Icon",
             "Make Active Board",
             "Making this Board active changes shared server state for other Hermes clients.",
+            "Shows available Board management actions.",
             "Slug",
             "The slug cannot be changed after the Board is created.",
             "This Board no longer exists. Choose another Board.",
@@ -232,8 +234,12 @@ final class LocalizationCatalogTests: XCTestCase {
             "Another Board action is in progress.",
             "Auto-blocked",
             "Crashed",
+            "Display",
             "Dispatcher",
+            "Dispatcher, attention required",
+            "Dispatcher, result available",
             "Dispatcher is unavailable on this server.",
+            "Group by Profile",
             "Hermex refreshed the Board, but cannot prove whether workers started. Review the current Board before running Dispatcher again.",
             "I Reviewed the Board",
             "Preview Dispatch",

@@ -32,6 +32,74 @@ struct KanbanPendingCardAction: Identifiable, Equatable {
     }
 }
 
+enum KanbanDispatcherPresentation {
+    static func hasResult(_ state: KanbanDispatchState?) -> Bool {
+        guard let state, state.result != nil else { return false }
+        switch state.phase {
+        case .succeeded, .outcomeUncertain:
+            return true
+        case .submitting, .reconciling, .refused, .failed, .boardUnavailable:
+            return false
+        }
+    }
+
+    static func requiresAttention(_ state: KanbanDispatchState?) -> Bool {
+        state?.phase == .outcomeUncertain && state?.result == nil
+    }
+
+    static func toolbarSystemImage(for state: KanbanDispatchState?) -> String {
+        if requiresAttention(state) {
+            return "exclamationmark.circle.fill"
+        }
+        if hasResult(state) {
+            return "bolt.horizontal.circle.fill"
+        }
+        return "bolt.horizontal.circle"
+    }
+
+    static func toolbarAccessibilityLabel(for state: KanbanDispatchState?) -> String {
+        if requiresAttention(state) {
+            return String(localized: "Dispatcher, attention required")
+        }
+        if hasResult(state) {
+            return String(localized: "Dispatcher, result available")
+        }
+        return String(localized: "Dispatcher")
+    }
+}
+
+@MainActor
+struct KanbanFiltersDraft {
+    var profile: String?
+    var tenant: String?
+    var includesArchived: Bool
+    var onlyMine: Bool
+    var groupsByProfile: Bool
+
+    init(model: KanbanFeatureState) {
+        profile = model.selectedProfile
+        tenant = model.selectedTenant
+        includesArchived = model.includeArchived
+        onlyMine = model.onlyMine
+        groupsByProfile = model.groupByProfile
+    }
+
+    func apply(to model: KanbanFeatureState) async {
+        let serverFiltersChanged = profile != model.selectedProfile
+            || tenant != model.selectedTenant
+            || includesArchived != model.includeArchived
+            || onlyMine != model.onlyMine
+        model.groupByProfile = groupsByProfile
+        guard serverFiltersChanged else { return }
+        await model.applyFilters(
+            profile: profile,
+            tenant: tenant,
+            includeArchived: includesArchived,
+            onlyMine: onlyMine
+        )
+    }
+}
+
 struct KanbanStatusFocusView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Bindable var model: KanbanFeatureState
@@ -43,12 +111,14 @@ struct KanbanStatusFocusView: View {
     @State private var showsBulkActions = false
     @State private var confirmsBulkArchive = false
     @State private var confirmsRunDispatcher = false
+    @State private var showsDispatcher = false
     @State private var presentedCardID: String?
     @AccessibilityFocusState private var focusedCardID: String?
     @AccessibilityFocusState private var archiveUndoIsFocused: Bool
     @AccessibilityFocusState private var selectionControlsAreFocused: Bool
     @AccessibilityFocusState private var bulkSummaryIsFocused: Bool
     @AccessibilityFocusState private var dispatchSummaryIsFocused: Bool
+    @AccessibilityFocusState private var dispatcherButtonIsFocused: Bool
 
     var body: some View {
         Group {
@@ -92,6 +162,11 @@ struct KanbanStatusFocusView: View {
         .toolbar { toolbarContent }
         .sheet(isPresented: $showsFilters) {
             KanbanFiltersView(model: model)
+        }
+        .sheet(isPresented: $showsDispatcher, onDismiss: {
+            dispatcherButtonIsFocused = true
+        }) {
+            dispatcherSheet
         }
         .sheet(isPresented: $showsBoardManagement) {
             NavigationStack {
@@ -139,7 +214,11 @@ struct KanbanStatusFocusView: View {
         }
         .onChange(of: model.dispatchState?.phase) { oldPhase, newPhase in
             if oldPhase?.isInFlight == true, newPhase?.isInFlight == false {
-                dispatchSummaryIsFocused = true
+                if showsDispatcher {
+                    dispatchSummaryIsFocused = true
+                } else {
+                    dispatcherButtonIsFocused = true
+                }
             }
         }
         .onChange(of: presentedCardID) { previousCardID, currentCardID in
@@ -180,14 +259,6 @@ struct KanbanStatusFocusView: View {
             }
         } message: {
             Text("The selected Cards will be moved to the archive.")
-        }
-        .alert("Run Dispatcher", isPresented: $confirmsRunDispatcher) {
-            Button("Cancel", role: .cancel) {}
-            Button("Run Dispatcher", role: .destructive) {
-                Task { await model.runDispatcher() }
-            }
-        } message: {
-            Text(KanbanDispatchCopy.runConfirmation)
         }
     }
 
@@ -238,9 +309,6 @@ struct KanbanStatusFocusView: View {
             } else if let summary = model.bulkActionSummary {
                 bulkSummaryBanner(summary)
             }
-            if model.selectedBoardSlug != nil || model.dispatchState != nil {
-                dispatcherPanel
-            }
             if model.requiresBoardSelection {
                 boardSelectionContent
             } else {
@@ -254,13 +322,34 @@ struct KanbanStatusFocusView: View {
         }
     }
 
+    private var dispatcherSheet: some View {
+        NavigationStack {
+            ScrollView {
+                dispatcherPanel
+                    .padding()
+            }
+            .navigationTitle("Dispatcher")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showsDispatcher = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .alert("Run Dispatcher", isPresented: $confirmsRunDispatcher) {
+            Button("Cancel", role: .cancel) {}
+            Button("Run Dispatcher", role: .destructive) {
+                Task { await model.runDispatcher() }
+            }
+        } message: {
+            Text(KanbanDispatchCopy.runConfirmation)
+        }
+    }
+
     private var dispatcherPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("Dispatcher", systemImage: "bolt.horizontal.circle")
-                    .font(.headline)
-                Spacer()
-            }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
                     previewDispatchButton
@@ -290,9 +379,7 @@ struct KanbanStatusFocusView: View {
                 dispatchSummary(dispatch)
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.secondary.opacity(0.06))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var previewDispatchButton: some View {
@@ -1059,12 +1146,20 @@ struct KanbanStatusFocusView: View {
             .accessibilityLabel(Text("New Card"))
 
             Button {
-                model.groupByProfile.toggle()
+                showsDispatcher = true
             } label: {
-                Image(systemName: model.groupByProfile ? "person.2.fill" : "person.2")
+                Label(
+                    "Dispatcher",
+                    systemImage: KanbanDispatcherPresentation.toolbarSystemImage(
+                        for: model.dispatchState
+                    )
+                )
             }
             .frame(minWidth: 44, minHeight: 44)
-            .accessibilityLabel(model.groupByProfile ? Text("Stop grouping by Profile") : Text("Group by Profile"))
+            .accessibilityLabel(
+                Text(KanbanDispatcherPresentation.toolbarAccessibilityLabel(for: model.dispatchState))
+            )
+            .accessibilityFocused($dispatcherButtonIsFocused)
 
             Button {
                 showsFilters = true
@@ -1097,6 +1192,16 @@ private enum KanbanBoardEditorMode: Identifiable {
         case .create: "create"
         case let .edit(board): "edit-\(board.slug ?? "")"
         }
+    }
+}
+
+private struct KanbanBoardStatusLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 4) {
+            configuration.icon
+            configuration.title
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1180,7 +1285,61 @@ private struct KanbanBoardManagementView: View {
     }
 
     private func boardRow(_ board: KanbanBoard) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let presentation = KanbanBoardRowPresentation(
+            board: board,
+            selectedBoardSlug: model.selectedBoardSlug,
+            sharedActiveBoardSlug: model.sharedActiveBoardSlug,
+            canManageBoards: model.canManageBoards
+        )
+
+        return HStack(alignment: .top, spacing: 8) {
+            boardBrowseControl(board, presentation: presentation)
+            boardActionsMenu(board, presentation: presentation)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func boardBrowseControl(
+        _ board: KanbanBoard,
+        presentation: KanbanBoardRowPresentation
+    ) -> some View {
+        if let slug = presentation.browseSlug {
+            Button {
+                Task { await model.selectBoard(slug) }
+            } label: {
+                boardRowContent(board, presentation: presentation)
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                Text(
+                    KanbanBoardAccessibility.browseSummary(
+                        board,
+                        isActive: presentation.isActive
+                    )
+                )
+            )
+            .accessibilityHint(
+                Text("Browsing a Board stays local to Hermex. Making a Board active changes shared server state.")
+            )
+        } else {
+            boardRowContent(board, presentation: presentation)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(
+                    presentation.isBrowsing ? .isSelected : AccessibilityTraits()
+                )
+        }
+    }
+
+    private func boardRowContent(
+        _ board: KanbanBoard,
+        presentation: KanbanBoardRowPresentation
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(board.icon ?? "▣")
                     .accessibilityHidden(true)
@@ -1193,16 +1352,20 @@ private struct KanbanBoardManagementView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Spacer()
-                if board.slug == model.selectedBoardSlug {
-                    Text("Browsing")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            }
+
+            if presentation.isBrowsing || presentation.isActive {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        boardStatusIndicators(presentation)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        boardStatusIndicators(presentation)
+                    }
                 }
-                if board.slug == model.sharedActiveBoardSlug {
-                    Text("Active")
-                        .font(.caption.bold())
-                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .labelStyle(KanbanBoardStatusLabelStyle())
             }
 
             if let description = board.description, !description.isEmpty {
@@ -1213,33 +1376,63 @@ private struct KanbanBoardManagementView: View {
             Text(KanbanCountFormatter.cards(board.total ?? 0))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
 
-            HStack {
-                if board.slug != model.selectedBoardSlug {
-                    Button("Browse Board") {
-                        guard let slug = board.slug else { return }
-                        Task { await model.selectBoard(slug) }
-                    }
-                    .accessibilityLabel(Text(KanbanBoardAccessibility.browseLabel(board)))
-                }
-                Button("Edit") {
+    @ViewBuilder
+    private func boardStatusIndicators(_ presentation: KanbanBoardRowPresentation) -> some View {
+        if presentation.isBrowsing {
+            Label("Browsing", systemImage: "eye.fill")
+        }
+        if presentation.isActive {
+            Label("Active", systemImage: "checkmark.circle.fill")
+        }
+    }
+
+    private func boardActionsMenu(
+        _ board: KanbanBoard,
+        presentation: KanbanBoardRowPresentation
+    ) -> some View {
+        Menu {
+            if presentation.actions.contains(.edit) {
+                Button {
                     model.dismissBoardMutationResult()
                     editorMode = .edit(board)
+                } label: {
+                    Label("Edit", systemImage: KanbanBoardRowAction.edit.systemImage)
                 }
-                .disabled(!model.canManageBoards)
-                Button("Make Active Board") {
-                    pendingActivation = board
-                }
-                .disabled(board.slug == model.sharedActiveBoardSlug || !model.canManageBoards)
-                Button("Archive", role: .destructive) {
-                    pendingArchive = board
-                }
-                .disabled(!model.canArchiveBoard(board))
             }
-            .buttonStyle(.borderless)
-            .frame(minHeight: 44)
+            if presentation.actions.contains(.makeActive) {
+                Button {
+                    pendingActivation = board
+                } label: {
+                    Label(
+                        "Make Active Board",
+                        systemImage: KanbanBoardRowAction.makeActive.systemImage
+                    )
+                }
+            }
+            if presentation.actions.contains(.archive) {
+                Button(role: .destructive) {
+                    pendingArchive = board
+                } label: {
+                    Label("Archive", systemImage: KanbanBoardRowAction.archive.systemImage)
+                }
+            }
+        } label: {
+            Label(
+                KanbanBoardAccessibility.actionsLabel(board),
+                systemImage: "ellipsis.circle"
+            )
+            .labelStyle(.iconOnly)
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
         }
-        .accessibilityElement(children: .contain)
+        .buttonStyle(.plain)
+        .disabled(!presentation.mutationsAreEnabled || presentation.actions.isEmpty)
+        .accessibilityLabel(Text(KanbanBoardAccessibility.actionsLabel(board)))
+        .accessibilityHint(Text("Shows available Board management actions."))
     }
 
     private func boardMutationStatus(_ mutation: KanbanBoardMutationState) -> some View {
@@ -1502,38 +1695,32 @@ private struct KanbanBulkActionsView: View {
 private struct KanbanFiltersView: View {
     @Environment(\.dismiss) private var dismiss
     let model: KanbanFeatureState
-    @State private var profile: String?
-    @State private var tenant: String?
-    @State private var includesArchived: Bool
-    @State private var onlyMine: Bool
+    @State private var draft: KanbanFiltersDraft
 
     init(model: KanbanFeatureState) {
         self.model = model
-        _profile = State(initialValue: model.selectedProfile)
-        _tenant = State(initialValue: model.selectedTenant)
-        _includesArchived = State(initialValue: model.includeArchived)
-        _onlyMine = State(initialValue: model.onlyMine)
+        _draft = State(initialValue: KanbanFiltersDraft(model: model))
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Profile") {
-                    Picker("Assigned Profile", selection: $profile) {
+                    Picker("Assigned Profile", selection: $draft.profile) {
                         Text("All Profiles").tag(String?.none)
                         ForEach(model.profileOptions, id: \.self) { value in
                             Text(value).tag(Optional(value))
                         }
                     }
-                    .disabled(onlyMine)
-                    Toggle("Only Mine", isOn: $onlyMine)
-                        .onChange(of: onlyMine) { _, enabled in
-                            if enabled { profile = nil }
+                    .disabled(draft.onlyMine)
+                    Toggle("Only Mine", isOn: $draft.onlyMine)
+                        .onChange(of: draft.onlyMine) { _, enabled in
+                            if enabled { draft.profile = nil }
                         }
                 }
 
                 Section("Tenant") {
-                    Picker("Tenant", selection: $tenant) {
+                    Picker("Tenant", selection: $draft.tenant) {
                         Text("All Tenants").tag(String?.none)
                         ForEach(model.tenantOptions, id: \.self) { value in
                             Text(value).tag(Optional(value))
@@ -1542,7 +1729,11 @@ private struct KanbanFiltersView: View {
                 }
 
                 Section("Archived Cards") {
-                    Toggle("Include Archived Cards", isOn: $includesArchived)
+                    Toggle("Include Archived Cards", isOn: $draft.includesArchived)
+                }
+
+                Section("Display") {
+                    Toggle("Group by Profile", isOn: $draft.groupsByProfile)
                 }
 
                 if model.hasActiveFilters {
@@ -1566,12 +1757,7 @@ private struct KanbanFiltersView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
                         Task {
-                            await model.applyFilters(
-                                profile: profile,
-                                tenant: tenant,
-                                includeArchived: includesArchived,
-                                onlyMine: onlyMine
-                            )
+                            await draft.apply(to: model)
                             dismiss()
                         }
                     }
@@ -1738,6 +1924,80 @@ enum KanbanBoardAccessibility {
     static func browseLabel(_ board: KanbanBoard) -> String {
         let boardName = board.name ?? board.slug ?? String(localized: "Board")
         return String.localizedStringWithFormat(String(localized: "Browse Board: %@"), boardName)
+    }
+
+    static func actionsLabel(_ board: KanbanBoard) -> String {
+        let boardName = board.name ?? board.slug ?? String(localized: "Board")
+        return String.localizedStringWithFormat(String(localized: "Board actions for %@"), boardName)
+    }
+
+    static func browseSummary(_ board: KanbanBoard, isActive: Bool) -> String {
+        var parts = [browseLabel(board)]
+        if let description = board.description?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !description.isEmpty {
+            parts.append(description)
+        }
+        parts.append(KanbanCountFormatter.cards(board.total ?? 0))
+        let status = statusValue(isBrowsing: false, isActive: isActive)
+        if !status.isEmpty { parts.append(status) }
+        return parts.joined(separator: ", ")
+    }
+
+    static func statusValue(isBrowsing: Bool, isActive: Bool) -> String {
+        var statuses: [String] = []
+        if isBrowsing { statuses.append(String(localized: "Browsing")) }
+        if isActive { statuses.append(String(localized: "Active")) }
+        return statuses.joined(separator: ", ")
+    }
+}
+
+enum KanbanBoardRowAction: Equatable {
+    case edit
+    case makeActive
+    case archive
+
+    var systemImage: String {
+        switch self {
+        case .edit: "pencil"
+        case .makeActive: "checkmark.circle"
+        case .archive: "archivebox"
+        }
+    }
+}
+
+struct KanbanBoardRowPresentation: Equatable {
+    let browseSlug: String?
+    let actions: [KanbanBoardRowAction]
+    let mutationsAreEnabled: Bool
+    let isBrowsing: Bool
+    let isActive: Bool
+
+    init(
+        board: KanbanBoard,
+        selectedBoardSlug: String?,
+        sharedActiveBoardSlug: String?,
+        canManageBoards: Bool
+    ) {
+        let trimmedSlug = board.slug?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let slug = trimmedSlug?.isEmpty == false ? trimmedSlug : nil
+        isBrowsing = slug != nil && slug == selectedBoardSlug
+        isActive = slug != nil && slug == sharedActiveBoardSlug
+        browseSlug = isBrowsing ? nil : slug
+        mutationsAreEnabled = canManageBoards && slug != nil
+
+        guard let slug else {
+            actions = []
+            return
+        }
+        var applicableActions: [KanbanBoardRowAction] = [.edit]
+        if slug != sharedActiveBoardSlug {
+            applicableActions.append(.makeActive)
+        }
+        if slug != "default" {
+            applicableActions.append(.archive)
+        }
+        actions = applicableActions
     }
 }
 
