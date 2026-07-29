@@ -76,12 +76,16 @@ identity: `DEVELOPMENT.md`. Never touch the production `com.uzairansar.hermesmob
 unless explicitly asked.
 
 ## Personal TestFlight delivery (owner-only)
-The personal app must be archived with `scripts/personal-release archive`. The
-script fetches `origin/personal/main` and the read-only app `upstream/master`,
-checks the personal baseline and app-upstream validation pins, runs the complete
-XCTest suite, archives an immutable `origin/personal/main` snapshot, embeds the
-source SHAs, and verifies the bundle/team/build identity. Never archive the
-personal app from the active worktree or bypass a blocked release check.
+Personal TestFlight is the owner's fast iteration channel: each merged
+`personal/main` goes to their phone as quickly as possible. The personal app
+must be archived with `scripts/personal-release archive`, which is fast by
+default: it archives an immutable `origin/personal/main` snapshot, embeds the
+source SHAs, and verifies the bundle/team/build identity. It does NOT rerun
+the XCTest suite (merged snapshots already passed the required `CI Gate`);
+pass `--run-tests` to revalidate. Stale app-upstream pins print a warning but
+do not block — upstream syncs are free-time housekeeping, never release
+gates. Only a missing personal-baseline commit (broken lineage) blocks.
+Never archive the personal app from the active worktree.
 
 Personal delivery is not complete when upload succeeds. Use the App Store
 Connect identity recorded in `CURRENT.md`, wait for the exact build to become

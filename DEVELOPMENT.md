@@ -243,15 +243,10 @@ The personal TestFlight app is separate from the production and branch apps
 documented below. Its bundle, team, App Store Connect app, and beta-group
 identity remain in local-only `CURRENT.md`.
 
-Never archive it with a raw `xcodebuild` command from the active worktree. Check
-the release state first:
-
-```zsh
-scripts/personal-release check
-```
-
-Then create a build-specific archive from the immutable remote
-`personal/main` snapshot:
+Personal TestFlight is the owner's fast iteration channel — the goal is the
+shortest path from a merged `personal/main` to their phone. Never archive it
+with a raw `xcodebuild` command from the active worktree; create a
+build-specific archive from the immutable remote `personal/main` snapshot:
 
 ```zsh
 scripts/personal-release archive \
@@ -265,13 +260,17 @@ scripts/personal-release archive \
 The archive command always:
 
 - fetches `origin/personal/main` and the read-only app `upstream/master`;
-- verifies every required personal baseline commit;
-- blocks untriaged, untested, or unmerged upstream app changes;
+- verifies every required personal baseline commit (broken lineage blocks);
+- warns — without blocking — when app-upstream pins are stale; sync upstream
+  in free time, it is never a release gate;
 - exports a clean Git snapshot instead of reading the active worktree;
-- runs the complete XCTest suite;
 - embeds the source branch, source SHA, upstream SHA, and clean state;
 - verifies the archive's bundle, team, build number, and embedded identity;
 - writes a sibling `.source.json` manifest for the delivery record.
+
+It does not rerun the XCTest suite by default: `personal/main` only advances
+through the required `CI Gate`, so the snapshot already passed the full suite
+on merge. Pass `--run-tests` to revalidate when a build warrants it.
 
 Only export/upload the archive that passed this command. After upload, follow the
 personal completion rule in `CURRENT.md`: wait for the exact build to become

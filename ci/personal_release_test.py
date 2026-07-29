@@ -185,6 +185,56 @@ class PersonalReleaseEvaluationTests(unittest.TestCase):
             any("does not contain upstream" in error for error in inspection.errors)
         )
 
+    def test_stale_upstream_is_advisory_for_archiving(self) -> None:
+        release = sha("c")
+        tested = sha("d")
+        upstream = sha("e")
+        ancestors = {
+            (sha("a"), release),
+            (sha("b"), release),
+            (tested, release),
+            (tested, upstream),
+        }
+
+        inspection = evaluate_release(
+            release_sha=release,
+            upstream_sha=upstream,
+            tested_upstream_sha=tested,
+            triaged_upstream_sha=tested,
+            baseline=self.baseline,
+            is_ancestor=lambda ancestor, descendant: (ancestor, descendant) in ancestors,
+            commit_count=lambda base, target: 3 if (base, target) == (tested, upstream) else None,
+            commit_summaries=lambda _base, _target: (),
+        )
+
+        self.assertFalse(inspection.is_releasable)
+        self.assertTrue(inspection.is_archivable)
+        self.assertEqual(inspection.lineage_errors, ())
+        self.assertTrue(inspection.freshness_errors)
+
+    def test_missing_baseline_commit_blocks_archiving(self) -> None:
+        release = sha("c")
+        upstream = sha("d")
+        ancestors = {
+            (sha("a"), release),
+            (upstream, release),
+            (upstream, upstream),
+        }
+
+        inspection = evaluate_release(
+            release_sha=release,
+            upstream_sha=upstream,
+            tested_upstream_sha=upstream,
+            triaged_upstream_sha=upstream,
+            baseline=self.baseline,
+            is_ancestor=lambda ancestor, descendant: (ancestor, descendant) in ancestors,
+            commit_count=lambda base, target: 0 if base == target else None,
+            commit_summaries=lambda _base, _target: (),
+        )
+
+        self.assertFalse(inspection.is_archivable)
+        self.assertTrue(inspection.lineage_errors)
+
 
 class PersonalReleaseArchiveIdentityTests(unittest.TestCase):
     identity = ArchiveIdentity(
