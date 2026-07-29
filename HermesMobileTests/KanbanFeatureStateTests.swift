@@ -174,6 +174,26 @@ final class KanbanFeatureStateTests: XCTestCase {
         XCTAssertTrue(state.onlyMine)
     }
 
+    func testGroupByProfileDraftCancelsOrAppliesLocallyWithoutRefetchingBoard() async {
+        let client = BrowsingClient()
+        let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
+        await state.load()
+        let requestsBeforeToggle = await client.boardRequests()
+        var draft = KanbanFiltersDraft(model: state)
+
+        draft.groupsByProfile = true
+
+        XCTAssertFalse(state.groupByProfile, "A cancelled draft must not mutate presentation state.")
+        var requestsAfterDraftChange = await client.boardRequests()
+        XCTAssertEqual(requestsAfterDraftChange, requestsBeforeToggle)
+
+        await draft.apply(to: state)
+
+        XCTAssertTrue(state.groupByProfile)
+        requestsAfterDraftChange = await client.boardRequests()
+        XCTAssertEqual(requestsAfterDraftChange, requestsBeforeToggle)
+    }
+
     func testBoardSwitchClearsBoardScopedDataAndRevalidatesCompatibility() async {
         let client = DeferredBoardSwitchClient()
         let state = KanbanFeatureState(server: URL(string: "https://example.test")!, client: client)
@@ -278,6 +298,18 @@ final class KanbanFeatureStateTests: XCTestCase {
             #"{"slug":"release","name":"Release"}"#
         )
         XCTAssertEqual(KanbanBoardAccessibility.browseLabel(board), "Browse Board: Release")
+        XCTAssertEqual(KanbanBoardAccessibility.actionsLabel(board), "Board actions for Release")
+        XCTAssertEqual(
+            KanbanBoardAccessibility.statusValue(isBrowsing: true, isActive: true),
+            "\(String(localized: "Browsing")), \(String(localized: "Active"))"
+        )
+        let describedBoard: KanbanBoard = mutationDecode(
+            #"{"slug":"release","name":"Release","description":"Release planning","total":3}"#
+        )
+        XCTAssertEqual(
+            KanbanBoardAccessibility.browseSummary(describedBoard, isActive: true),
+            "Browse Board: Release, Release planning, 3 Cards, Active"
+        )
 
         let dispatchResult: KanbanDispatchResult = mutationDecode(
             #"{"spawned":[{"id":"secret"}],"promoted":2,"reclaimed":0,"skipped_unassigned":[],"skipped_nonspawnable":[],"auto_blocked":[],"timed_out":[],"crashed":[]}"#
@@ -315,6 +347,89 @@ final class KanbanFeatureStateTests: XCTestCase {
             KanbanDispatchCopy.runConfirmation,
             "This may start up to \(KanbanDispatchRequest.maximum) workers and consume API budget."
         )
+    }
+
+    func testBoardRowPresentationSeparatesLocalBrowsingFromApplicableMenuActions() {
+        let ordinary: KanbanBoard = mutationDecode(
+            #"{"slug":"release","name":"Release"}"#
+        )
+        let ordinaryPresentation = KanbanBoardRowPresentation(
+            board: ordinary,
+            selectedBoardSlug: "main",
+            sharedActiveBoardSlug: "main",
+            canManageBoards: true
+        )
+        XCTAssertEqual(ordinaryPresentation.browseSlug, "release")
+        XCTAssertEqual(ordinaryPresentation.actions, [.edit, .makeActive, .archive])
+        XCTAssertTrue(ordinaryPresentation.mutationsAreEnabled)
+        XCTAssertFalse(ordinaryPresentation.isBrowsing)
+        XCTAssertFalse(ordinaryPresentation.isActive)
+
+        let browsedPresentation = KanbanBoardRowPresentation(
+            board: ordinary,
+            selectedBoardSlug: "release",
+            sharedActiveBoardSlug: "main",
+            canManageBoards: true
+        )
+        XCTAssertNil(browsedPresentation.browseSlug)
+        XCTAssertEqual(browsedPresentation.actions, [.edit, .makeActive, .archive])
+        XCTAssertTrue(browsedPresentation.isBrowsing)
+
+        let activePresentation = KanbanBoardRowPresentation(
+            board: ordinary,
+            selectedBoardSlug: "main",
+            sharedActiveBoardSlug: "release",
+            canManageBoards: true
+        )
+        XCTAssertEqual(activePresentation.browseSlug, "release")
+        XCTAssertEqual(activePresentation.actions, [.edit, .archive])
+        XCTAssertTrue(activePresentation.isActive)
+
+        let defaultBoard: KanbanBoard = mutationDecode(
+            #"{"slug":"default","name":"Default"}"#
+        )
+        let defaultPresentation = KanbanBoardRowPresentation(
+            board: defaultBoard,
+            selectedBoardSlug: "release",
+            sharedActiveBoardSlug: "release",
+            canManageBoards: true
+        )
+        XCTAssertEqual(defaultPresentation.browseSlug, "default")
+        XCTAssertEqual(defaultPresentation.actions, [.edit, .makeActive])
+        XCTAssertFalse(defaultPresentation.actions.contains(.archive))
+    }
+
+    func testBoardRowPresentationDisablesAllMutationsWhenManagementIsUnavailable() {
+        let board: KanbanBoard = mutationDecode(
+            #"{"slug":"release","name":"Release"}"#
+        )
+        let presentation = KanbanBoardRowPresentation(
+            board: board,
+            selectedBoardSlug: "main",
+            sharedActiveBoardSlug: "main",
+            canManageBoards: false
+        )
+
+        XCTAssertEqual(presentation.browseSlug, "release")
+        XCTAssertEqual(presentation.actions, [.edit, .makeActive, .archive])
+        XCTAssertFalse(presentation.mutationsAreEnabled)
+        XCTAssertEqual(KanbanBoardRowAction.edit.systemImage, "pencil")
+        XCTAssertEqual(KanbanBoardRowAction.makeActive.systemImage, "checkmark.circle")
+        XCTAssertEqual(KanbanBoardRowAction.archive.systemImage, "archivebox")
+
+        let invalidBoard: KanbanBoard = mutationDecode(
+            #"{"name":"Missing slug"}"#
+        )
+        let invalidPresentation = KanbanBoardRowPresentation(
+            board: invalidBoard,
+            selectedBoardSlug: "main",
+            sharedActiveBoardSlug: "main",
+            canManageBoards: true
+        )
+        XCTAssertNil(invalidPresentation.browseSlug)
+        XCTAssertFalse(invalidPresentation.isBrowsing)
+        XCTAssertFalse(invalidPresentation.mutationsAreEnabled)
+        XCTAssertTrue(invalidPresentation.actions.isEmpty)
     }
 
     func testCardRowPrimaryActionKeepsNavigationAndSelectionDistinct() throws {
@@ -393,6 +508,100 @@ final class KanbanFeatureStateTests: XCTestCase {
         XCTAssertTrue(state.isPreviewStale)
         let finalRequestCount = await client.dispatchRequestCount
         XCTAssertEqual(finalRequestCount, 1)
+    }
+
+    func testDispatcherToolbarResultPersistsUntilExplicitDismissal() async {
+        let client = DispatcherClient()
+        let state = KanbanFeatureState(
+            server: URL(string: "https://example.test")!,
+            client: client
+        )
+        await state.load()
+
+        XCTAssertFalse(KanbanDispatcherPresentation.hasResult(state.dispatchState))
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarAccessibilityLabel(for: state.dispatchState),
+            String(localized: "Dispatcher")
+        )
+
+        await state.previewDispatch()
+
+        XCTAssertTrue(KanbanDispatcherPresentation.hasResult(state.dispatchState))
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarAccessibilityLabel(for: state.dispatchState),
+            String(localized: "Dispatcher, result available")
+        )
+
+        let failed = KanbanDispatchState(
+            mode: .preview,
+            boardSlug: "main",
+            phase: .failed,
+            result: nil,
+            completedAt: nil,
+            boardActivityGeneration: 0
+        )
+        let refused = KanbanDispatchState(
+            mode: .run,
+            boardSlug: "main",
+            phase: .refused,
+            result: nil,
+            completedAt: nil,
+            boardActivityGeneration: 0
+        )
+        let uncertain = KanbanDispatchState(
+            mode: .run,
+            boardSlug: "main",
+            phase: .outcomeUncertain,
+            result: nil,
+            completedAt: nil,
+            boardActivityGeneration: 0
+        )
+        let uncertainWithResult = KanbanDispatchState(
+            mode: .run,
+            boardSlug: "main",
+            phase: .outcomeUncertain,
+            result: state.dispatchState?.result,
+            completedAt: nil,
+            boardActivityGeneration: 0
+        )
+        XCTAssertFalse(KanbanDispatcherPresentation.hasResult(failed))
+        XCTAssertFalse(KanbanDispatcherPresentation.hasResult(refused))
+        XCTAssertFalse(KanbanDispatcherPresentation.hasResult(uncertain))
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarSystemImage(for: failed),
+            "bolt.horizontal.circle"
+        )
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarSystemImage(for: refused),
+            "bolt.horizontal.circle"
+        )
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarSystemImage(for: uncertain),
+            "exclamationmark.circle.fill",
+            "Ambiguous-outcome recovery must use a distinct, visibly reopenable indicator."
+        )
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarAccessibilityLabel(for: uncertain),
+            String(localized: "Dispatcher, attention required")
+        )
+        XCTAssertTrue(KanbanDispatcherPresentation.hasResult(uncertainWithResult))
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarSystemImage(for: state.dispatchState),
+            "bolt.horizontal.circle.fill"
+        )
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarSystemImage(for: uncertainWithResult),
+            "bolt.horizontal.circle.fill"
+        )
+        XCTAssertEqual(
+            KanbanDispatcherPresentation.toolbarAccessibilityLabel(for: uncertainWithResult),
+            String(localized: "Dispatcher, result available")
+        )
+
+        state.dismissDispatchResult()
+
+        XCTAssertNil(state.dispatchState)
+        XCTAssertFalse(KanbanDispatcherPresentation.hasResult(state.dispatchState))
     }
 
     func testRunDispatcherJoinsBoardWideLockAndAlwaysReconcilesWithoutRequiringPreview() async {
