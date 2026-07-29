@@ -318,6 +318,620 @@ final class CacheStoreTests: XCTestCase {
         XCTAssertEqual(window.messageOffset, 269)
     }
 
+    func testRestorationCacheKeepsLatestWindowSeparateAndSurvivesMetadataApply() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let sessionID = "restoration-before-metadata"
+        let latestMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Latest question",
+                timestamp: 2_000,
+                messageId: "latest-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Latest answer",
+                timestamp: 2_001,
+                messageId: "latest-assistant"
+            ),
+        ]
+        let historicalMessages = (0..<80).map { index in
+            ChatMessage(
+                role: index.isMultiple(of: 2) ? "user" : "assistant",
+                content: "Historical message \(index)",
+                timestamp: Double(1_000 + index),
+                messageId: "historical-\(index)",
+                reasoning: index == 11 ? "Saved reasoning" : nil
+            )
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:1011",
+            messageID: "historical-11",
+            offsetFromRowTop: 120
+        )
+
+        try CacheStore.cacheMessages(
+            latestMessages,
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 1_980,
+            in: context,
+            cachedAt: cachedAt
+        )
+        try CacheStore.cacheRestorationMessageWindow(
+            historicalMessages,
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 1_000,
+            position: position,
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        let latestWindow = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: cachedAt.addingTimeInterval(1)
+        )
+        let restorationWindow = try XCTUnwrap(
+            CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: position,
+                in: context,
+                now: cachedAt.addingTimeInterval(1)
+            )
+        )
+
+        XCTAssertEqual(latestWindow.messages, latestMessages)
+        XCTAssertEqual(latestWindow.messageOffset, 1_980)
+        XCTAssertEqual(try fetchCachedMessages(in: context).count, 2)
+        XCTAssertEqual(
+            restorationWindow.messages.count,
+            CachePolicy.maxRestorationMessagesPerSession
+        )
+        XCTAssertEqual(restorationWindow.messageOffset, 1_000)
+        XCTAssertEqual(
+            restorationWindow.messages.first?.messageId,
+            "historical-0"
+        )
+        XCTAssertEqual(
+            restorationWindow.messages.last?.messageId,
+            "historical-49"
+        )
+        XCTAssertEqual(
+            restorationWindow.messages.first {
+                $0.messageId == "historical-11"
+            }?.reasoning,
+            "Saved reasoning"
+        )
+        XCTAssertTrue(
+            try CacheStore.cachedSessions(
+                serverURL: serverURL,
+                in: context,
+                now: cachedAt.addingTimeInterval(1)
+            ).isEmpty
+        )
+
+        try CacheStore.cacheSession(
+            SessionSummary(
+                sessionId: sessionID,
+                title: "Metadata arrived later",
+                messageCount: 2_002
+            ),
+            serverURL: serverURL,
+            in: context,
+            cachedAt: cachedAt.addingTimeInterval(10)
+        )
+
+        let restoredAfterApply = try XCTUnwrap(
+            CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: position,
+                in: context,
+                now: cachedAt.addingTimeInterval(20)
+            )
+        )
+        XCTAssertEqual(restoredAfterApply.messages, restorationWindow.messages)
+        XCTAssertEqual(restoredAfterApply.knownMessageCount, 2_002)
+        XCTAssertEqual(
+            try CacheStore.cachedSessions(
+                serverURL: serverURL,
+                in: context,
+                now: cachedAt.addingTimeInterval(20)
+            ).map(\.title),
+            ["Metadata arrived later"]
+        )
+    }
+
+    func testRestorationCacheRequiresExactSavedAnchorIdentity() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let sessionID = "exact-restoration-anchor"
+        let messages = [
+            ChatMessage(
+                role: "assistant",
+                content: "Saved row",
+                timestamp: 1_000,
+                messageId: "saved-message"
+            ),
+        ]
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:42",
+            messageID: "saved-message",
+            offsetFromRowTop: 80
+        )
+
+        try CacheStore.cacheRestorationMessageWindow(
+            messages,
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 42,
+            position: savedPosition,
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        XCTAssertNotNil(
+            try CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: savedPosition,
+                in: context,
+                now: cachedAt.addingTimeInterval(1)
+            )
+        )
+        XCTAssertNil(
+            try CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: ChatTranscriptScrollPosition(
+                    renderID: "transcript:43",
+                    messageID: "saved-message",
+                    offsetFromRowTop: 80
+                ),
+                in: context,
+                now: cachedAt.addingTimeInterval(1)
+            )
+        )
+        XCTAssertNil(
+            try CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: ChatTranscriptScrollPosition(
+                    renderID: "transcript:42",
+                    messageID: "other-message",
+                    offsetFromRowTop: 80
+                ),
+                in: context,
+                now: cachedAt.addingTimeInterval(1)
+            )
+        )
+    }
+
+    func testFilteredSessionListRefreshPreservesLiveRestorationWindow()
+        throws
+    {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let sessionID = "deep-linked-session"
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:42",
+            messageID: "saved-message",
+            offsetFromRowTop: 80
+        )
+        try CacheStore.cacheSession(
+            SessionSummary(
+                sessionId: sessionID,
+                title: "Filtered metadata"
+            ),
+            serverURL: serverURL,
+            in: context,
+            cachedAt: cachedAt
+        )
+        try CacheStore.cacheRestorationMessageWindow(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Saved row",
+                    timestamp: 42,
+                    messageId: "saved-message"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 42,
+            position: position,
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        try CacheStore.cacheSessions(
+            [],
+            serverURL: serverURL,
+            in: context,
+            cachedAt: cachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertTrue(
+            try CacheStore.cachedSessions(
+                serverURL: serverURL,
+                in: context,
+                now: cachedAt.addingTimeInterval(61)
+            ).isEmpty
+        )
+        XCTAssertNotNil(
+            try CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: position,
+                in: context,
+                now: cachedAt.addingTimeInterval(61)
+            )
+        )
+    }
+
+    func testRestorationCacheExpiresIndependentlyFromRefreshedSessionMetadata() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let sessionID = "expired-restoration-window"
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:10",
+            messageID: "historical-10",
+            offsetFromRowTop: 20
+        )
+
+        try CacheStore.cacheRestorationMessageWindow(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Historical answer",
+                    timestamp: 10,
+                    messageId: "historical-10"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 10,
+            position: position,
+            in: context,
+            cachedAt: cachedAt
+        )
+        try CacheStore.cacheSession(
+            SessionSummary(
+                sessionId: sessionID,
+                title: "Still-current metadata"
+            ),
+            serverURL: serverURL,
+            in: context,
+            cachedAt: cachedAt.addingTimeInterval(
+                CachePolicy.restorationTTL - 60
+            )
+        )
+
+        let afterRestorationExpiry = cachedAt.addingTimeInterval(
+            CachePolicy.restorationTTL + 1
+        )
+        XCTAssertNil(
+            try CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: sessionID,
+                position: position,
+                in: context,
+                now: afterRestorationExpiry
+            )
+        )
+        XCTAssertEqual(
+            try CacheStore.cachedSessions(
+                serverURL: serverURL,
+                in: context,
+                now: afterRestorationExpiry
+            ).map(\.title),
+            ["Still-current metadata"]
+        )
+
+        try CacheStore.cacheMessages(
+            [],
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            cachedAt: afterRestorationExpiry
+        )
+        let cachedSession = try XCTUnwrap(
+            fetchCachedSessions(in: context).first {
+                $0.sessionID == sessionID
+            }
+        )
+        XCTAssertNil(cachedSession.restorationMessagesData)
+        XCTAssertNil(cachedSession.restorationMessageOffset)
+        XCTAssertNil(cachedSession.restorationAnchorRenderID)
+        XCTAssertNil(cachedSession.restorationAnchorMessageID)
+        XCTAssertNil(cachedSession.restorationCachedAt)
+        XCTAssertNil(cachedSession.restorationExpiresAt)
+    }
+
+    func testCacheMessagesBoundsProductionScaleSessionToRecentWindow() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let messages = (0..<2_091).map { index in
+            ChatMessage(
+                role: index.isMultiple(of: 4) ? "user" : "assistant",
+                content: "Synthetic large-session message \(index)",
+                timestamp: Double(index),
+                messageId: "message-\(index)"
+            )
+        }
+
+        try CacheStore.cacheMessages(
+            messages,
+            serverURL: serverURL,
+            sessionID: "production-scale",
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        let persistedMessages = try fetchCachedMessages(in: context)
+            .filter { $0.sessionID == "production-scale" }
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "production-scale",
+            in: context,
+            now: cachedAt.addingTimeInterval(60)
+        )
+        let expectedFirstIndex =
+            messages.count - CachePolicy.maxMessagesPerSession
+
+        XCTAssertEqual(
+            persistedMessages.count,
+            CachePolicy.maxMessagesPerSession
+        )
+        XCTAssertEqual(
+            window.messages.count,
+            CachePolicy.maxMessagesPerSession
+        )
+        XCTAssertEqual(
+            window.messages.first?.messageId,
+            "message-\(expectedFirstIndex)"
+        )
+        XCTAssertEqual(window.messages.last?.messageId, "message-2090")
+        XCTAssertEqual(window.messageOffset, expectedFirstIndex)
+        XCTAssertEqual(
+            Set(persistedMessages.compactMap(\.messageOffset)),
+            [expectedFirstIndex]
+        )
+    }
+
+    func testCachedMessageWindowBoundsOversizedLegacyStoreBeforeRendering() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+
+        for index in 0..<2_091 {
+            context.insert(
+                CachedMessage(
+                    serverURLString: serverURL.absoluteString,
+                    sessionID: "legacy-production-scale",
+                    message: ChatMessage(
+                        role: "assistant",
+                        content: "Legacy cached message \(index)",
+                        timestamp: Double(index),
+                        messageId: "legacy-\(index)"
+                    ),
+                    sortIndex: index,
+                    messageOffset: 0,
+                    cachedAt: cachedAt
+                )
+            )
+        }
+        try context.save()
+
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "legacy-production-scale",
+            in: context,
+            now: cachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(
+            window.messages.count,
+            CachePolicy.maxMessagesPerSession
+        )
+        XCTAssertEqual(window.messages.first?.messageId, "legacy-1891")
+        XCTAssertEqual(window.messages.last?.messageId, "legacy-2090")
+        XCTAssertEqual(window.messageOffset, 1_891)
+    }
+
+    func testCacheMessagesBulkReplacesOversizedLegacySession() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let legacyCachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let replacementCachedAt = legacyCachedAt.addingTimeInterval(60)
+        let sessionID = "legacy-bulk-replacement"
+
+        for index in 0..<2_091 {
+            context.insert(
+                CachedMessage(
+                    serverURLString: serverURL.absoluteString,
+                    sessionID: sessionID,
+                    message: ChatMessage(
+                        role: "assistant",
+                        content: "Legacy \(index)",
+                        timestamp: Double(index),
+                        messageId: "legacy-\(index)"
+                    ),
+                    sortIndex: index,
+                    messageOffset: 0,
+                    cachedAt: legacyCachedAt
+                )
+            )
+        }
+        try context.save()
+
+        let replacementMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Current question",
+                timestamp: 2_091,
+                messageId: "current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Current answer",
+                timestamp: 2_092,
+                messageId: "current-assistant"
+            ),
+        ]
+        try CacheStore.cacheMessages(
+            replacementMessages,
+            serverURL: serverURL,
+            sessionID: sessionID,
+            messageOffset: 2_091,
+            in: context,
+            cachedAt: replacementCachedAt
+        )
+
+        let persistedMessages = try fetchCachedMessages(in: context)
+            .filter { $0.sessionID == sessionID }
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: replacementCachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(
+            persistedMessages.compactMap(\.messageId).sorted(),
+            ["current-assistant", "current-user"]
+        )
+        XCTAssertEqual(window.messages, replacementMessages)
+        XCTAssertEqual(window.messageOffset, 2_091)
+    }
+
+    func testCacheWriteDeletesProductionScaleExpiredRowsDuringMaintenance() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let now = Date(timeIntervalSince1970: 1_770_000_000)
+        let expiredCachedAt = now
+            .addingTimeInterval(-CachePolicy.ttl - 60)
+
+        for index in 0..<2_091 {
+            context.insert(
+                CachedMessage(
+                    serverURLString: serverURL.absoluteString,
+                    sessionID: "expired-production-scale",
+                    message: ChatMessage(
+                        role: "assistant",
+                        content: "Expired cached message \(index)",
+                        timestamp: Double(index),
+                        messageId: "expired-\(index)"
+                    ),
+                    sortIndex: index,
+                    messageOffset: 0,
+                    cachedAt: expiredCachedAt
+                )
+            )
+        }
+        try context.save()
+
+        XCTAssertEqual(try fetchCachedMessages(in: context).count, 2_091)
+
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "user",
+                    content: "Fresh cached message",
+                    timestamp: now.timeIntervalSince1970,
+                    messageId: "fresh"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "fresh-session",
+            in: context,
+            cachedAt: now
+        )
+
+        let persistedMessages = try fetchCachedMessages(in: context)
+        XCTAssertEqual(
+            persistedMessages.compactMap(\.messageId),
+            ["fresh"]
+        )
+        XCTAssertFalse(
+            persistedMessages.contains {
+                $0.sessionID == "expired-production-scale"
+            }
+        )
+    }
+
+    func testCachedMessageWindowFiltersExpiredRowsBeforeApplyingFetchLimit() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let sessionID = "mixed-expiry"
+        let now = Date(timeIntervalSince1970: 1_770_000_000)
+        let validCachedAt = now
+            .addingTimeInterval(-CachePolicy.ttl + 60)
+        let expiredCachedAt = now
+            .addingTimeInterval(-CachePolicy.ttl - 60)
+
+        for index in 0..<3 {
+            context.insert(
+                CachedMessage(
+                    serverURLString: serverURL.absoluteString,
+                    sessionID: sessionID,
+                    message: ChatMessage(
+                        role: "assistant",
+                        content: "Valid cached message \(index)",
+                        timestamp: Double(index),
+                        messageId: "valid-\(index)"
+                    ),
+                    sortIndex: index,
+                    messageOffset: 0,
+                    cachedAt: validCachedAt
+                )
+            )
+        }
+
+        for index in 0..<CachePolicy.maxMessagesPerSession {
+            let sortIndex = 1_000 + index
+            context.insert(
+                CachedMessage(
+                    serverURLString: serverURL.absoluteString,
+                    sessionID: sessionID,
+                    message: ChatMessage(
+                        role: "assistant",
+                        content: "Expired cached message \(index)",
+                        timestamp: Double(sortIndex),
+                        messageId: "expired-\(index)"
+                    ),
+                    sortIndex: sortIndex,
+                    messageOffset: 1_000,
+                    cachedAt: expiredCachedAt
+                )
+            )
+        }
+        try context.save()
+
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: now
+        )
+
+        XCTAssertEqual(
+            window.messages.compactMap(\.messageId),
+            ["valid-0", "valid-1", "valid-2"]
+        )
+        XCTAssertEqual(window.messageOffset, 0)
+    }
+
     func testCacheSessionUpsertsOneSessionWithoutRemovingExistingSessions() throws {
         let context = try makeContext()
         let serverURL = URL(string: "https://example.test")!

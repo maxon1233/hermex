@@ -23,7 +23,11 @@ enum CacheStore {
         )
 
         return try context.fetch(descriptor)
-            .filter { $0.archived != true && $0.expiresAt > now }
+            .filter {
+                $0.hasSessionMetadata != false
+                    && $0.archived != true
+                    && $0.expiresAt > now
+            }
             .map(SessionSummary.init(cachedSession:))
     }
 
@@ -50,15 +54,19 @@ enum CacheStore {
         now: Date = Date()
     ) throws -> CachedMessageWindow {
         let serverURLString = serverURL.absoluteString
-        let descriptor = FetchDescriptor<CachedMessage>(
+        var descriptor = FetchDescriptor<CachedMessage>(
             predicate: #Predicate { cachedMessage in
                 cachedMessage.serverURLString == serverURLString
                     && cachedMessage.sessionID == sessionID
-            }
+                    && cachedMessage.expiresAt > now
+            },
+            sortBy: [
+                SortDescriptor(\CachedMessage.sortIndex, order: .reverse)
+            ]
         )
+        descriptor.fetchLimit = CachePolicy.maxMessagesPerSession
 
         let cachedMessages = try context.fetch(descriptor)
-            .filter { $0.expiresAt > now }
             .sorted { $0.sortIndex < $1.sortIndex }
         guard !cachedMessages.isEmpty else {
             return CachedMessageWindow(
@@ -97,6 +105,52 @@ enum CacheStore {
         )
     }
 
+    /// Returns the independently cached historical window only when it belongs
+    /// to the exact saved row. A cache entry for a previous reading position
+    /// must never be reused for a newer or otherwise ambiguous anchor.
+    @MainActor
+    static func cachedRestorationMessageWindow(
+        serverURL: URL,
+        sessionID: String,
+        position: ChatTranscriptScrollPosition,
+        in context: ModelContext,
+        now: Date = Date()
+    ) throws -> CachedMessageWindow? {
+        let serverURLString = serverURL.absoluteString
+        let cacheKey = CachedSession.cacheKey(
+            serverURLString: serverURLString,
+            sessionID: sessionID
+        )
+        guard let cachedSession = try cachedSession(
+            cacheKey: cacheKey,
+            in: context
+        ),
+        cachedSession.restorationAnchorRenderID == position.renderID,
+        cachedSession.restorationAnchorMessageID == position.messageID,
+        let expiresAt = cachedSession.restorationExpiresAt,
+        expiresAt > now,
+        let messageOffset = cachedSession.restorationMessageOffset,
+        let data = cachedSession.restorationMessagesData,
+        let payloads = try? JSONDecoder().decode(
+            [CachedRestorationMessagePayload].self,
+            from: data
+        ),
+        let boundedWindow = boundedRestorationWindow(
+            payloads.map(\.message),
+            messageOffset: messageOffset,
+            containing: position
+        ) else {
+            return nil
+        }
+
+        return CachedMessageWindow(
+            messages: boundedWindow.messages,
+            messageOffset: boundedWindow.messageOffset,
+            hasPersistedMessageOffset: true,
+            knownMessageCount: cachedSession.messageCount
+        )
+    }
+
     @MainActor
     static func cacheSessions(
         _ sessions: [SessionSummary],
@@ -128,7 +182,18 @@ enum CacheStore {
         )
         let staleSessions = try context.fetch(descriptor).filter { !freshKeys.contains($0.cacheKey) }
         for staleSession in staleSessions {
-            context.delete(staleSession)
+            if let restorationExpiresAt =
+                    staleSession.restorationExpiresAt,
+               restorationExpiresAt > cachedAt {
+                // The visible session list is filtered (for example delegated,
+                // hidden-source, or deep-linked sessions). Retire stale list
+                // metadata without deleting an independently live reading
+                // position cache.
+                staleSession.hasSessionMetadata = false
+                staleSession.expiresAt = cachedAt
+            } else {
+                context.delete(staleSession)
+            }
         }
 
         try performMaintenance(in: context, now: cachedAt)
@@ -171,17 +236,42 @@ enum CacheStore {
         cachedAt: Date = Date()
     ) throws {
         let serverURLString = serverURL.absoluteString
+        let droppedMessageCount = max(
+            0,
+            messages.count - CachePolicy.maxMessagesPerSession
+        )
+        let cacheableMessages = Array(messages.dropFirst(droppedMessageCount))
         let resolvedMessageOffset = max(0, messageOffset)
-        let freshKeys = Set(messages.enumerated().map { offset, message in
-            CachedMessage.cacheKey(
-                serverURLString: serverURLString,
-                sessionID: sessionID,
-                message: message,
-                sortIndex: resolvedMessageOffset + offset
-            )
-        })
+            + droppedMessageCount
 
-        for (offset, message) in messages.enumerated() {
+        let sessionPredicate = #Predicate<CachedMessage> { cachedMessage in
+            cachedMessage.serverURLString == serverURLString
+                && cachedMessage.sessionID == sessionID
+        }
+        let descriptor = FetchDescriptor<CachedMessage>(
+            predicate: sessionPredicate
+        )
+        let existingMessageCount = try context.fetchCount(descriptor)
+        let existingMessages: [CachedMessage]
+        if existingMessageCount > CachePolicy.maxMessagesPerSession {
+            // Oversized stores were created by the old restoration catch-up
+            // loop. Delete that session in one store operation rather than
+            // materializing and deleting thousands of models on the main actor.
+            try context.delete(
+                model: CachedMessage.self,
+                where: sessionPredicate
+            )
+            existingMessages = []
+        } else {
+            existingMessages = try context.fetch(descriptor)
+        }
+        var existingMessagesByKey: [String: CachedMessage] = [:]
+        existingMessagesByKey.reserveCapacity(existingMessages.count)
+        for cachedMessage in existingMessages {
+            existingMessagesByKey[cachedMessage.cacheKey] = cachedMessage
+        }
+
+        for (offset, message) in cacheableMessages.enumerated() {
             let absoluteSortIndex = resolvedMessageOffset + offset
             let cacheKey = CachedMessage.cacheKey(
                 serverURLString: serverURLString,
@@ -189,7 +279,9 @@ enum CacheStore {
                 message: message,
                 sortIndex: absoluteSortIndex
             )
-            if let cachedMessage = try cachedMessage(cacheKey: cacheKey, in: context) {
+            if let cachedMessage = existingMessagesByKey.removeValue(
+                forKey: cacheKey
+            ) {
                 cachedMessage.apply(
                     message,
                     sortIndex: absoluteSortIndex,
@@ -208,18 +300,74 @@ enum CacheStore {
             }
         }
 
-        let descriptor = FetchDescriptor<CachedMessage>(
-            predicate: #Predicate { cachedMessage in
-                cachedMessage.serverURLString == serverURLString
-                    && cachedMessage.sessionID == sessionID
-            }
-        )
-        let staleMessages = try context.fetch(descriptor).filter { !freshKeys.contains($0.cacheKey) }
-        for staleMessage in staleMessages {
+        for staleMessage in existingMessagesByKey.values {
             context.delete(staleMessage)
         }
 
         try performMaintenance(in: context, now: cachedAt)
+        try context.save()
+    }
+
+    /// Persists one small historical window alongside, but never in place of,
+    /// the ordinary latest-message rows. The payload is centered around the
+    /// requested anchor before encoding so oversized responses remain bounded.
+    @MainActor
+    static func cacheRestorationMessageWindow(
+        _ messages: [ChatMessage],
+        serverURL: URL,
+        sessionID: String,
+        messageOffset: Int,
+        position: ChatTranscriptScrollPosition,
+        in context: ModelContext,
+        cachedAt: Date = Date()
+    ) throws {
+        guard let boundedWindow = boundedRestorationWindow(
+            messages,
+            messageOffset: messageOffset,
+            containing: position
+        ) else {
+            return
+        }
+
+        let payloads = boundedWindow.messages.map(
+            CachedRestorationMessagePayload.init(message:)
+        )
+        let data = try JSONEncoder().encode(payloads)
+        let serverURLString = serverURL.absoluteString
+        let cacheKey = CachedSession.cacheKey(
+            serverURLString: serverURLString,
+            sessionID: sessionID
+        )
+        let restorationSession: CachedSession
+        if let existingSession = try cachedSession(
+            cacheKey: cacheKey,
+            in: context
+        ) {
+            restorationSession = existingSession
+        } else {
+            let newSession = CachedSession(
+                serverURLString: serverURLString,
+                sessionID: sessionID,
+                cachedAt: cachedAt
+            )
+            context.insert(newSession)
+            restorationSession = newSession
+        }
+
+        restorationSession.restorationMessagesData = data
+        restorationSession.restorationMessageOffset =
+            boundedWindow.messageOffset
+        restorationSession.restorationAnchorRenderID = position.renderID
+        restorationSession.restorationAnchorMessageID = position.messageID
+        restorationSession.restorationCachedAt = cachedAt
+        restorationSession.restorationExpiresAt = cachedAt.addingTimeInterval(
+            CachePolicy.restorationTTL
+        )
+
+        // Reading-position commits happen immediately after scrolling settles.
+        // Avoid a global cache-maintenance scan on that UI-sensitive path; all
+        // reads enforce the restoration TTL, and ordinary cache refreshes still
+        // perform physical cleanup.
         try context.save()
     }
 
@@ -268,49 +416,70 @@ enum CacheStore {
 
     @MainActor
     private static func performMaintenance(in context: ModelContext, now: Date) throws {
+        try clearExpiredRestorationWindows(in: context, now: now)
         try deleteExpiredSessions(in: context, now: now)
         try deleteExpiredMessages(in: context, now: now)
         try evictOldestMessagesIfNeeded(in: context)
     }
 
     @MainActor
+    private static func clearExpiredRestorationWindows(
+        in context: ModelContext,
+        now: Date
+    ) throws {
+        let descriptor = FetchDescriptor<CachedSession>()
+        let expiredWindows = try context.fetch(descriptor).filter {
+            guard let expiresAt = $0.restorationExpiresAt else {
+                return false
+            }
+            return expiresAt <= now
+        }
+
+        for cachedSession in expiredWindows {
+            clearRestorationWindow(on: cachedSession)
+        }
+    }
+
+    @MainActor
     private static func deleteExpiredSessions(in context: ModelContext, now: Date) throws {
         let descriptor = FetchDescriptor<CachedSession>()
-        let expiredSessions = try context.fetch(descriptor).filter { $0.expiresAt <= now }
-        for session in expiredSessions {
-            context.delete(session)
+        let expiredSessions = try context.fetch(descriptor).filter {
+            $0.expiresAt <= now
+                && ($0.restorationExpiresAt == nil
+                    || $0.restorationExpiresAt! <= now)
+        }
+        for cachedSession in expiredSessions {
+            context.delete(cachedSession)
         }
     }
 
     @MainActor
     private static func deleteExpiredMessages(in context: ModelContext, now: Date) throws {
-        let descriptor = FetchDescriptor<CachedMessage>()
-        let expiredMessages = try context.fetch(descriptor).filter { $0.expiresAt <= now }
-        for message in expiredMessages {
-            context.delete(message)
-        }
+        try context.delete(
+            model: CachedMessage.self,
+            where: #Predicate { cachedMessage in
+                cachedMessage.expiresAt <= now
+            }
+        )
     }
 
     @MainActor
     private static func evictOldestMessagesIfNeeded(in context: ModelContext) throws {
-        let descriptor = FetchDescriptor<CachedMessage>()
-        let messages = try context.fetch(descriptor)
-        let overflowCount = messages.count - CachePolicy.maxMessages
+        let totalCount = try context.fetchCount(
+            FetchDescriptor<CachedMessage>()
+        )
+        let overflowCount = totalCount - CachePolicy.maxMessages
         guard overflowCount > 0 else { return }
 
-        let messagesToEvict = messages
-            .sorted { left, right in
-                if left.cachedAt != right.cachedAt {
-                    return left.cachedAt < right.cachedAt
-                }
-
-                if left.timestamp != right.timestamp {
-                    return (left.timestamp ?? 0) < (right.timestamp ?? 0)
-                }
-
-                return left.sortIndex < right.sortIndex
-            }
-            .prefix(overflowCount)
+        var descriptor = FetchDescriptor<CachedMessage>(
+            sortBy: [
+                SortDescriptor(\CachedMessage.cachedAt),
+                SortDescriptor(\CachedMessage.timestamp),
+                SortDescriptor(\CachedMessage.sortIndex),
+            ]
+        )
+        descriptor.fetchLimit = overflowCount
+        let messagesToEvict = try context.fetch(descriptor)
 
         for message in messagesToEvict {
             context.delete(message)
@@ -337,6 +506,122 @@ enum CacheStore {
         )
         descriptor.fetchLimit = 1
         return try context.fetch(descriptor).first
+    }
+
+    nonisolated private static func boundedRestorationWindow(
+        _ messages: [ChatMessage],
+        messageOffset: Int,
+        containing position: ChatTranscriptScrollPosition
+    ) -> (messages: [ChatMessage], messageOffset: Int)? {
+        guard !messages.isEmpty else { return nil }
+
+        let resolvedOffset = max(0, messageOffset)
+        let visibleRows = messages.enumerated().compactMap {
+            loadedIndex,
+            message -> (loadedIndex: Int, identity: ChatTranscriptRowIdentity)?
+            in
+            guard message.role != "tool",
+                  !TranscriptTurnClassifier.isToolResultOnlyMessage(message)
+            else {
+                return nil
+            }
+
+            return (
+                loadedIndex,
+                ChatTranscriptRowIdentity(
+                    renderID: "transcript:\(resolvedOffset + loadedIndex)",
+                    messageID: ChatTranscriptMessageIdentity.resolve(
+                        for: message
+                    )
+                )
+            )
+        }
+        guard let matchingVisibleIndex =
+                ChatTranscriptReadingPositionResolver.matchingRowIndex(
+                    for: position,
+                    identities: visibleRows.map(\.identity)
+                )
+        else {
+            return nil
+        }
+
+        let maximumCount =
+            CachePolicy.maxRestorationMessagesPerSession
+        guard messages.count > maximumCount else {
+            return (messages, resolvedOffset)
+        }
+
+        let matchingLoadedIndex =
+            visibleRows[matchingVisibleIndex].loadedIndex
+        let maximumStartIndex = messages.count - maximumCount
+        let preferredStartIndex = max(
+            0,
+            matchingLoadedIndex - (maximumCount / 2)
+        )
+        let startIndex = min(preferredStartIndex, maximumStartIndex)
+        let endIndex = startIndex + maximumCount
+
+        return (
+            Array(messages[startIndex..<endIndex]),
+            resolvedOffset + startIndex
+        )
+    }
+
+    private static func clearRestorationWindow(
+        on cachedSession: CachedSession
+    ) {
+        cachedSession.restorationMessagesData = nil
+        cachedSession.restorationMessageOffset = nil
+        cachedSession.restorationAnchorRenderID = nil
+        cachedSession.restorationAnchorMessageID = nil
+        cachedSession.restorationCachedAt = nil
+        cachedSession.restorationExpiresAt = nil
+    }
+}
+
+/// A stable Codable representation used only inside CachedSession's restoration
+/// Data blob. ChatMessage intentionally remains decode-only at the API boundary.
+private struct CachedRestorationMessagePayload: Codable {
+    let role: String?
+    let content: String?
+    let timestamp: Double?
+    let messageID: String?
+    let name: String?
+    let toolCallID: String?
+    let toolUseID: String?
+    let toolCalls: [JSONValue]?
+    let contentParts: [JSONValue]?
+    let reasoning: String?
+    let attachments: [MessageAttachment]?
+
+    init(message: ChatMessage) {
+        role = message.role
+        content = message.content
+        timestamp = message.timestamp
+        messageID = message.messageId
+        name = message.name
+        toolCallID = message.toolCallId
+        toolUseID = message.toolUseId
+        toolCalls = message.toolCalls
+        contentParts = message.contentParts
+        reasoning = message.reasoning
+        attachments = message.attachments
+    }
+
+    var message: ChatMessage {
+        ChatMessage(
+            role: role,
+            content: content,
+            timestamp: timestamp,
+            messageId: messageID,
+            name: name,
+            toolCallId: toolCallID,
+            toolUseId: toolUseID,
+            toolCalls: toolCalls,
+            contentParts: contentParts,
+            reasoning: reasoning,
+            attachments: attachments
+        )
     }
 }
 

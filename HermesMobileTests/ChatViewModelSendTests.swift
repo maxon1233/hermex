@@ -10,6 +10,7 @@ final class ChatViewModelSendTests: XCTestCase {
     override func tearDown() {
         ChatViewModel.resetActiveStreamSnapshotsForTesting()
         MockURLProtocol.requestHandler = nil
+        DeferredChatMockURLProtocol.onRequest = nil
         super.tearDown()
     }
 
@@ -1918,6 +1919,92 @@ final class ChatViewModelSendTests: XCTestCase {
         assertMemoMatchesPureMapping("memo should match after a second content edit")
     }
 
+    func testTranscriptMappingReusesUnchangedIDLessIdentitiesDuringStreamingEdits() {
+        let firstHistoryText = String(repeating: "Older memory one. ", count: 500)
+        let secondHistoryText = String(repeating: "Older memory two. ", count: 500)
+        var messages = [
+            ChatMessage(
+                role: "user",
+                content: firstHistoryText,
+                timestamp: 1,
+                messageId: nil
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: secondHistoryText,
+                timestamp: 2,
+                messageId: nil
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Streaming",
+                timestamp: 3,
+                messageId: "streaming-row"
+            ),
+        ]
+        var resolvedContents: [String] = []
+        let resolver: (ChatMessage) -> String = { message in
+            resolvedContents.append(message.content ?? "")
+            return ChatTranscriptMessageIdentity.resolve(for: message)
+        }
+
+        let firstMapping = ChatViewModel.transcriptMessages(
+            from: messages,
+            messageOffset: 100,
+            persistenceIdentityResolver: resolver
+        )
+        XCTAssertEqual(resolvedContents.count, 3)
+
+        resolvedContents = []
+        messages[2] = ChatMessage(
+            role: "assistant",
+            content: "Streaming response grew",
+            timestamp: 3,
+            messageId: "streaming-row"
+        )
+        let secondMapping = ChatViewModel.transcriptMessages(
+            from: messages,
+            messageOffset: 100,
+            reusing: firstMapping,
+            persistenceIdentityResolver: resolver
+        )
+
+        XCTAssertEqual(resolvedContents, ["Streaming response grew"])
+        XCTAssertEqual(
+            secondMapping[0].persistenceMessageID,
+            firstMapping[0].persistenceMessageID
+        )
+        XCTAssertEqual(
+            secondMapping[1].persistenceMessageID,
+            firstMapping[1].persistenceMessageID
+        )
+
+        resolvedContents = []
+        let editedHistoryText = firstHistoryText + "Edited."
+        messages[0] = ChatMessage(
+            role: "user",
+            content: editedHistoryText,
+            timestamp: 1,
+            messageId: nil
+        )
+        let thirdMapping = ChatViewModel.transcriptMessages(
+            from: messages,
+            messageOffset: 100,
+            reusing: secondMapping,
+            persistenceIdentityResolver: resolver
+        )
+
+        XCTAssertEqual(resolvedContents, [editedHistoryText])
+        XCTAssertNotEqual(
+            thirdMapping[0].persistenceMessageID,
+            secondMapping[0].persistenceMessageID
+        )
+        XCTAssertEqual(
+            thirdMapping[1].persistenceMessageID,
+            secondMapping[1].persistenceMessageID
+        )
+    }
+
     @MainActor
     func testInterimAssistantEventUpdatesTranscriptBeforeCompletion() async throws {
         let streamClient = SpySSEStreamingClient()
@@ -2175,6 +2262,159 @@ final class ChatViewModelSendTests: XCTestCase {
             XCTAssertEqual(replayQueryItems.first(where: { $0.name == "after_seq" })?.value, "9")
             XCTAssertEqual(reopenedViewModel.messages.compactMap(\.content), ["Keep working", "Partial live answer."])
         }
+    }
+
+    @MainActor
+    func testReopenedActiveStreamBoundsExpandedSnapshotAndPreservesReplayCursor() async throws {
+        ChatViewModel.resetActiveStreamSnapshotsForTesting()
+        defer { ChatViewModel.resetActiveStreamSnapshotsForTesting() }
+
+        let olderMessagesJSON = (0..<450).map { index in
+            """
+            {
+              "role": "\(index.isMultiple(of: 2) ? "user" : "assistant")",
+              "content": "History \(index)",
+              "timestamp": \(index),
+              "message_id": "history-\(index)"
+            }
+            """
+        }.joined(separator: ",")
+        let originalStreamClient = SpySSEStreamingClient()
+        let originalViewModel = try makeViewModel(streamClient: originalStreamClient) { request in
+            switch request.url?.path {
+            case "/api/session":
+                let components = URLComponents(
+                    url: try XCTUnwrap(request.url),
+                    resolvingAgainstBaseURL: false
+                )
+                let query = Dictionary(
+                    uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                        ($0.name, $0.value ?? "")
+                    }
+                )
+                if query["msg_before"] == "450" {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "messages": [\(olderMessagesJSON)],
+                        "_messages_truncated": false,
+                        "_messages_offset": 0
+                      }
+                    }
+                    """, for: request)
+                }
+
+                XCTAssertNil(query["msg_before"])
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {
+                        "role": "user",
+                        "content": "Recent question",
+                        "timestamp": 450,
+                        "message_id": "recent-user"
+                      },
+                      {
+                        "role": "assistant",
+                        "content": "Recent answer",
+                        "timestamp": 451,
+                        "message_id": "recent-assistant"
+                      }
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 450
+                  }
+                }
+                """, for: request)
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await originalViewModel.loadMessages()
+        let didStart = await originalViewModel.sendMessage("Keep working")
+        XCTAssertTrue(didStart)
+        originalStreamClient.emit(
+            .token("Partial live answer."),
+            lastEventID: "session-abc:12"
+        )
+        let didLoadOlder = await originalViewModel.loadOlderMessages()
+
+        XCTAssertTrue(didLoadOlder)
+        XCTAssertEqual(originalViewModel.messages.count, 454)
+        XCTAssertEqual(originalViewModel.messagesOffset, 0)
+        originalViewModel.suspendStreamForNavigation()
+
+        let reopenedStreamClient = SpySSEStreamingClient()
+        let reopenedViewModel = try makeViewModel(streamClient: reopenedStreamClient) { request in
+            switch request.url?.path {
+            case "/api/session":
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "active_stream_id": "stream-123",
+                    "message_count": 454,
+                    "messages": [],
+                    "_messages_truncated": true,
+                    "_messages_offset": 454
+                  }
+                }
+                """, for: request)
+            case "/api/chat/stream/status":
+                return apiTestJSONResponse("""
+                {
+                  "active": false,
+                  "stream_id": "stream-123",
+                  "replay_available": true
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await reopenedViewModel.loadMessages()
+        await reopenedViewModel.reconnectStreamIfNeeded()
+
+        XCTAssertLessThanOrEqual(
+            reopenedViewModel.messages.count,
+            ChatViewModel.automaticMessageWindowLimit
+        )
+        XCTAssertEqual(reopenedViewModel.messages.count, 400)
+        XCTAssertEqual(reopenedViewModel.messagesOffset, 54)
+        XCTAssertTrue(reopenedViewModel.hasOlderMessages)
+        XCTAssertEqual(reopenedViewModel.messages.first?.messageId, "history-54")
+        XCTAssertEqual(reopenedViewModel.messages.last?.content, "Partial live answer.")
+
+        let replayURL = try XCTUnwrap(reopenedStreamClient.startedURLs.last)
+        let replayQueryItems =
+            URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?
+                .queryItems ?? []
+        XCTAssertEqual(
+            replayQueryItems.first(where: { $0.name == "stream_id" })?.value,
+            "stream-123"
+        )
+        XCTAssertEqual(
+            replayQueryItems.first(where: { $0.name == "replay" })?.value,
+            "1"
+        )
+        XCTAssertEqual(
+            replayQueryItems.first(where: { $0.name == "after_seq" })?.value,
+            "12"
+        )
     }
 
     @MainActor
@@ -2542,6 +2782,81 @@ final class ChatViewModelSendTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testCompletedStreamSessionRebasesBothTransientRowsAcrossToolRows()
+        async throws
+    {
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse("""
+            {
+              "session_id": "session-abc",
+              "stream_id": "stream-123"
+            }
+            """, for: request)
+        }
+
+        let didStart = await viewModel.sendMessage("Inspect it")
+        XCTAssertTrue(didStart)
+        let optimisticUserMessageID = try XCTUnwrap(
+            viewModel.messages.first?.messageId
+        )
+        streamClient.emit(.token("Final answer"))
+        let transientAssistantMessageID = try XCTUnwrap(
+            viewModel.streamingAssistantMessageID
+        )
+        let completedSession = try makeSessionDetail("""
+        {
+          "session_id": "session-abc",
+          "messages": [
+            {"role":"user","content":"Inspect it","message_id":"user-final"},
+            {
+              "role":"assistant",
+              "content":"",
+              "message_id":"assistant-tool",
+              "tool_calls":[{
+                "id":"call-1",
+                "function":{"name":"terminal","arguments":"{}"}
+              }]
+            },
+            {
+              "role":"tool",
+              "content":"done",
+              "message_id":"tool-result",
+              "tool_call_id":"call-1"
+            },
+            {
+              "role":"assistant",
+              "content":"Final answer",
+              "message_id":"assistant-final"
+            }
+          ]
+        }
+        """)
+
+        streamClient.emit(.done(DoneStreamEvent(session: completedSession)))
+
+        XCTAssertFalse(viewModel.responseCompletionNeedsTranscriptRefresh)
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.mappings.count, 2)
+        let userMapping = try XCTUnwrap(event.mappings.first(where: {
+            $0.sourceMessageID == optimisticUserMessageID
+        }))
+        XCTAssertEqual(userMapping.sourceRenderID, "transcript:0")
+        XCTAssertEqual(userMapping.targetRenderID, "transcript:0")
+        XCTAssertEqual(userMapping.targetMessageID, "user-final")
+        let assistantMapping = try XCTUnwrap(event.mappings.first(where: {
+            $0.sourceMessageID == transientAssistantMessageID
+        }))
+        XCTAssertEqual(assistantMapping.sourceRenderID, "transcript:1")
+        XCTAssertEqual(assistantMapping.targetRenderID, "transcript:3")
+        XCTAssertEqual(assistantMapping.targetMessageID, "assistant-final")
+        XCTAssertEqual(viewModel.messages.last?.messageId, "assistant-final")
+    }
+
     func testDoneWithoutCompletedSessionRequiresFollowUpTranscriptRefresh() {
         runMainActorTest {
             let streamClient = SpySSEStreamingClient()
@@ -2560,11 +2875,869 @@ final class ChatViewModelSendTests: XCTestCase {
 
             streamClient.emit(.token("Done."))
             streamClient.emit(.done(DoneStreamEvent(session: nil)))
+            streamClient.emit(.streamEnd)
+            streamClient.emit(.streamEnd)
 
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
             XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
             XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done."])
+        }
+    }
+
+    @MainActor
+    func testCompletionRefreshRebasesTransientAssistantAcrossInsertedToolRows()
+        async throws
+    {
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            case "/api/session":
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {"role":"user","content":"Inspect it","message_id":"user-final"},
+                      {
+                        "role":"assistant",
+                        "content":"",
+                        "message_id":"assistant-tool",
+                        "tool_calls":[{
+                          "id":"call-1",
+                          "function":{"name":"terminal","arguments":"{}"}
+                        }]
+                      },
+                      {
+                        "role":"tool",
+                        "content":"done",
+                        "message_id":"tool-result",
+                        "tool_call_id":"call-1"
+                      },
+                      {
+                        "role":"assistant",
+                        "content":"Final answer",
+                        "message_id":"assistant-final"
+                      }
+                    ]
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("Inspect it")
+        XCTAssertTrue(didStart)
+        let optimisticUserMessageID = try XCTUnwrap(
+            viewModel.messages.first?.messageId
+        )
+        streamClient.emit(.token("Final answer"))
+        let transientMessageID = try XCTUnwrap(
+            viewModel.streamingAssistantMessageID
+        )
+        XCTAssertTrue(transientMessageID.hasPrefix("stream-"))
+
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+        let completionTrigger = viewModel.responseCompletionHapticTrigger
+        await viewModel.loadMessages(
+            allowsCacheFallback: false,
+            expectedResponseCompletionTrigger: completionTrigger
+        )
+
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.generation, 1)
+        XCTAssertEqual(event.mappings.count, 2)
+        let userMapping = try XCTUnwrap(event.mappings.first(where: {
+            $0.sourceMessageID == optimisticUserMessageID
+        }))
+        XCTAssertEqual(userMapping.sourceRenderID, "transcript:0")
+        XCTAssertEqual(userMapping.targetRenderID, "transcript:0")
+        XCTAssertEqual(userMapping.targetMessageID, "user-final")
+        let assistantMapping = try XCTUnwrap(event.mappings.first(where: {
+            $0.sourceMessageID == transientMessageID
+        }))
+        XCTAssertEqual(assistantMapping.sourceRenderID, "transcript:1")
+        XCTAssertEqual(assistantMapping.targetRenderID, "transcript:3")
+        XCTAssertEqual(assistantMapping.targetMessageID, "assistant-final")
+        XCTAssertEqual(viewModel.messages.last?.messageId, "assistant-final")
+    }
+
+    @MainActor
+    func testCompletionRefreshRebasesOptimisticUserWithoutAssistantMapping()
+        async throws
+    {
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            case "/api/session":
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {
+                        "role":"user",
+                        "content":"User-only anchor",
+                        "message_id":"authoritative-user"
+                      },
+                      {
+                        "role":"assistant",
+                        "content":"Authoritative answer",
+                        "message_id":"authoritative-assistant"
+                      }
+                    ]
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("User-only anchor")
+        XCTAssertTrue(didStart)
+        let optimisticUserMessageID = try XCTUnwrap(
+            viewModel.messages.first?.messageId
+        )
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+
+        await viewModel.loadMessages(
+            allowsCacheFallback: false,
+            expectedResponseCompletionTrigger:
+                viewModel.responseCompletionHapticTrigger
+        )
+
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.mappings.count, 1)
+        let mapping = try XCTUnwrap(event.mappings.first)
+        XCTAssertEqual(mapping.sourceRenderID, "transcript:0")
+        XCTAssertEqual(mapping.sourceMessageID, optimisticUserMessageID)
+        XCTAssertEqual(mapping.targetRenderID, "transcript:0")
+        XCTAssertEqual(mapping.targetMessageID, "authoritative-user")
+    }
+
+    @MainActor
+    func testCompletionRefreshRejectedAtEntryKeepsEarlyNextStreamTokenWithoutGET() async throws {
+        let chatStartCount = LockedCounter()
+        let sessionRequestCount = LockedCounter()
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                let requestNumber = chatStartCount.increment()
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-\(requestNumber)"
+                }
+                """, for: request)
+            case "/api/session":
+                _ = sessionRequestCount.increment()
+                XCTFail("A superseded completion refresh must not issue a session GET.")
+                return apiTestJSONResponse(#"{"session": null}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStartFirstQuestion = await viewModel.sendMessage("First question")
+        XCTAssertTrue(didStartFirstQuestion)
+        streamClient.emit(.token("First answer"))
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+        let completionTrigger = viewModel.responseCompletionHapticTrigger
+        XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
+
+        let didStartSecondQuestion = await viewModel.sendMessage("Second question")
+        XCTAssertTrue(didStartSecondQuestion)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-2")
+
+        streamClient.automaticallyFlushPendingStreamingContent = false
+        streamClient.emit(.token("Early second answer"))
+
+        await viewModel.loadMessages(
+            allowsCacheFallback: false,
+            expectedResponseCompletionTrigger: completionTrigger
+        )
+        viewModel.flushPendingStreamingContent()
+
+        XCTAssertEqual(sessionRequestCount.count, 0)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-2")
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "First question",
+            "First answer",
+            "Second question",
+            "Early second answer",
+        ])
+    }
+
+    @MainActor
+    func testCompletionRefreshCannotOverwriteQuickNextSend() async throws {
+        let sessionRequestStarted = expectation(
+            description: "completion session request started"
+        )
+        let releaseSessionResponse = DispatchSemaphore(value: 0)
+        let chatStartCount = LockedCounter()
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                let requestNumber = chatStartCount.increment()
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-\(requestNumber)"
+                }
+                """, for: request)
+            case "/api/session":
+                sessionRequestStarted.fulfill()
+                XCTAssertEqual(
+                    releaseSessionResponse.wait(
+                        timeout: .now() + .seconds(5)
+                    ),
+                    .success
+                )
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {"role":"user","content":"First question","message_id":"persisted-user-1"},
+                      {"role":"assistant","content":"First answer","message_id":"persisted-assistant-1"}
+                    ]
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStartFirstQuestion = await viewModel.sendMessage(
+            "First question"
+        )
+        XCTAssertTrue(didStartFirstQuestion)
+        streamClient.emit(.token("First answer"))
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+        let completionTrigger = viewModel.responseCompletionHapticTrigger
+        XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
+
+        let refreshTask = Task { @MainActor in
+            await viewModel.loadMessages(
+                allowsCacheFallback: false,
+                expectedResponseCompletionTrigger: completionTrigger
+            )
+        }
+        defer { releaseSessionResponse.signal() }
+        await fulfillment(of: [sessionRequestStarted], timeout: 2)
+
+        let secondSendTask = Task { @MainActor in
+            await viewModel.sendMessage("Second question")
+        }
+        try await waitUntil {
+            viewModel.messages.last?.content == "Second question"
+        }
+        XCTAssertEqual(viewModel.messages.last?.content, "Second question")
+
+        releaseSessionResponse.signal()
+        let didStartSecondQuestion = await secondSendTask.value
+        XCTAssertTrue(didStartSecondQuestion)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-2")
+
+        await refreshTask.value
+
+        XCTAssertEqual(viewModel.activeStreamID, "stream-2")
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "First question",
+            "First answer",
+            "Second question",
+        ])
+    }
+
+    @MainActor
+    func testCompletionRefreshRejectsSuccessfulButStaleTranscript() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            case "/api/session":
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {"role":"user","content":"Older question","message_id":"old-user"},
+                      {"role":"assistant","content":"Older answer","message_id":"old-assistant"}
+                    ]
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStartLatestQuestion = await viewModel.sendMessage(
+            "Latest question"
+        )
+        XCTAssertTrue(didStartLatestQuestion)
+        streamClient.emit(.token("Latest answer"))
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+        let completionTrigger = viewModel.responseCompletionHapticTrigger
+
+        await viewModel.loadMessages(
+            allowsCacheFallback: false,
+            expectedResponseCompletionTrigger: completionTrigger
+        )
+
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Latest question",
+            "Latest answer",
+        ])
+    }
+
+    func testLargeUnwindowedDoneAppliesBoundedTailWithoutFollowUpRefresh() {
+        runMainActorTest {
+            let streamClient = SpySSEStreamingClient()
+            let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await viewModel.sendMessage("Latest question")
+            XCTAssertTrue(didStart)
+            streamClient.emit(.token("Streamed answer"))
+
+            var messageObjects = (0..<2_089).map { index in
+                let role = index.isMultiple(of: 2) ? "user" : "assistant"
+                return """
+                {"role":"\(role)","content":"Historical \(index)","message_id":"history-\(index)"}
+                """
+            }
+            messageObjects.append(
+                """
+                {"role":"user","content":"Latest question","message_id":"persisted-user"}
+                """
+            )
+            messageObjects.append(
+                """
+                {"role":"assistant","content":"Streamed answer","message_id":"persisted-assistant"}
+                """
+            )
+            let messagesJSON = messageObjects.joined(separator: ",")
+            let completedSession = try self.makeSessionDetail("""
+            {
+              "session_id": "session-abc",
+              "title": "Mem0",
+              "message_count": 2091,
+              "messages": [\(messagesJSON)]
+            }
+            """)
+
+            streamClient.emit(.done(DoneStreamEvent(session: completedSession)))
+            streamClient.emit(.streamEnd)
+
+            XCTAssertNil(viewModel.activeStreamID)
+            XCTAssertEqual(viewModel.displayTitle, "Mem0")
+            XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
+            XCTAssertFalse(viewModel.responseCompletionNeedsTranscriptRefresh)
+            XCTAssertEqual(viewModel.messages.count, 50)
+            XCTAssertEqual(viewModel.messagesOffset, 2_041)
+            XCTAssertTrue(viewModel.hasOlderMessages)
+            XCTAssertEqual(viewModel.messages.first?.content, "Historical 2041")
+            XCTAssertEqual(viewModel.messages.suffix(2).compactMap(\.content), [
+                "Latest question",
+                "Streamed answer",
+            ])
+            XCTAssertEqual(viewModel.displayedTranscriptMessages.count, 50)
+        }
+    }
+
+    func testStaleLargeDoneKeepsStreamedTurnAndRequestsGuardedRefresh() {
+        runMainActorTest {
+            let streamClient = SpySSEStreamingClient()
+            let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStartLatestQuestion = await viewModel.sendMessage(
+                "Latest question"
+            )
+            XCTAssertTrue(didStartLatestQuestion)
+            streamClient.emit(.token("Streamed answer"))
+
+            let staleMessages = (0..<60).map { index in
+                """
+                {"role":"\(index.isMultiple(of: 2) ? "user" : "assistant")","content":"Stale \(index)","message_id":"stale-\(index)"}
+                """
+            }.joined(separator: ",")
+            let staleSession = try self.makeSessionDetail("""
+            {
+              "session_id": "session-abc",
+              "message_count": 60,
+              "messages": [\(staleMessages)]
+            }
+            """)
+
+            streamClient.emit(.done(DoneStreamEvent(session: staleSession)))
+
+            XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
+            XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+                "Latest question",
+                "Streamed answer",
+            ])
+        }
+    }
+
+    func testLargeUnwindowedDoneWithTrailingToolRowsKeepsStreamedTurnAndRequestsRefresh() {
+        runMainActorTest {
+            let streamClient = SpySSEStreamingClient()
+            let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await viewModel.sendMessage("Run the long tool")
+            XCTAssertTrue(didStart)
+            streamClient.emit(.token("Streamed answer"))
+
+            let trailingTools = (0..<60).map { index in
+                """
+                {
+                  "role": "tool",
+                  "content": "Tool result \(index)",
+                  "message_id": "tool-\(index)",
+                  "tool_call_id": "call-\(index)"
+                }
+                """
+            }.joined(separator: ",")
+            let completedSession = try self.makeSessionDetail("""
+            {
+              "session_id": "session-abc",
+              "message_count": 62,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Run the long tool",
+                  "message_id": "persisted-user"
+                },
+                {
+                  "role": "assistant",
+                  "content": "Streamed answer",
+                  "message_id": "persisted-assistant"
+                },
+                \(trailingTools)
+              ]
+            }
+            """)
+
+            streamClient.emit(.done(DoneStreamEvent(session: completedSession)))
+
+            XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
+            XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
+            XCTAssertEqual(viewModel.messagesOffset, 0)
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+                "Run the long tool",
+                "Streamed answer",
+            ])
+        }
+    }
+
+    func testWindowedDoneWhoseAutomaticBoundIsToolOnlyKeepsStreamedTurnAndRequestsRefresh() {
+        runMainActorTest {
+            let streamClient = SpySSEStreamingClient()
+            let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStart = await viewModel.sendMessage("Run the windowed tool")
+            XCTAssertTrue(didStart)
+            streamClient.emit(.token("Streamed answer"))
+
+            let trailingTools = (0..<401).map { index in
+                """
+                {
+                  "role": "tool",
+                  "content": "Windowed tool result \(index)",
+                  "message_id": "windowed-tool-\(index)",
+                  "tool_call_id": "windowed-call-\(index)"
+                }
+                """
+            }.joined(separator: ",")
+            let completedSession = try self.makeSessionDetail("""
+            {
+              "session_id": "session-abc",
+              "message_count": 903,
+              "_messages_truncated": true,
+              "_messages_offset": 500,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Run the windowed tool",
+                  "message_id": "persisted-windowed-user"
+                },
+                {
+                  "role": "assistant",
+                  "content": "Streamed answer",
+                  "message_id": "persisted-windowed-assistant"
+                },
+                \(trailingTools)
+              ]
+            }
+            """)
+
+            streamClient.emit(.done(DoneStreamEvent(session: completedSession)))
+
+            XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
+            XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
+            XCTAssertEqual(viewModel.messagesOffset, 0)
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+                "Run the windowed tool",
+                "Streamed answer",
+            ])
+        }
+    }
+
+    func testCompletionTurnMatchRejectsRepeatedPromptAtOlderAbsolutePosition() {
+        let currentMessages = [
+            ChatMessage(
+                role: "user",
+                content: "go ahead",
+                timestamp: 1_000,
+                messageId: "local-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Done.",
+                timestamp: 1_001,
+                messageId: "stream-current-assistant"
+            ),
+        ]
+        let staleMessages = [
+            ChatMessage(
+                role: "user",
+                content: "go ahead",
+                timestamp: 100,
+                messageId: "persisted-old-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Done.",
+                timestamp: 101,
+                messageId: "persisted-old-assistant"
+            ),
+        ]
+
+        XCTAssertFalse(
+            ChatViewModel.reloadedMessagesContainCurrentCompletedTurn(
+                staleMessages,
+                reloadedMessagesOffset: 40,
+                currentMessages: currentMessages,
+                currentMessagesOffset: 41
+            )
+        )
+    }
+
+    func testCompletionTurnMatchRejectsRecentRepeatedPromptAtOlderPosition() {
+        let currentMessages = [
+            ChatMessage(
+                role: "user",
+                content: "merge",
+                timestamp: 1_000,
+                messageId: "local-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Merged.",
+                timestamp: 1_001,
+                messageId: "stream-current-assistant"
+            ),
+        ]
+        let priorRepeatedTurn = [
+            ChatMessage(
+                role: "user",
+                content: "merge",
+                timestamp: 990,
+                messageId: "persisted-prior-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Merged.",
+                timestamp: 991,
+                messageId: "persisted-prior-assistant"
+            ),
+        ]
+
+        XCTAssertFalse(
+            ChatViewModel.reloadedMessagesContainCurrentCompletedTurn(
+                priorRepeatedTurn,
+                reloadedMessagesOffset: 80,
+                currentMessages: currentMessages,
+                currentMessagesOffset: 81
+            )
+        )
+    }
+
+    func testCompletionTurnMatchRejectsRepeatedPromptWhenPersistedTimestampIsMissing() {
+        let currentMessages = [
+            ChatMessage(
+                role: "user",
+                content: "yes",
+                timestamp: nil,
+                messageId: "persisted-prior-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "First answer.",
+                timestamp: nil,
+                messageId: "persisted-prior-assistant"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "yes",
+                timestamp: nil,
+                messageId: "local-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Second answer.",
+                timestamp: nil,
+                messageId: "stream-current-assistant"
+            ),
+        ]
+        let staleMessages = Array(currentMessages.prefix(2))
+
+        XCTAssertFalse(
+            ChatViewModel.reloadedMessagesContainCurrentCompletedTurn(
+                staleMessages,
+                reloadedMessagesOffset: 0,
+                currentMessages: currentMessages,
+                currentMessagesOffset: 0
+            )
+        )
+    }
+
+    func testCompletionTurnMatchAcceptsCurrentTurnPersistedAfterLongResponse() {
+        let currentMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Earlier prompt",
+                timestamp: 900,
+                messageId: "persisted-prior-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Earlier answer",
+                timestamp: 901,
+                messageId: "persisted-prior-assistant"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "Run the long task",
+                timestamp: 1_000,
+                messageId: "local-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Finished.",
+                timestamp: 1_001,
+                messageId: "stream-current-assistant"
+            ),
+        ]
+        let persistedMessages = [
+            currentMessages[0],
+            currentMessages[1],
+            ChatMessage(
+                role: "user",
+                content: "Run the long task",
+                timestamp: 1_180,
+                messageId: "persisted-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Finished.",
+                timestamp: 1_181,
+                messageId: "persisted-current-assistant"
+            ),
+        ]
+
+        XCTAssertTrue(
+            ChatViewModel.reloadedMessagesContainCurrentCompletedTurn(
+                persistedMessages,
+                reloadedMessagesOffset: 0,
+                currentMessages: currentMessages,
+                currentMessagesOffset: 0
+            )
+        )
+    }
+
+    func testCompletionTurnMatchRejectsEmptyAssistantsWithDifferentToolCalls() {
+        let currentMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Inspect it",
+                timestamp: 1_000,
+                messageId: "local-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "",
+                timestamp: 1_001,
+                messageId: "stream-current-assistant",
+                toolCalls: [
+                    .object([
+                        "id": .string("current-call"),
+                        "name": .string("read_file"),
+                    ]),
+                ]
+            ),
+        ]
+        let staleMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Inspect it",
+                timestamp: 1_000,
+                messageId: "persisted-current-user"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "",
+                timestamp: 1_001,
+                messageId: "persisted-current-assistant",
+                toolCalls: [
+                    .object([
+                        "id": .string("stale-call"),
+                        "name": .string("run_command"),
+                    ]),
+                ]
+            ),
+        ]
+
+        XCTAssertFalse(
+            ChatViewModel.reloadedMessagesContainCurrentCompletedTurn(
+                staleMessages,
+                reloadedMessagesOffset: 0,
+                currentMessages: currentMessages,
+                currentMessagesOffset: 0
+            )
+        )
+    }
+
+    func testPersistedToolCallsAreBoundedAndFilteredToAutomaticMessageWindow() {
+        let persistedToolCalls: [PersistedToolCall] = (0..<1_000).map { (index: Int) in
+            PersistedToolCall(
+                name: "tool-\(index)",
+                snippet: nil,
+                tid: "call-\(index)",
+                assistantMsgIdx: index,
+                args: nil
+            )
+        }
+
+        let retained = ChatViewModel.boundedPersistedToolCalls(
+            persistedToolCalls,
+            messageOffset: 900,
+            messageCount: 100
+        )
+
+        XCTAssertEqual(retained.count, 100)
+        XCTAssertEqual(retained.first?.assistantMsgIdx, 900)
+        XCTAssertEqual(retained.last?.assistantMsgIdx, 999)
+    }
+
+    func testCountOnlyCompletedWindowDerivesAbsoluteOffset() {
+        runMainActorTest {
+            let streamClient = SpySSEStreamingClient()
+            let viewModel = try self.makeViewModel(streamClient: streamClient) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/start")
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            }
+
+            let didStartLatestQuestion = await viewModel.sendMessage(
+                "Latest question"
+            )
+            XCTAssertTrue(didStartLatestQuestion)
+            streamClient.emit(.token("Latest answer"))
+            let completedSession = try self.makeSessionDetail("""
+            {
+              "session_id": "session-abc",
+              "message_count": 100,
+              "messages": [
+                {"role":"user","content":"Latest question","message_id":"user-98"},
+                {"role":"assistant","content":"Latest answer","message_id":"assistant-99"}
+              ]
+            }
+            """)
+
+            streamClient.emit(.done(DoneStreamEvent(session: completedSession)))
+
+            XCTAssertEqual(viewModel.messagesOffset, 98)
+            XCTAssertTrue(viewModel.hasOlderMessages)
+            XCTAssertFalse(viewModel.responseCompletionNeedsTranscriptRefresh)
+            XCTAssertEqual(viewModel.displayedTranscriptMessages.map(\.renderID), [
+                "transcript:98",
+                "transcript:99",
+            ])
         }
     }
 
@@ -3006,6 +4179,66 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testCompletionRefreshFailurePreservesJustStreamedResponseInsteadOfStaleCache() async throws {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let streamClient = SpySSEStreamingClient()
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Stale cached answer",
+                    timestamp: 1_770_000_000,
+                    messageId: "cached-assistant"
+                )
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            in: context
+        )
+
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            case "/api/session":
+                let response = HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 502,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "text/html"]
+                )
+                return (try XCTUnwrap(response), Data("bad gateway".utf8))
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didStart = await viewModel.sendMessage("Fresh question")
+        XCTAssertTrue(didStart)
+        streamClient.emit(.token("Fresh streamed answer"))
+        streamClient.emit(.done(DoneStreamEvent(session: nil)))
+
+        await viewModel.loadMessages(
+            modelContext: context,
+            allowsCacheFallback: false
+        )
+
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Fresh question",
+            "Fresh streamed answer"
+        ])
+        XCTAssertFalse(viewModel.isViewingCachedData)
+        XCTAssertNotNil(viewModel.lastError)
+    }
+
+    @MainActor
     func testLoadMessagesUsesCachedTranscriptForNetworkTimeout() async throws {
         let context = try makeContext()
         let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
@@ -3208,6 +4441,150 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedPositionCacheStaysVisibleAcrossDelayedLatestRefresh()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let cachedMessages = [
+            ChatMessage(
+                role: "assistant",
+                content: "Cached before",
+                timestamp: 1_770_000_084,
+                messageId: "cached-84"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "Saved row",
+                timestamp: 1_770_000_085,
+                messageId: "cached-85"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Cached after",
+                timestamp: 1_770_000_086,
+                messageId: "cached-86"
+            ),
+        ]
+        try CacheStore.cacheMessages(
+            cachedMessages,
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 84,
+            in: context
+        )
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:85",
+            messageID: "cached-85",
+            offsetFromRowTop: 310,
+            coordinateSpaceVersion: 2
+        )
+        let sessionRequestStarted = expectation(
+            description: "session request started"
+        )
+        let releaseSessionResponse = DispatchSemaphore(value: 0)
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            XCTAssertNil(
+                components?.queryItems?.first(where: {
+                    $0.name == "msg_before"
+                })
+            )
+            sessionRequestStarted.fulfill()
+            XCTAssertEqual(
+                releaseSessionResponse.wait(timeout: .now() + .seconds(5)),
+                .success
+            )
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 117,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Fresh question",
+                    "timestamp": 1770000114,
+                    "message_id": "fresh-114"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "Fresh answer",
+                    "timestamp": 1770000115,
+                    "message_id": "fresh-115"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "Fresh tail",
+                    "timestamp": 1770000116,
+                    "message_id": "fresh-116"
+                  }
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 114,
+                "compression_anchor_summary": "Fresh compressed context."
+              }
+            }
+            """, for: request)
+        }
+
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: savedPosition
+        )
+        XCTAssertEqual(viewModel.messages, cachedMessages)
+        XCTAssertEqual(viewModel.messagesOffset, 84)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertTrue(viewModel.hasOlderMessages)
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(
+                modelContext: context,
+                initialScrollPosition: savedPosition
+            )
+        }
+        defer { releaseSessionResponse.signal() }
+
+        await fulfillment(of: [sessionRequestStarted], timeout: 2)
+        XCTAssertEqual(viewModel.messages, cachedMessages)
+        XCTAssertEqual(viewModel.messagesOffset, 84)
+        XCTAssertTrue(viewModel.isLoading)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+
+        releaseSessionResponse.signal()
+        await loadTask.value
+
+        XCTAssertEqual(
+            viewModel.messages,
+            cachedMessages,
+            "The authoritative tail must not replace the restored visible window."
+        )
+        XCTAssertEqual(viewModel.messagesOffset, 84)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.cacheFirstReconcileScrollToken, 0)
+        XCTAssertNil(
+            viewModel.compressionReferenceCard,
+            "Fresh metadata must not insert a card into the restored cache."
+        )
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["fresh-114", "fresh-115", "fresh-116"]
+        )
+        XCTAssertEqual(viewModel.messagesOffset, 114)
+        XCTAssertEqual(
+            viewModel.compressionReferenceCard?.referenceText,
+            "Fresh compressed context."
+        )
+    }
+
+    @MainActor
     func testPrepareInitialMessageLoadPrimesCacheWithoutStartingNetwork() throws {
         let context = try makeContext()
         let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
@@ -3306,6 +4683,139 @@ final class ChatViewModelSendTests: XCTestCase {
             1
         )
         XCTAssertTrue(viewModel.isLoading)
+    }
+
+    @MainActor
+    func testPrepareInitialMessageLoadMigratesTransientAnchorFromOrdinaryCache()
+        throws
+    {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let session = SessionSummary(
+            sessionId: "session-abc",
+            title: "Cached tool turn",
+            messageCount: 1000
+        )
+        let cachedMessages = [
+            ChatMessage(
+                role: "assistant",
+                content: "Prior answer",
+                timestamp: nil,
+                messageId: "assistant-299"
+            ),
+            ChatMessage(
+                role: "tool",
+                content: "first tool result",
+                timestamp: nil,
+                messageId: "tool-300",
+                toolCallId: "call-1"
+            ),
+            ChatMessage(
+                role: "tool",
+                content: "second tool result",
+                timestamp: nil,
+                messageId: "tool-301",
+                toolCallId: "call-2"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Recovered answer",
+                timestamp: nil,
+                messageId: "assistant-302"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "Next question",
+                timestamp: nil,
+                messageId: "user-303"
+            ),
+        ]
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "stream-stale",
+            offsetFromRowTop: 13.5
+        )
+        try CacheStore.cacheSession(
+            session,
+            serverURL: serverURL,
+            in: context
+        )
+        try CacheStore.cacheMessages(
+            cachedMessages,
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 299,
+            in: context
+        )
+        // Model an older build that cached the temporary stream row itself.
+        // Cache-first restore must ignore that exact hit and canonicalize from
+        // the ordinary completed-turn cache above.
+        try CacheStore.cacheRestorationMessageWindow(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Prior answer",
+                    timestamp: nil,
+                    messageId: "assistant-299"
+                ),
+                ChatMessage(
+                    role: "assistant",
+                    content: "Recovered answer",
+                    timestamp: nil,
+                    messageId: "stream-stale"
+                ),
+                ChatMessage(
+                    role: "user",
+                    content: "Next question",
+                    timestamp: nil,
+                    messageId: "user-301"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 299,
+            position: savedPosition,
+            in: context
+        )
+        let viewModel = try makeViewModel(
+            sessionSummary: session
+        ) { request in
+            XCTFail(
+                "Cache preparation must not start a request: "
+                    + (request.url?.absoluteString ?? "nil")
+            )
+            throw URLError(.badURL)
+        }
+
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: savedPosition
+        )
+
+        XCTAssertTrue(viewModel.isLoading)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            [
+                "assistant-299",
+                "tool-300",
+                "tool-301",
+                "assistant-302",
+                "user-303",
+            ]
+        )
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.generation, 1)
+        XCTAssertEqual(event.mappings.count, 1)
+        let mapping = try XCTUnwrap(event.mappings.first)
+        XCTAssertEqual(mapping.sourceRenderID, "transcript:300")
+        XCTAssertEqual(mapping.sourceMessageID, "stream-stale")
+        XCTAssertEqual(mapping.targetRenderID, "transcript:302")
+        XCTAssertEqual(mapping.targetMessageID, "assistant-302")
+        XCTAssertNil(viewModel.transcriptScrollPositionRetirementEvent)
     }
 
     @MainActor
@@ -6099,6 +7609,1714 @@ final class ChatViewModelSendTests: XCTestCase {
     }
 
     @MainActor
+    func testLoadEarlierExpandsOnlyMemoryAndSendCachesAuthoritativeTail() async throws {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/session":
+                let components = URLComponents(
+                    url: try XCTUnwrap(request.url),
+                    resolvingAgainstBaseURL: false
+                )
+                let query = Dictionary(
+                    uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                        ($0.name, $0.value ?? "")
+                    }
+                )
+                if query["msg_before"] == "2" {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "messages": [
+                          {"role": "user", "content": "Older question", "message_id": "u-0"},
+                          {"role": "assistant", "content": "Older answer", "message_id": "a-1"}
+                        ],
+                        "_messages_offset": 0
+                      }
+                    }
+                    """, for: request)
+                }
+
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "message_id": "u-2"},
+                      {"role": "assistant", "content": "Recent answer", "message_id": "a-3"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 2
+                  }
+                }
+                """, for: request)
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.loadMessages(modelContext: context)
+        let didLoadOlder = await viewModel.loadOlderMessages(modelContext: context)
+        XCTAssertTrue(didLoadOlder)
+
+        var cachedWindow = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            in: context
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 2)
+        XCTAssertEqual(cachedWindow.messages.compactMap(\.content), [
+            "Recent question",
+            "Recent answer"
+        ])
+
+        let didStart = await viewModel.sendMessage(
+            "Newest question",
+            modelContext: context
+        )
+        XCTAssertTrue(didStart)
+
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Older question",
+            "Older answer",
+            "Recent question",
+            "Recent answer",
+            "Newest question"
+        ])
+        cachedWindow = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            in: context
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 2)
+        XCTAssertEqual(cachedWindow.messages.compactMap(\.content), [
+            "Recent question",
+            "Recent answer",
+            "Newest question"
+        ])
+    }
+
+    func testAutomaticReloadWindowBoundsProductionScaleTranscript() {
+        let messages = (0..<2_091).map { index in
+            ChatMessage(
+                role: index.isMultiple(of: 4) ? "user" : "assistant",
+                content: "Synthetic production-scale message \(index)",
+                timestamp: Double(index),
+                messageId: "message-\(index)"
+            )
+        }
+
+        let boundedWindow = ChatViewModel.boundedAutomaticMessageWindow(
+            messages,
+            messageOffset: 0
+        )
+        let expectedFirstIndex =
+            messages.count - ChatViewModel.automaticMessageWindowLimit
+
+        XCTAssertEqual(
+            boundedWindow.messages.count,
+            ChatViewModel.automaticMessageWindowLimit
+        )
+        XCTAssertEqual(
+            boundedWindow.messages.first?.messageId,
+            "message-\(expectedFirstIndex)"
+        )
+        XCTAssertEqual(
+            boundedWindow.messages.last?.messageId,
+            "message-2090"
+        )
+        XCTAssertEqual(boundedWindow.messageOffset, expectedFirstIndex)
+    }
+
+    func testAutomaticReloadWindowRetainsContiguousToolOnlySuffixForAbsoluteIndexes() {
+        var messages = [
+            ChatMessage(
+                role: "user",
+                content: "Run the long tool",
+                timestamp: 0,
+                messageId: "user-anchor"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Running it now.",
+                timestamp: 1,
+                messageId: "assistant-anchor"
+            ),
+        ]
+        messages += (0..<500).map { index in
+            ChatMessage(
+                role: "tool",
+                content: "Tool result \(index)",
+                timestamp: Double(index + 2),
+                messageId: "tool-\(index)",
+                toolCallId: "call-\(index)"
+            )
+        }
+
+        let boundedWindow = ChatViewModel.boundedAutomaticMessageWindow(
+            messages,
+            messageOffset: 700
+        )
+
+        XCTAssertEqual(
+            boundedWindow.messages.count,
+            ChatViewModel.automaticMessageWindowLimit
+        )
+        XCTAssertEqual(
+            boundedWindow.messages.first?.messageId,
+            "tool-100"
+        )
+        XCTAssertEqual(boundedWindow.messages.last?.messageId, "tool-499")
+        XCTAssertEqual(boundedWindow.messageOffset, 802)
+        XCTAssertTrue(
+            ChatViewModel.transcriptMessages(
+                from: boundedWindow.messages,
+                messageOffset: boundedWindow.messageOffset
+            ).isEmpty
+        )
+
+        var messagesWithNextUser = boundedWindow.messages
+        messagesWithNextUser.append(ChatMessage(
+            role: "user",
+            content: "Continue",
+            timestamp: 502,
+            messageId: "next-user"
+        ))
+        XCTAssertEqual(
+            ChatViewModel.transcriptMessages(
+                from: messagesWithNextUser,
+                messageOffset: boundedWindow.messageOffset
+            ).map(\.renderID),
+            ["transcript:1202"]
+        )
+    }
+
+    func testRestorationMessageWindowKeepsRequestedAnchorWhenOversized() {
+        let messages = (0..<600).map { index in
+            ChatMessage(
+                role: index.isMultiple(of: 2) ? "user" : "assistant",
+                content: "Message \(index)",
+                timestamp: Double(index),
+                messageId: "message-\(index)"
+            )
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:500",
+            messageID: "message-400",
+            offsetFromRowTop: 37.25
+        )
+
+        let window = ChatViewModel.restorationMessageWindow(
+            messages,
+            messageOffset: 100,
+            containing: position,
+            maximumCount: 400
+        )
+
+        XCTAssertEqual(window?.messages.count, 400)
+        XCTAssertEqual(window?.messageOffset, 300)
+        XCTAssertTrue(ChatViewModel.messageWindow(
+            window?.messages ?? [],
+            messageOffset: window?.messageOffset ?? 0,
+            contains: position
+        ))
+    }
+
+    @MainActor
+    func testInitialCachePrimeDoesNotExposeLatestTailForOffWindowSavedAnchor()
+        throws
+    {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "user",
+                    content: "Recent question",
+                    timestamp: 999,
+                    messageId: "recent-998"
+                ),
+                ChatMessage(
+                    role: "assistant",
+                    content: "Recent answer",
+                    timestamp: 1_000,
+                    messageId: "recent-999"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 998,
+            in: context
+        )
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        let viewModel = try makeViewModel { request in
+            XCTFail("Cache priming must not make a network request.")
+            throw URLError(.badURL)
+        }
+
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        XCTAssertTrue(viewModel.isLoading)
+        XCTAssertTrue(
+            viewModel.messages.isEmpty,
+            "The unrelated newest tail must remain hidden while the saved row resolves."
+        )
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+    }
+
+    @MainActor
+    func testInitialCachePrimeRendersSavedWindowAndRetainsLatestSeparately()
+        throws
+    {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let latestMessages = [
+            ChatMessage(
+                role: "user",
+                content: "Recent question",
+                timestamp: 999,
+                messageId: "recent-998"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "Recent answer",
+                timestamp: 1_000,
+                messageId: "recent-999"
+            ),
+        ]
+        let historicalMessages = [
+            ChatMessage(
+                role: "assistant",
+                content: "Before saved row",
+                timestamp: 300,
+                messageId: "history-299"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "Saved row",
+                timestamp: 301,
+                messageId: "saved-300"
+            ),
+            ChatMessage(
+                role: "assistant",
+                content: "After saved row",
+                timestamp: 302,
+                messageId: "history-301"
+            ),
+        ]
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        try CacheStore.cacheMessages(
+            latestMessages,
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 998,
+            in: context
+        )
+        try CacheStore.cacheRestorationMessageWindow(
+            historicalMessages,
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 299,
+            position: position,
+            in: context
+        )
+        let viewModel = try makeViewModel { request in
+            XCTFail("Cache priming must not make a network request.")
+            throw URLError(.badURL)
+        }
+
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messages, historicalMessages)
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messages, latestMessages)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+    }
+
+    @MainActor
+    func testCachedSavedWindowSkipsHistoricalNetworkRequestOnReopen()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Recent answer",
+                    timestamp: 1_000,
+                    messageId: "recent-999"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 999,
+            in: context
+        )
+        try CacheStore.cacheRestorationMessageWindow(
+            [
+                ChatMessage(
+                    role: "user",
+                    content: "Saved row",
+                    timestamp: 301,
+                    messageId: "saved-300"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 300,
+            position: position,
+            in: context
+        )
+        var requestQueries: [[String: String]] = []
+        let viewModel = try makeViewModel { request in
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            requestQueries.append(query)
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "assistant", "content": "Recent answer", "timestamp": 1000, "message_id": "recent-999"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 999
+              }
+            }
+            """, for: request)
+        }
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        await viewModel.loadMessages(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        XCTAssertEqual(requestQueries.count, 1)
+        XCTAssertFalse(requestQueries[0].keys.contains("msg_before"))
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messages.compactMap(\.messageId), ["saved-300"])
+        XCTAssertEqual(viewModel.messagesOffset, 300)
+    }
+
+    @MainActor
+    func testCommittedReadingPositionCachesItsCurrentWindow() async throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        let viewModel = try makeViewModel { request in
+            apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 302,
+                "messages": [
+                  {"role": "assistant", "content": "Before saved row", "timestamp": 300, "message_id": "history-299"},
+                  {"role": "user", "content": "Saved row", "timestamp": 301, "message_id": "saved-300"},
+                  {"role": "assistant", "content": "After saved row", "timestamp": 302, "message_id": "history-301"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 299
+              }
+            }
+            """, for: request)
+        }
+
+        await viewModel.loadMessages()
+        let didCache = viewModel.cacheCurrentRestorationMessageWindow(
+            containing: position,
+            modelContext: context
+        )
+
+        XCTAssertTrue(didCache)
+        let cachedWindow = try XCTUnwrap(
+            CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: "session-abc",
+                position: position,
+                in: context
+            )
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 299)
+        XCTAssertEqual(
+            cachedWindow.messages.compactMap(\.messageId),
+            ["history-299", "saved-300", "history-301"]
+        )
+    }
+
+    @MainActor
+    func testTransientReadingPositionCannotCreateRestorationCache() async throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let viewModel = try makeViewModel { request in
+            apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 302,
+                "messages": [
+                  {"role": "assistant", "content": "Before row", "message_id": "history-299"},
+                  {"role": "assistant", "content": "Temporary row", "message_id": "stream-stale"},
+                  {"role": "user", "content": "After row", "message_id": "history-301"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 299
+              }
+            }
+            """, for: request)
+        }
+        let transientPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "stream-stale",
+            offsetFromRowTop: 24.5
+        )
+
+        await viewModel.loadMessages()
+        let didCache = viewModel.cacheCurrentRestorationMessageWindow(
+            containing: transientPosition,
+            modelContext: context
+        )
+
+        XCTAssertFalse(didCache)
+        XCTAssertNil(try CacheStore.cachedRestorationMessageWindow(
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            position: transientPosition,
+            in: context
+        ))
+    }
+
+    @MainActor
+    func testLatestActivationDuringSlowInitialReloadStillAppliesFreshTail()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Stale cached tail",
+                    timestamp: 999,
+                    messageId: "cached-998"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 998,
+            in: context
+        )
+
+        let latestRequestStarted = expectation(description: "latest started")
+        let targetRequestStarted = expectation(description: "target started")
+        let requests = DeferredChatRequests()
+        DeferredChatMockURLProtocol.onRequest = { request in
+            let components = URLComponents(
+                url: request.request.url!,
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            let isTarget = query["msg_before"] != nil
+            requests.store(request, isTarget: isTarget)
+            if isTarget {
+                targetRequestStarted.fulfill()
+            } else {
+                latestRequestStarted.fulfill()
+            }
+        }
+        let viewModel = try makeDeferredViewModel()
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(
+                modelContext: context,
+                initialScrollPosition: position
+            )
+        }
+        await fulfillment(
+            of: [latestRequestStarted, targetRequestStarted],
+            timeout: 2
+        )
+        try requests.target().complete(withJSON: """
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Saved row", "timestamp": 301, "message_id": "saved-300"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """)
+        try await waitUntil {
+            viewModel.isShowingHistoricalMessageWindow
+        }
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Saved row"]
+        )
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Stale cached tail"]
+        )
+
+        try requests.latest().complete(withJSON: """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "message_count": 1000,
+            "messages": [
+              {"role": "assistant", "content": "Fresh authoritative tail", "timestamp": 1000, "message_id": "fresh-999"}
+            ],
+            "_messages_truncated": true,
+            "_messages_offset": 999
+          }
+        }
+        """)
+        await loadTask.value
+
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 999)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Fresh authoritative tail"]
+        )
+    }
+
+    @MainActor
+    func testLatestActivationWithoutRetainedSnapshotIsFulfilledByFreshTail()
+        async throws
+    {
+        let context = try makeContext()
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        let latestRequestStarted = expectation(description: "latest started")
+        let targetRequestStarted = expectation(description: "target started")
+        let requests = DeferredChatRequests()
+        DeferredChatMockURLProtocol.onRequest = { request in
+            let components = URLComponents(
+                url: request.request.url!,
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            let isTarget = query["msg_before"] != nil
+            requests.store(request, isTarget: isTarget)
+            if isTarget {
+                targetRequestStarted.fulfill()
+            } else {
+                latestRequestStarted.fulfill()
+            }
+        }
+        let viewModel = try makeDeferredViewModel()
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(
+                modelContext: context,
+                initialScrollPosition: position
+            )
+        }
+        await fulfillment(
+            of: [latestRequestStarted, targetRequestStarted],
+            timeout: 2
+        )
+        try requests.target().complete(withJSON: """
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Saved row", "timestamp": 301, "message_id": "saved-300"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """)
+        try await waitUntil {
+            viewModel.isShowingHistoricalMessageWindow
+        }
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Saved row"]
+        )
+
+        let triggerBeforeActivation = viewModel.streamingScrollTrigger
+        XCTAssertFalse(viewModel.activateLatestMessageWindowIfNeeded())
+
+        try requests.latest().complete(withJSON: """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "message_count": 1000,
+            "messages": [
+              {"role": "assistant", "content": "Fresh authoritative tail", "timestamp": 1000, "message_id": "fresh-999"}
+            ],
+            "_messages_truncated": true,
+            "_messages_offset": 999
+          }
+        }
+        """)
+        await loadTask.value
+
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 999)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Fresh authoritative tail"]
+        )
+        XCTAssertGreaterThan(
+            viewModel.streamingScrollTrigger,
+            triggerBeforeActivation
+        )
+    }
+
+    @MainActor
+    func testFastLatestResponseStaysHiddenUntilSavedWindowArrives()
+        async throws
+    {
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        let latestRequestStarted = expectation(description: "latest started")
+        let targetRequestStarted = expectation(description: "target started")
+        let requests = DeferredChatRequests()
+        DeferredChatMockURLProtocol.onRequest = { request in
+            let components = URLComponents(
+                url: request.request.url!,
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            let isTarget = query["msg_before"] != nil
+            requests.store(request, isTarget: isTarget)
+            if isTarget {
+                targetRequestStarted.fulfill()
+            } else {
+                latestRequestStarted.fulfill()
+            }
+        }
+        let viewModel = try makeDeferredViewModel()
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(initialScrollPosition: position)
+        }
+        await fulfillment(
+            of: [latestRequestStarted, targetRequestStarted],
+            timeout: 2
+        )
+        try requests.latest().complete(withJSON: """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "message_count": 1000,
+            "messages": [
+              {"role": "assistant", "content": "Unrelated newest tail", "timestamp": 1000, "message_id": "fresh-999"}
+            ],
+            "_messages_truncated": true,
+            "_messages_offset": 999
+          }
+        }
+        """)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(viewModel.isLoading)
+        XCTAssertTrue(viewModel.messages.isEmpty)
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+
+        try requests.target().complete(withJSON: """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "message_count": 1000,
+            "messages": [
+              {"role": "user", "content": "Saved row", "timestamp": 301, "message_id": "saved-300"}
+            ],
+            "_messages_truncated": true,
+            "_messages_offset": 300
+          }
+        }
+        """)
+        await loadTask.value
+
+        XCTAssertFalse(viewModel.isLoading)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 300)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Saved row"]
+        )
+    }
+
+    @MainActor
+    func testInitialLoadUsesOneBoundedRequestForSavedAnchorOutsideLatestTail() async throws {
+        var requestQueries: [[String: String]] = []
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            requestQueries.append(query)
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "timestamp": 999, "message_id": "recent-998"},
+                      {"role": "assistant", "content": "Recent answer", "timestamp": 1000, "message_id": "recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            XCTAssertEqual(query["msg_limit"], "100")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "assistant", "content": "Before saved row", "timestamp": 300, "message_id": "history-299"},
+                  {"role": "user", "content": "Saved row", "timestamp": 301, "message_id": "saved-300"},
+                  {"role": "assistant", "content": "After saved row", "timestamp": 302, "message_id": "history-301"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 299
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: position)
+
+        XCTAssertEqual(requestQueries.count, 2)
+        XCTAssertEqual(
+            requestQueries.filter { $0["msg_before"] == nil }.count,
+            1
+        )
+        XCTAssertEqual(
+            requestQueries.filter { $0["msg_before"] == "351" }.count,
+            1
+        )
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["history-299", "saved-300", "history-301"]
+        )
+        XCTAssertTrue(ChatViewModel.messageWindow(
+            viewModel.messages,
+            messageOffset: viewModel.messagesOffset,
+            contains: position
+        ))
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["recent-998", "recent-999"]
+        )
+    }
+
+    @MainActor
+    func testInitialRestorationDerivesTargetedOffsetFromMessageCount() async throws {
+        let viewModel = try makeViewModel { request in
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                      {"role": "assistant", "content": "Recent answer", "message_id": "recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 304,
+                "messages": [
+                  {"role": "user", "content": "Saved row", "message_id": "saved-300"},
+                  {"role": "assistant", "content": "After 1", "message_id": "history-301"},
+                  {"role": "user", "content": "After 2", "message_id": "history-302"},
+                  {"role": "assistant", "content": "After 3", "message_id": "history-303"}
+                ],
+                "_messages_truncated": true
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: position)
+
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 300)
+        XCTAssertTrue(ChatViewModel.messageWindow(
+            viewModel.messages,
+            messageOffset: viewModel.messagesOffset,
+            contains: position
+        ))
+    }
+
+    @MainActor
+    func testInitialRestorationMigratesTransientAssistantAndCachesCanonicalWindow()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        var sessionRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            sessionRequestCount += 1
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role":"user","content":"Recent question","message_id":"recent-998"},
+                      {"role":"assistant","content":"Recent answer","message_id":"recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            XCTAssertEqual(query["msg_limit"], "100")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role":"assistant","content":"Prior answer","message_id":"assistant-299"},
+                  {
+                    "role":"tool",
+                    "content":"first tool result",
+                    "message_id":"tool-300",
+                    "tool_call_id":"call-1"
+                  },
+                  {
+                    "role":"tool",
+                    "content":"second tool result",
+                    "message_id":"tool-301",
+                    "tool_call_id":"call-2"
+                  },
+                  {"role":"assistant","content":"Recovered answer","message_id":"assistant-302"},
+                  {"role":"user","content":"Next question","message_id":"user-303"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 299
+              }
+            }
+            """, for: request)
+        }
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "stream-stale",
+            offsetFromRowTop: 17.5
+        )
+
+        await viewModel.loadMessages(
+            modelContext: context,
+            initialScrollPosition: savedPosition
+        )
+
+        XCTAssertEqual(sessionRequestCount, 2)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.generation, 1)
+        XCTAssertEqual(event.mappings.count, 1)
+        let mapping = try XCTUnwrap(event.mappings.first)
+        XCTAssertEqual(mapping.sourceRenderID, "transcript:300")
+        XCTAssertEqual(mapping.sourceMessageID, "stream-stale")
+        XCTAssertEqual(mapping.targetRenderID, "transcript:302")
+        XCTAssertEqual(mapping.targetMessageID, "assistant-302")
+        XCTAssertNil(viewModel.transcriptScrollPositionRetirementEvent)
+
+        let canonicalPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:302",
+            messageID: "assistant-302",
+            offsetFromRowTop: 17.5
+        )
+        let cachedWindow = try XCTUnwrap(
+            CacheStore.cachedRestorationMessageWindow(
+                serverURL: serverURL,
+                sessionID: "session-abc",
+                position: canonicalPosition,
+                in: context
+            )
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 299)
+        XCTAssertTrue(ChatViewModel.messageWindow(
+            cachedWindow.messages,
+            messageOffset: cachedWindow.messageOffset,
+            contains: canonicalPosition
+        ))
+        XCTAssertNil(try CacheStore.cachedRestorationMessageWindow(
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            position: savedPosition,
+            in: context
+        ))
+    }
+
+    @MainActor
+    func testInitialRestorationMigratesUUIDBackedOptimisticUser()
+        async throws
+    {
+        var sessionRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            sessionRequestCount += 1
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role":"user","content":"Recent question","message_id":"recent-998"},
+                      {"role":"assistant","content":"Recent answer","message_id":"recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            XCTAssertEqual(query["msg_limit"], "100")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role":"assistant","content":"Prior answer","message_id":"assistant-299"},
+                  {
+                    "role":"tool",
+                    "content":"tool result",
+                    "message_id":"tool-300",
+                    "tool_call_id":"call-1"
+                  },
+                  {"role":"assistant","content":"Prior final","message_id":"assistant-301"},
+                  {"role":"user","content":"Recovered question","message_id":"user-302"},
+                  {"role":"assistant","content":"Recovered answer","message_id":"assistant-303"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 299
+              }
+            }
+            """, for: request)
+        }
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "local-00000000-0000-0000-0000-000000000001",
+            offsetFromRowTop: 9.25
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: savedPosition)
+
+        XCTAssertEqual(sessionRequestCount, 2)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+        let event = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRebaseEvent
+        )
+        XCTAssertEqual(event.generation, 1)
+        XCTAssertEqual(event.mappings.count, 1)
+        let mapping = try XCTUnwrap(event.mappings.first)
+        XCTAssertEqual(mapping.sourceRenderID, "transcript:300")
+        XCTAssertEqual(mapping.sourceMessageID, savedPosition.messageID)
+        XCTAssertEqual(mapping.targetRenderID, "transcript:302")
+        XCTAssertEqual(mapping.targetMessageID, "user-302")
+        XCTAssertNil(viewModel.transcriptScrollPositionRetirementEvent)
+    }
+
+    @MainActor
+    func testInitialRestorationRejectsAmbiguousTransientAssistantMigration()
+        async throws
+    {
+        let context = try makeContext()
+        var sessionRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            sessionRequestCount += 1
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role":"user","content":"Recent question","message_id":"recent-998"},
+                      {"role":"assistant","content":"Recent answer","message_id":"recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role":"assistant","content":"First candidate","message_id":"assistant-300"},
+                  {
+                    "role":"tool",
+                    "content":"tool result",
+                    "message_id":"tool-301",
+                    "tool_call_id":"call-1"
+                  },
+                  {"role":"assistant","content":"Second candidate","message_id":"assistant-302"},
+                  {"role":"user","content":"Next question","message_id":"user-303"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """, for: request)
+        }
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "stream-stale",
+            offsetFromRowTop: 12
+        )
+
+        await viewModel.loadMessages(
+            modelContext: context,
+            initialScrollPosition: savedPosition
+        )
+
+        XCTAssertEqual(sessionRequestCount, 2)
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["recent-998", "recent-999"]
+        )
+        XCTAssertNil(viewModel.transcriptScrollPositionRebaseEvent)
+        let retirement = try XCTUnwrap(
+            viewModel.transcriptScrollPositionRetirementEvent
+        )
+        XCTAssertEqual(retirement.generation, 1)
+        XCTAssertEqual(retirement.renderID, "transcript:300")
+        XCTAssertEqual(retirement.messageID, "stream-stale")
+        XCTAssertEqual(
+            retirement.reason,
+            .ambiguousAuthoritativeAssistants
+        )
+    }
+
+    @MainActor
+    func testInitialRestorationKeepsTransientAnchorWhenTargetPageEndsMidTurn()
+        async throws
+    {
+        let targetMessagesJSON = (251...350).map { index in
+            if index == 302 {
+                return """
+                {"role":"assistant","content":"Only visible candidate","message_id":"assistant-302"}
+                """
+            }
+            return """
+            {
+              "role":"tool",
+              "content":"tool result \(index)",
+              "message_id":"tool-\(index)",
+              "tool_call_id":"call-\(index)"
+            }
+            """
+        }.joined(separator: ",")
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role":"user","content":"Recent question","message_id":"recent-998"},
+                      {"role":"assistant","content":"Recent answer","message_id":"recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            XCTAssertEqual(query["msg_limit"], "100")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [\(targetMessagesJSON)],
+                "_messages_truncated": true,
+                "_messages_offset": 251
+              }
+            }
+            """, for: request)
+        }
+        let savedPosition = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "stream-stale",
+            offsetFromRowTop: 12
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: savedPosition)
+
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertNil(viewModel.transcriptScrollPositionRebaseEvent)
+        XCTAssertNil(viewModel.transcriptScrollPositionRetirementEvent)
+    }
+
+    @MainActor
+    func testInitialRestorationIdentityMismatchKeepsLatestWithoutRetrying() async throws {
+        var latestRequestCount = 0
+        var targetedRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                latestRequestCount += 1
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                      {"role": "assistant", "content": "Recent answer", "message_id": "recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            targetedRequestCount += 1
+            XCTAssertEqual(query["msg_before"], "351")
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Rewritten row", "message_id": "changed-300"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 10
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: position)
+
+        // The contract under test: an identity mismatch performs exactly one
+        // targeted lookup and never retries it. Count request kinds instead of
+        // a total so a stray late request leaked from an earlier test through
+        // the shared MockURLProtocol handler (observed on slow CI runners)
+        // cannot fail the wrong assertion.
+        XCTAssertEqual(
+            targetedRequestCount,
+            1,
+            "The identity mismatch must not retry the targeted window request."
+        )
+        XCTAssertGreaterThanOrEqual(latestRequestCount, 1)
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["recent-998", "recent-999"]
+        )
+        XCTAssertNil(viewModel.transcriptScrollPositionRebaseEvent)
+        XCTAssertNil(viewModel.transcriptScrollPositionRetirementEvent)
+    }
+
+    @MainActor
+    func testInitialRestorationDoesNotReplaceAnActiveStreamWithHistoricalRows() async throws {
+        var sessionRequestCount = 0
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            sessionRequestCount += 1
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "active_stream_id": "stream-active",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                  {"role": "assistant", "content": "Partial response", "message_id": "recent-999"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 998
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 10
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: position)
+
+        XCTAssertTrue((1...2).contains(sessionRequestCount))
+        XCTAssertEqual(viewModel.activeStreamID, "stream-active")
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+    }
+
+    @MainActor
+    func testCancellingDelayedInitialRestorationLeavesLatestTailVisible() async throws {
+        let targetRequestStarted = expectation(
+            description: "historical restoration request started"
+        )
+        let releaseTargetResponse = DispatchSemaphore(value: 0)
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                      {"role": "assistant", "content": "Recent answer", "message_id": "recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            XCTAssertEqual(query["msg_before"], "351")
+            targetRequestStarted.fulfill()
+            XCTAssertEqual(
+                releaseTargetResponse.wait(timeout: .now() + 3),
+                .success
+            )
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Saved row", "message_id": "saved-300"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 10
+        )
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(initialScrollPosition: position)
+        }
+        await fulfillment(of: [targetRequestStarted], timeout: 2)
+        viewModel.cancelInitialRestorationRequest()
+        releaseTargetResponse.signal()
+        await loadTask.value
+
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.messageId),
+            ["recent-998", "recent-999"]
+        )
+    }
+
+    @MainActor
+    func testSendFromHistoricalRestorationActivatesAndCachesLatestTailFirst() async throws {
+        let context = try makeContext()
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/session":
+                let components = URLComponents(
+                    url: try XCTUnwrap(request.url),
+                    resolvingAgainstBaseURL: false
+                )
+                let query = Dictionary(
+                    uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                        ($0.name, $0.value ?? "")
+                    }
+                )
+                if query["msg_before"] == nil {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "message_count": 1000,
+                        "messages": [
+                          {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                          {"role": "assistant", "content": "Recent answer", "message_id": "recent-999"}
+                        ],
+                        "_messages_truncated": true,
+                        "_messages_offset": 998
+                      }
+                    }
+                    """, for: request)
+                }
+
+                XCTAssertEqual(query["msg_before"], "351")
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Saved row", "message_id": "saved-300"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 300
+                  }
+                }
+                """, for: request)
+            case "/api/chat/start":
+                return apiTestJSONResponse("""
+                {
+                  "session_id": "session-abc",
+                  "stream_id": "stream-123"
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 10
+        )
+
+        await viewModel.loadMessages(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+
+        let didStart = await viewModel.sendMessage(
+            "Newest question",
+            modelContext: context
+        )
+        let cachedWindow = try CacheStore.cachedMessageWindow(
+            serverURL: URL(string: "https://example.test")!,
+            sessionID: "session-abc",
+            in: context
+        )
+
+        XCTAssertTrue(didStart)
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Recent question", "Recent answer", "Newest question"]
+        )
+        XCTAssertEqual(cachedWindow.messageOffset, 998)
+        XCTAssertEqual(
+            cachedWindow.messages.compactMap(\.content),
+            ["Recent question", "Recent answer", "Newest question"]
+        )
+    }
+
+    @MainActor
+    // Local rows produced while the reader is on a restored historical window
+    // must not activate the latest window (activation replaces the displayed
+    // transcript underneath the reader — the mid-read viewport jump). They are
+    // retained with the latest tail and surface on the next explicit
+    // activation.
+    func testLocalMessageFromHistoricalRestorationStaysRetainedUntilActivation() async throws {
+        let viewModel = try makeViewModel { request in
+            let components = URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )
+            let query = Dictionary(
+                uniqueKeysWithValues: (components?.queryItems ?? []).map {
+                    ($0.name, $0.value ?? "")
+                }
+            )
+            if query["msg_before"] == nil {
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "message_count": 1000,
+                    "messages": [
+                      {"role": "user", "content": "Recent question", "message_id": "recent-998"},
+                      {"role": "assistant", "content": "Recent answer", "message_id": "recent-999"}
+                    ],
+                    "_messages_truncated": true,
+                    "_messages_offset": 998
+                  }
+                }
+                """, for: request)
+            }
+
+            return apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "session-abc",
+                "message_count": 1000,
+                "messages": [
+                  {"role": "user", "content": "Saved row", "message_id": "saved-300"}
+                ],
+                "_messages_truncated": true,
+                "_messages_offset": 300
+              }
+            }
+            """, for: request)
+        }
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 10
+        )
+
+        await viewModel.loadMessages(initialScrollPosition: position)
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+
+        let messageID = viewModel.appendLocalAssistantMessage("Local slash result")
+
+        XCTAssertNotNil(messageID)
+        XCTAssertTrue(
+            viewModel.isShowingHistoricalMessageWindow,
+            "A local row must not activate the latest window mid-read."
+        )
+        XCTAssertEqual(viewModel.messagesOffset, 300)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Saved row"],
+            "The displayed historical window must stay untouched."
+        )
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(viewModel.messagesOffset, 998)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Recent question", "Recent answer", "Local slash result"]
+        )
+    }
+
+    @MainActor
     func testLoadOlderMessagesUsesCurrentOffsetAndPrependsWithoutDuplicates() async throws {
         var requestQueries: [[String: String]] = []
         let viewModel = try makeViewModel { request in
@@ -6992,6 +10210,168 @@ final class ChatViewModelSendTests: XCTestCase {
         )
     }
 
+    /// Regression: a refresh that carries no saved position (for example the
+    /// deferred initial reload that runs after view-side restoration already
+    /// consumed the position, or a foreground reconcile) must not replace the
+    /// displayed historical window. The fresh tail belongs in the retained
+    /// latest snapshot until the reader explicitly activates it.
+    @MainActor
+    func testPositionlessRefreshPreservesDisplayedHistoricalWindow()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Cached before row",
+                    timestamp: 300,
+                    messageId: "cached-299"
+                ),
+                ChatMessage(
+                    role: "user",
+                    content: "Cached saved row",
+                    timestamp: 301,
+                    messageId: "saved-300"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 299,
+            in: context
+        )
+
+        let latestRequestStarted = expectation(description: "latest started")
+        let requests = DeferredChatRequests()
+        DeferredChatMockURLProtocol.onRequest = { request in
+            requests.store(request, isTarget: false)
+            latestRequestStarted.fulfill()
+        }
+        let viewModel = try makeDeferredViewModel()
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Cached before row", "Cached saved row"]
+        )
+
+        let loadTask = Task { @MainActor in
+            await viewModel.loadMessages(modelContext: context)
+        }
+        await fulfillment(of: [latestRequestStarted], timeout: 2)
+        try requests.latest().complete(withJSON: """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "message_count": 1000,
+            "messages": [
+              {"role": "assistant", "content": "Fresh authoritative tail", "timestamp": 1000, "message_id": "fresh-999"}
+            ],
+            "_messages_truncated": true,
+            "_messages_offset": 999
+          }
+        }
+        """)
+        await loadTask.value
+
+        XCTAssertTrue(
+            viewModel.isShowingHistoricalMessageWindow,
+            "A position-less refresh must keep the reader's historical window."
+        )
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Cached before row", "Cached saved row"],
+            "The displayed window must not be replaced underneath the reader."
+        )
+        XCTAssertEqual(viewModel.messagesOffset, 299)
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertFalse(viewModel.isShowingHistoricalMessageWindow)
+        XCTAssertEqual(
+            viewModel.messages.compactMap(\.content),
+            ["Fresh authoritative tail"],
+            "Activation must reveal the refreshed latest window."
+        )
+        XCTAssertEqual(viewModel.messagesOffset, 999)
+    }
+
+    /// Regression: background local rows (poll results, notices) arriving while
+    /// the reader is on a restored historical window must land in the retained
+    /// latest snapshot instead of activating it, which visibly replaced the
+    /// window underneath the reader.
+    @MainActor
+    func testBackgroundLocalNoticeWhileHistoricalStaysInRetainedSnapshot()
+        async throws
+    {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let position = ChatTranscriptScrollPosition(
+            renderID: "transcript:300",
+            messageID: "saved-300",
+            offsetFromRowTop: 24.5
+        )
+        try CacheStore.cacheMessages(
+            [
+                ChatMessage(
+                    role: "assistant",
+                    content: "Cached before row",
+                    timestamp: 300,
+                    messageId: "cached-299"
+                ),
+                ChatMessage(
+                    role: "user",
+                    content: "Cached saved row",
+                    timestamp: 301,
+                    messageId: "saved-300"
+                ),
+            ],
+            serverURL: serverURL,
+            sessionID: "session-abc",
+            messageOffset: 299,
+            in: context
+        )
+
+        let viewModel = try makeDeferredViewModel()
+        viewModel.prepareInitialMessageLoad(
+            modelContext: context,
+            initialScrollPosition: position
+        )
+        XCTAssertTrue(viewModel.isShowingHistoricalMessageWindow)
+        let displayedCountBeforeNotice = viewModel.messages.count
+
+        let noticeID = viewModel.appendLocalNoticeMessage(
+            "Background task finished"
+        )
+
+        XCTAssertNotNil(noticeID)
+        XCTAssertTrue(
+            viewModel.isShowingHistoricalMessageWindow,
+            "A background notice must not activate the latest window."
+        )
+        XCTAssertEqual(
+            viewModel.messages.count,
+            displayedCountBeforeNotice,
+            "The displayed historical window must not change for a background row."
+        )
+
+        XCTAssertTrue(viewModel.activateLatestMessageWindowIfNeeded())
+        XCTAssertEqual(
+            viewModel.messages.last?.content,
+            "Background task finished",
+            "The notice must surface with the next explicit latest activation."
+        )
+    }
+
     /// Lets a `Task { @MainActor … }` enqueued by a delegate callback run to completion
     /// before assertions. Same-actor tasks run FIFO, so awaiting a task enqueued *after*
     /// the callback's drains it; the leading yields add slack.
@@ -7076,6 +10456,25 @@ final class ChatViewModelSendTests: XCTestCase {
         }
 
         return viewModel
+    }
+
+    @MainActor
+    private func makeDeferredViewModel() throws -> ChatViewModel {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeferredChatMockURLProtocol.self]
+        let urlSession = URLSession(configuration: configuration)
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let client = APIClient(baseURL: server, session: urlSession)
+        return ChatViewModel(
+            session: try makeSession(),
+            server: server,
+            client: client,
+            streamClient: SpySSEStreamingClient(),
+            approvalStreamClient: SpySSEStreamingClient(),
+            clarifyStreamClient: SpySSEStreamingClient(),
+            listenAudioSession: SpyListenAudioSession(),
+            listenRemoteControlCenter: SpyListenRemoteControlCenter()
+        )
     }
 
     @MainActor
@@ -7353,6 +10752,77 @@ private final class SpyListenAudioSession: ListenAudioSessionControlling {
     func deactivate() {
         deactivateCount += 1
         recorder?.record("deactivate")
+    }
+}
+
+/// Keeps both initial session requests in flight so restoration races can be
+/// completed deterministically in either order.
+private final class DeferredChatMockURLProtocol: URLProtocol {
+    static var onRequest: ((DeferredChatMockURLProtocol) -> Void)?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let onRequest = Self.onRequest else {
+            client?.urlProtocol(
+                self,
+                didFailWithError: URLError(.badServerResponse)
+            )
+            return
+        }
+        onRequest(self)
+    }
+
+    override func stopLoading() {}
+
+    func complete(withJSON json: String) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        client?.urlProtocol(self, didLoad: Data(json.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
+private final class DeferredChatRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latestRequest: DeferredChatMockURLProtocol?
+    private var targetRequest: DeferredChatMockURLProtocol?
+
+    func store(_ request: DeferredChatMockURLProtocol, isTarget: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        if isTarget {
+            targetRequest = request
+        } else {
+            latestRequest = request
+        }
+    }
+
+    func latest() throws -> DeferredChatMockURLProtocol {
+        lock.lock()
+        defer { lock.unlock() }
+        return try XCTUnwrap(latestRequest)
+    }
+
+    func target() throws -> DeferredChatMockURLProtocol {
+        lock.lock()
+        defer { lock.unlock() }
+        return try XCTUnwrap(targetRequest)
     }
 }
 

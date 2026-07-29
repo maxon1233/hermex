@@ -39,6 +39,27 @@ private enum TurnDiffPresentation: Identifiable {
     }
 }
 
+private struct ChatTranscriptPositionEventObserver: ViewModifier {
+    let rebaseEvent: ChatTranscriptScrollPositionRebaseEvent?
+    let retirementEvent: ChatTranscriptScrollPositionRetirementEvent?
+    let onRebase: (ChatTranscriptScrollPositionRebaseEvent) -> Void
+    let onRetirement: (ChatTranscriptScrollPositionRetirementEvent) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: rebaseEvent) { _, event in
+                if let event {
+                    onRebase(event)
+                }
+            }
+            .onChange(of: retirementEvent) { _, event in
+                if let event {
+                    onRetirement(event)
+                }
+            }
+    }
+}
+
 /// Reports the first completed UIKit appearance transition for a SwiftUI destination.
 /// `NavigationStack` does not expose push completion directly, while `viewDidAppear`
 /// and the transition coordinator remain synchronized with system animation speed.
@@ -255,6 +276,7 @@ private struct ListenPlaybackBar: View {
 
 private final class ChatTranscriptViewportState {
     var latestMetrics: ChatScrollMetrics?
+    var lastRestorationCachePosition: ChatTranscriptScrollPosition?
     let positionRecorder: ChatTranscriptScrollPositionRecorder
 
     init(positionRecorder: ChatTranscriptScrollPositionRecorder) {
@@ -630,6 +652,13 @@ struct ChatView: View {
                 // message-count auto-follow racing it) lands without an animated jump (#289).
                 cacheFirstSnapUntil = Date().addingTimeInterval(0.35)
             }
+            .modifier(ChatTranscriptPositionEventObserver(
+                rebaseEvent: viewModel.transcriptScrollPositionRebaseEvent,
+                retirementEvent:
+                    viewModel.transcriptScrollPositionRetirementEvent,
+                onRebase: handleTranscriptScrollPositionRebase,
+                onRetirement: handleTranscriptScrollPositionRetirement
+            ))
             .onChange(of: viewModel.isUploadingAttachment) { _, isUploading in
                 if !isUploading {
                     applyInitialComposerFocusPolicyIfNeeded()
@@ -1105,7 +1134,7 @@ struct ChatView: View {
             errorMessage: viewModel.errorMessage,
             messages: viewModel.messages,
             displayedTranscriptMessages: displayedTranscriptMessages,
-            initialScrollPosition: initialTranscriptScrollPosition,
+            initialScrollPosition: effectiveInitialTranscriptScrollPosition,
             compressionReferenceCard: viewModel.compressionReferenceCard,
             reasoningGroups: viewModel.displayedReasoningGroups,
             completedToolCallGroupsForAnchor: { anchorMessageID in
@@ -1175,6 +1204,9 @@ struct ChatView: View {
             onScrollToLatestContent: { proxy, animated in
                 scrollToLatestContent(proxy, animated: animated)
             },
+            onCancelInitialRestoration: {
+                viewModel.cancelInitialRestorationRequest()
+            },
             onInitialScrollPositionResolution: handleInitialScrollPositionResolution,
             onReadingPositionChange: handleReadingPositionChange,
             onReadingPositionCommit: persistTranscriptScrollPosition,
@@ -1230,7 +1262,41 @@ struct ChatView: View {
     }
 
     private var showsScrollToBottomButton: Bool {
-        !isScrolledNearBottom && (viewModel.activeStreamID == nil || !shouldFollowLatestMessage)
+        viewModel.isShowingHistoricalMessageWindow
+            || (
+                !isScrolledNearBottom
+                    && (viewModel.activeStreamID == nil || !shouldFollowLatestMessage)
+            )
+    }
+
+    private var effectiveInitialTranscriptScrollPosition:
+        ChatTranscriptScrollPosition?
+    {
+        guard let initialTranscriptScrollPosition else { return nil }
+
+        if let retirement =
+                viewModel.transcriptScrollPositionRetirementEvent,
+           retirement.renderID == initialTranscriptScrollPosition.renderID,
+           retirement.messageID == initialTranscriptScrollPosition.messageID {
+            return nil
+        }
+
+        guard let rebase = viewModel.transcriptScrollPositionRebaseEvent,
+              let mapping = rebase.mappings.first(where: {
+                  $0.sourceRenderID == initialTranscriptScrollPosition.renderID
+                      && $0.sourceMessageID
+                          == initialTranscriptScrollPosition.messageID
+              }) else {
+            return initialTranscriptScrollPosition
+        }
+        return ChatTranscriptScrollPosition(
+            renderID: mapping.targetRenderID,
+            messageID: mapping.targetMessageID,
+            offsetFromRowTop:
+                initialTranscriptScrollPosition.offsetFromRowTop,
+            coordinateSpaceVersion:
+                initialTranscriptScrollPosition.coordinateSpaceVersion
+        )
     }
 
     private var showsAssistantTypingIndicator: Bool {
@@ -1347,11 +1413,25 @@ struct ChatView: View {
                 modelContext: modelContext,
                 initialScrollPosition: initialTranscriptScrollPosition
             )
+            // A stale optimistic row can be canonicalized entirely from the
+            // ordinary on-device cache. Apply that migration synchronously so
+            // the subsequent network reconcile receives the durable position
+            // instead of starting a redundant historical lookup.
+            if let rebaseEvent =
+                    viewModel.transcriptScrollPositionRebaseEvent {
+                handleTranscriptScrollPositionRebase(rebaseEvent)
+            }
+            if let retirementEvent =
+                    viewModel.transcriptScrollPositionRetirementEvent {
+                handleTranscriptScrollPositionRetirement(retirementEvent)
+            }
         }
     }
 
     private func handleInitialAppearanceTask() async {
         prepareInitialAppearance()
+        let preparedInitialScrollPosition =
+            effectiveInitialTranscriptScrollPosition
 
         guard ChatInitialAppearancePolicy.shouldBeginAsyncWork(
             hasCompletedAppearance: didCompleteInitialAppearance
@@ -1359,16 +1439,23 @@ struct ChatView: View {
             return
         }
 
-        async let chatStartup: Void = performInitialAsyncWork()
+        async let chatStartup: Void = performInitialAsyncWork(
+            initialScrollPosition: preparedInitialScrollPosition
+        )
         async let gitAvailability: Void = loadInitialGitAvailability()
         _ = await (chatStartup, gitAvailability)
     }
 
-    private func performInitialAsyncWork() async {
+    private func performInitialAsyncWork(
+        initialScrollPosition: ChatTranscriptScrollPosition?
+    ) async {
         guard !Task.isCancelled else { return }
 
         if loadsInitialMessages {
-            await loadMessages(appliesInitialFocus: false)
+            await loadMessages(
+                appliesInitialFocus: false,
+                initialScrollPosition: initialScrollPosition
+            )
             guard !Task.isCancelled else { return }
         }
         if initialAttachments.isEmpty {
@@ -1415,10 +1502,18 @@ struct ChatView: View {
         viewModel.isViewingCachedData || viewModel.activeStreamID != nil || viewModel.isSubmittingGoal
     }
 
-    private func loadMessages(appliesInitialFocus: Bool = true) async {
+    private func loadMessages(
+        appliesInitialFocus: Bool = true,
+        allowsCacheFallback: Bool = true,
+        expectedResponseCompletionTrigger: Int? = nil,
+        initialScrollPosition: ChatTranscriptScrollPosition? = nil
+    ) async {
         await viewModel.loadMessages(
             modelContext: modelContext,
-            initialScrollPosition: initialTranscriptScrollPosition
+            initialScrollPosition: initialScrollPosition,
+            allowsCacheFallback: allowsCacheFallback,
+            expectedResponseCompletionTrigger:
+                expectedResponseCompletionTrigger
         )
         await viewModel.reconnectStreamIfNeeded(modelContext: modelContext)
         if appliesInitialFocus {
@@ -1472,6 +1567,10 @@ struct ChatView: View {
         let shouldRestoreFocusAfterSend = composerIsFocused
 
         if submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
+            // Slash handlers can append local rows or begin an auxiliary
+            // stream before returning their result. Leave any temporary
+            // historical restoration page before executing them.
+            prepareTranscriptForExplicitSend()
             let parsedCommand = SlashCommandExecutor.parse(submittedDraft)?.command
             let result = await SlashCommandExecutor.execute(text: submittedDraft, viewModel: viewModel)
             handleSlashExecutionResult(result, parsedCommand: parsedCommand)
@@ -1965,12 +2064,22 @@ struct ChatView: View {
         }
 
         ChatHaptics.assistantResponseCompleted(isEnabled: isHapticsEnabled)
+        let completionTrigger = viewModel.responseCompletionHapticTrigger
+        let needsTranscriptRefresh =
+            viewModel.responseCompletionNeedsTranscriptRefresh
 
         Task { @MainActor in
             defer { endResponseCompletionBackgroundTask() }
 
-            if viewModel.responseCompletionNeedsTranscriptRefresh {
-                await loadMessages()
+            if needsTranscriptRefresh {
+                // Preserve the just-streamed turn if this reconciliation fails;
+                // an offline cache or stale successful response can predate the
+                // turn that just completed, and a quick next send supersedes it.
+                await loadMessages(
+                    appliesInitialFocus: false,
+                    allowsCacheFallback: false,
+                    expectedResponseCompletionTrigger: completionTrigger
+                )
             }
 
             await ResponseCompletionNotificationService.scheduleResponseCompletedIfAllowed(
@@ -2006,6 +2115,8 @@ struct ChatView: View {
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        viewModel.cancelInitialRestorationRequest()
+        viewModel.activateLatestMessageWindowIfNeeded()
         // Deliberate jump to the latest content. Snap without animation while a
         // response is streaming so the tap lands immediately instead of racing
         // the short follow animations already chasing incoming tokens.
@@ -2174,10 +2285,11 @@ struct ChatView: View {
     private func applyResolvedScrollMetrics(_ metrics: ChatScrollMetrics) {
         let wasUserInteracting = isUserInteractingWithScroll
         let isStreaming = viewModel.activeStreamID != nil
-        let isNearBottom = ChatScrollPolicy.isNearBottom(
-            distanceFromBottom: metrics.distanceFromBottom,
-            isStreaming: isStreaming
-        )
+        let isNearBottom = !viewModel.isShowingHistoricalMessageWindow
+            && ChatScrollPolicy.isNearBottom(
+                distanceFromBottom: metrics.distanceFromBottom,
+                isStreaming: isStreaming
+            )
         if isScrolledNearBottom != isNearBottom {
             isScrolledNearBottom = isNearBottom
         }
@@ -2220,28 +2332,94 @@ struct ChatView: View {
         transcriptViewportState.positionRecorder.record(position)
     }
 
-    private func handleInitialScrollPositionResolution(_ restored: Bool) {
+    private func handleTranscriptScrollPositionRebase(
+        _ event: ChatTranscriptScrollPositionRebaseEvent
+    ) {
+        for mapping in event.mappings {
+            let replacesInitialPosition =
+                initialTranscriptScrollPosition?.renderID
+                    == mapping.sourceRenderID
+                    && initialTranscriptScrollPosition?.messageID
+                        == mapping.sourceMessageID
+            if replacesInitialPosition {
+                // Ignore any bottom-layout sample captured while the target
+                // page was hidden; the persisted source is being migrated.
+                transcriptViewportState.positionRecorder
+                    .discardUnpersistedPosition()
+            }
+
+            guard let rebasedPosition =
+                    transcriptViewportState.positionRecorder.rebasePosition(
+                        sourceRenderID: mapping.sourceRenderID,
+                        sourceMessageID: mapping.sourceMessageID,
+                        targetRenderID: mapping.targetRenderID,
+                        targetMessageID: mapping.targetMessageID
+                    ) else {
+                continue
+            }
+
+            if replacesInitialPosition {
+                // Retarget the still-hidden lock before `isLoading` can become
+                // false and trigger a newest-tail fallback.
+                initialTranscriptScrollPosition = rebasedPosition
+            }
+            persistTranscriptScrollPosition()
+            return
+        }
+    }
+
+    private func handleTranscriptScrollPositionRetirement(
+        _ event: ChatTranscriptScrollPositionRetirementEvent
+    ) {
+        guard initialTranscriptScrollPosition?.renderID == event.renderID,
+              initialTranscriptScrollPosition?.messageID == event.messageID,
+              initialTranscriptScrollPosition?.hasTransientMessageIdentity
+                == true else {
+            return
+        }
+
+        ChatTranscriptScrollPersistence.save(
+            nil,
+            for: server,
+            sessionID: session.id
+        )
+        transcriptViewportState.positionRecorder.resetPosition(nil)
+        transcriptViewportState.lastRestorationCachePosition = nil
+        initialTranscriptScrollPosition = nil
+    }
+
+    private func handleInitialScrollPositionResolution(
+        _ resolution: ChatTranscriptInitialScrollResolution
+    ) {
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "view.resolution \(String(describing: resolution))"
+        )
         initialTranscriptScrollPosition = nil
 
-        if let latestMetrics = transcriptViewportState.latestMetrics {
+        if resolution == .missingAnchorFallback {
+            transcriptViewportState.positionRecorder
+                .discardUnpersistedPosition()
+            viewModel.activateLatestMessageWindowIfNeeded()
             transcriptViewportState.latestMetrics = nil
-            applyResolvedScrollMetrics(latestMetrics)
-        } else if !restored {
             shouldFollowLatestMessage = true
             isReadingOlderTranscript = false
             isScrolledNearBottom = true
+        } else if let latestMetrics = transcriptViewportState.latestMetrics {
+            transcriptViewportState.latestMetrics = nil
+            applyResolvedScrollMetrics(latestMetrics)
         }
         persistTranscriptScrollPosition()
 
-        // A fallback caused by unavailable/changed history deliberately keeps
-        // the last persisted anchor. A later online reopen can still restore
-        // it; an explicit user scroll will replace it through the live viewport
-        // callback.
+        // A fallback caused by an anchor outside the bounded window deliberately
+        // keeps the last persisted anchor. A later cached authoritative window
+        // can still restore it; an explicit reader scroll replaces it.
     }
 
     private func handleDisappear() {
         composerDraft.flush()
         persistTranscriptScrollPosition()
+        viewModel.cancelInitialRestorationRequest()
         activeStreamStatusRefreshTask?.cancel()
         activeStreamStatusRefreshTask = nil
         viewModel.stopListening()
@@ -2250,7 +2428,32 @@ struct ChatView: View {
     }
 
     private func persistTranscriptScrollPosition() {
-        transcriptViewportState.positionRecorder.flush()
+        let didFlush = transcriptViewportState.positionRecorder.flush()
+        // SCROLLTRACE
+        if didFlush,
+           let flushed =
+               transcriptViewportState.positionRecorder.persistedPosition {
+            ChatScrollTrace.log(
+                "view.persistPosition row=\(flushed.renderID) offset=\(String(format: "%.1f", flushed.offsetFromRowTop))"
+            )
+        }
+        guard let position =
+                transcriptViewportState.positionRecorder.persistedPosition else {
+            return
+        }
+        guard position
+            != transcriptViewportState.lastRestorationCachePosition else {
+            return
+        }
+
+        // Backfill the exact bounded window even when the restored viewport did
+        // not move and therefore needed no UserDefaults rewrite.
+        if viewModel.cacheCurrentRestorationMessageWindow(
+            containing: position,
+            modelContext: modelContext
+        ) {
+            transcriptViewportState.lastRestorationCachePosition = position
+        }
     }
 
     private var isAutoFollowScrollPaused: Bool {
@@ -2261,6 +2464,8 @@ struct ChatView: View {
     }
 
     private func prepareTranscriptForExplicitSend() {
+        viewModel.cancelInitialRestorationRequest()
+        viewModel.activateLatestMessageWindowIfNeeded()
         shouldFollowLatestMessage = true
         userScrollCooldownUntil = nil
         if isReadingOlderTranscript {

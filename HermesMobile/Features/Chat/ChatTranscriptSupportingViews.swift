@@ -6,8 +6,104 @@ struct ChatScrollMetrics: Equatable {
     let isUserInteracting: Bool
 }
 
+enum ChatTranscriptInitialScrollResolution: Equatable {
+    case restored
+    case missingAnchorFallback
+    case cancelledByUser
+}
+
+/// Non-observable access to the transcript's underlying UIScrollView.
+///
+/// Scroll samples remain outside SwiftUI state. Restoration uses this bridge
+/// for at most a bounded number of exact, non-animated offset corrections.
+@MainActor
+final class ChatScrollViewportController {
+    struct Snapshot: Equatable {
+        let visibleContentOffsetY: Double
+        let contentHeight: Double
+        let visibleContainerHeight: Double
+        let topContentInset: Double
+    }
+
+    private weak var scrollView: UIScrollView?
+    private(set) var latestSnapshot: Snapshot?
+
+    func attach(to scrollView: UIScrollView) {
+        self.scrollView = scrollView
+        updateSnapshot(from: scrollView)
+    }
+
+    func detach(from scrollView: UIScrollView?) {
+        guard self.scrollView === scrollView else { return }
+        self.scrollView = nil
+        latestSnapshot = nil
+    }
+
+    func updateSnapshot(from scrollView: UIScrollView) {
+        guard self.scrollView === scrollView else { return }
+
+        let inset = scrollView.adjustedContentInset
+        let visibleHeight = max(
+            0,
+            scrollView.bounds.height - inset.top - inset.bottom
+        )
+        latestSnapshot = Snapshot(
+            visibleContentOffsetY: Double(
+                scrollView.contentOffset.y + inset.top
+            ),
+            contentHeight: Double(scrollView.contentSize.height),
+            visibleContainerHeight: Double(visibleHeight),
+            topContentInset: Double(inset.top)
+        )
+    }
+
+    /// Reads UIKit's geometry synchronously instead of relying on the most
+    /// recent KVO delivery. Row-frame preferences can arrive before the
+    /// observer callback for the same layout pass, and a restoration
+    /// correction must never clamp against the previous content height.
+    func currentSnapshot() -> Snapshot? {
+        guard let scrollView else { return nil }
+        updateSnapshot(from: scrollView)
+        return latestSnapshot
+    }
+
+    func scrollToVisibleContentOffsetY(_ proposedOffsetY: Double) {
+        guard let scrollView else { return }
+
+        let inset = scrollView.adjustedContentInset
+        let visibleHeight = max(
+            0,
+            scrollView.bounds.height - inset.top - inset.bottom
+        )
+        let maximumOffsetY = max(
+            0,
+            scrollView.contentSize.height - visibleHeight
+        )
+        let visibleOffsetY = min(
+            maximumOffsetY,
+            max(0, CGFloat(proposedOffsetY))
+        )
+        let rawOffsetY = visibleOffsetY - inset.top
+        guard abs(scrollView.contentOffset.y - rawOffsetY) > 0.5 else {
+            updateSnapshot(from: scrollView)
+            return
+        }
+
+        // SCROLLTRACE
+        ChatScrollTrace.log(
+            "setContentOffset proposed=\(String(format: "%.1f", proposedOffsetY)) clamped=\(String(format: "%.1f", visibleOffsetY)) from=\(String(format: "%.1f", scrollView.contentOffset.y + inset.top)) contentH=\(String(format: "%.1f", scrollView.contentSize.height)) visibleH=\(String(format: "%.1f", visibleHeight))"
+        )
+        scrollView.setContentOffset(
+            CGPoint(x: scrollView.contentOffset.x, y: rawOffsetY),
+            animated: false
+        )
+        updateSnapshot(from: scrollView)
+    }
+}
+
 struct ChatScrollObserver: UIViewRepresentable {
     let isStreaming: Bool
+    var viewportController: ChatScrollViewportController? = nil
     let onMetrics: @MainActor (ChatScrollMetrics) -> Void
 
     private var metricContext: MetricContext {
@@ -15,7 +111,11 @@ struct ChatScrollObserver: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(metricContext: metricContext, onMetrics: onMetrics)
+        Coordinator(
+            metricContext: metricContext,
+            viewportController: viewportController,
+            onMetrics: onMetrics
+        )
     }
 
     func makeUIView(context: Context) -> ObserverView {
@@ -24,6 +124,7 @@ struct ChatScrollObserver: UIViewRepresentable {
 
     func updateUIView(_ uiView: ObserverView, context: Context) {
         context.coordinator.onMetrics = onMetrics
+        context.coordinator.viewportController = viewportController
         uiView.coordinator = context.coordinator
         context.coordinator.updateMetricContext(metricContext)
 
@@ -79,6 +180,7 @@ struct ChatScrollObserver: UIViewRepresentable {
         }
 
         var onMetrics: @MainActor (ChatScrollMetrics) -> Void
+        weak var viewportController: ChatScrollViewportController?
 
         private weak var scrollView: UIScrollView?
         private var observations: [NSKeyValueObservation] = []
@@ -89,9 +191,11 @@ struct ChatScrollObserver: UIViewRepresentable {
 
         init(
             metricContext: MetricContext,
+            viewportController: ChatScrollViewportController?,
             onMetrics: @escaping @MainActor (ChatScrollMetrics) -> Void
         ) {
             self.metricContext = metricContext
+            self.viewportController = viewportController
             self.onMetrics = onMetrics
         }
 
@@ -113,6 +217,7 @@ struct ChatScrollObserver: UIViewRepresentable {
             observations.removeAll()
             lastMetrics = nil
             self.scrollView = scrollView
+            viewportController?.attach(to: scrollView)
 
             observations = [
                 scrollView.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in
@@ -127,6 +232,7 @@ struct ChatScrollObserver: UIViewRepresentable {
         }
 
         func detach() {
+            viewportController?.detach(from: scrollView)
             observations.removeAll()
             lastMetrics = nil
             pendingMetrics = nil
@@ -134,10 +240,21 @@ struct ChatScrollObserver: UIViewRepresentable {
             scrollView = nil
         }
 
+        // SCROLLTRACE: last logged contentSize so the settling timeline is visible.
+        private var lastLoggedContentHeight: CGFloat = -1
+
         func reportMetrics(delivery: MetricDelivery) {
             guard let scrollView else { return }
 
             let inset = scrollView.adjustedContentInset
+            viewportController?.updateSnapshot(from: scrollView)
+            // SCROLLTRACE
+            if abs(scrollView.contentSize.height - lastLoggedContentHeight) > 0.5 {
+                lastLoggedContentHeight = scrollView.contentSize.height
+                ChatScrollTrace.log(
+                    "contentSize h=\(String(format: "%.1f", scrollView.contentSize.height)) offsetY=\(String(format: "%.1f", scrollView.contentOffset.y + inset.top))"
+                )
+            }
             let visibleHeight = scrollView.bounds.height - inset.top - inset.bottom
             guard visibleHeight > 0 else { return }
 
@@ -529,6 +646,7 @@ struct ChatTranscriptLoadingSkeletonView: View {
         .allowsHitTesting(false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Loading messages")
+        .accessibilityIdentifier("chat-transcript-loading-skeleton")
     }
 }
 
