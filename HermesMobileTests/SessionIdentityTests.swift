@@ -254,14 +254,16 @@ final class SessionRowDisplaySettingsTests: XCTestCase {
         super.tearDown()
     }
 
-    func testSubagentSessionsDefaultHiddenAndPersistStoredChoice() {
-        XCTAssertFalse(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
-
-        defaults.set(true, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
+    // Subagent children default to visible now that they nest under their
+    // parent row (desktop sidebar parity); an explicit stored opt-out wins.
+    func testSubagentSessionsDefaultVisibleAndPersistStoredChoice() {
         XCTAssertTrue(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
 
         defaults.set(false, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
         XCTAssertFalse(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
+
+        defaults.set(true, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
+        XCTAssertTrue(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
     }
 }
 

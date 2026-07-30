@@ -324,6 +324,7 @@ struct SessionSidebarUtilityRows: View {
 }
 
 struct SessionListRowsSection: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let viewModel: SessionListViewModel
 
     let sessions: [SessionSummary]
@@ -334,6 +335,11 @@ struct SessionListRowsSection: View {
     let showsWorkspace: Bool
     let selectedSessionID: String?
     let actions: SessionListRowActions
+    /// Child sessions nested beneath each top-level row, keyed by parent
+    /// session ID (`SessionListViewModel.childSessionsByParentID`).
+    var childSessionsByParentID: [String: [SessionSummary]] = [:]
+    var expandedChildSessionParentIDs: Set<String> = []
+    var onToggleChildSessions: ((SessionSummary) -> Void)? = nil
 
     var body: some View {
         sessionsHeaderRow
@@ -358,14 +364,42 @@ struct SessionListRowsSection: View {
                 sessionGroupHeader(section.title, isFirst: index == 0)
 
                 ForEach(section.sessions) { session in
+                    let nestedChildSessions = childSessions(for: session)
+                    let nestedChildrenAreExpanded = childSessionsAreExpanded(
+                        for: session,
+                        childSessions: nestedChildSessions
+                    )
+
                     SessionInteractiveRow(
                         viewModel: viewModel,
                         session: session,
                         showsMessageCount: showsMessageCount,
                         showsWorkspace: showsWorkspace,
                         selectedSessionID: selectedSessionID,
-                        actions: actions
+                        actions: actions,
+                        childSessionCount: nestedChildSessions.count,
+                        childSessionsAreExpanded: nestedChildrenAreExpanded,
+                        hasStreamingChildSession: nestedChildSessions.contains(
+                            where: SessionRowView.isActiveStreaming
+                        ),
+                        onToggleChildSessions: onToggleChildSessions.map { toggle in
+                            { toggle(session) }
+                        }
                     )
+
+                    if nestedChildrenAreExpanded {
+                        ForEach(nestedChildSessions) { childSession in
+                            SessionChildInteractiveRow(
+                                viewModel: viewModel,
+                                session: childSession,
+                                selectedSessionID: selectedSessionID,
+                                actions: actions
+                            )
+                            .transition(
+                                SessionListMotion.disclosureContentTransition(reduceMotion: reduceMotion)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -373,6 +407,23 @@ struct SessionListRowsSection: View {
 
     private var groupedSections: [SessionListSection] {
         SessionListViewModel.makeSections(for: sessions)
+    }
+
+    private func childSessions(for session: SessionSummary) -> [SessionSummary] {
+        guard let sessionID = session.sessionId else { return [] }
+        return childSessionsByParentID[sessionID] ?? []
+    }
+
+    /// Search shows every matched parent's children unfolded, mirroring the
+    /// desktop sidebar, so a child hit is visible without an extra tap.
+    private func childSessionsAreExpanded(
+        for session: SessionSummary,
+        childSessions: [SessionSummary]
+    ) -> Bool {
+        guard !childSessions.isEmpty else { return false }
+        if isSearchActive { return true }
+        guard let sessionID = session.sessionId else { return false }
+        return expandedChildSessionParentIDs.contains(sessionID)
     }
 
     private func sessionGroupHeader(_ title: String, isFirst: Bool) -> some View {
@@ -471,6 +522,10 @@ struct SessionInteractiveRow: View {
     let showsWorkspace: Bool
     let selectedSessionID: String?
     let actions: SessionListRowActions
+    var childSessionCount = 0
+    var childSessionsAreExpanded = false
+    var hasStreamingChildSession = false
+    var onToggleChildSessions: (() -> Void)? = nil
 
     var body: some View {
         Button {
@@ -480,7 +535,11 @@ struct SessionInteractiveRow: View {
                 session: session,
                 showsMessageCount: showsMessageCount,
                 showsWorkspace: showsWorkspace,
-                isViewingCachedData: viewModel.isViewingCachedData
+                isViewingCachedData: viewModel.isViewingCachedData,
+                childSessionCount: childSessionCount,
+                childSessionsAreExpanded: childSessionsAreExpanded,
+                hasStreamingChildSession: hasStreamingChildSession,
+                onToggleChildSessions: onToggleChildSessions
             )
         }
         .buttonStyle(.plain)
@@ -511,6 +570,12 @@ struct SessionInteractiveRow: View {
                 actions: actions
             )
         }
+        // The row collapses to a single VoiceOver element, so the nested chip
+        // button is unreachable there; expose the fold as a named action.
+        .modifier(ChildSessionsToggleAccessibilityAction(
+            childSessionsAreExpanded: childSessionsAreExpanded,
+            onToggleChildSessions: childSessionCount > 0 ? onToggleChildSessions : nil
+        ))
         .sessionsScreenListRow(insets: EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
     }
 
@@ -552,6 +617,72 @@ struct SessionInteractiveRow: View {
         SessionRowActionPolicy.offersMutationActions(for: session)
             && !viewModel.isViewingCachedData
             && hasServerSessionID(session)
+    }
+}
+
+/// Applies the "expand/collapse children" custom VoiceOver action only when a
+/// toggle is available — an unconditional `accessibilityAction` would announce
+/// a dead action on childless rows.
+private struct ChildSessionsToggleAccessibilityAction: ViewModifier {
+    let childSessionsAreExpanded: Bool
+    let onToggleChildSessions: (() -> Void)?
+
+    func body(content: Content) -> some View {
+        if let onToggleChildSessions {
+            content.accessibilityAction(
+                named: childSessionsAreExpanded
+                    ? String(localized: "Collapse child sessions")
+                    : String(localized: "Expand child sessions")
+            ) {
+                onToggleChildSessions()
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// Nested child-session row: opens the child on tap and offers the shared
+/// context menu. Delegated children are runner-owned and view-only
+/// (`isSessionReadOnly`), so the menu already reduces to copy/export for them;
+/// swipe mutations are intentionally not attached.
+struct SessionChildInteractiveRow: View {
+    let viewModel: SessionListViewModel
+    let session: SessionSummary
+    let selectedSessionID: String?
+    let actions: SessionListRowActions
+
+    var body: some View {
+        Button {
+            actions.open(session)
+        } label: {
+            SessionChildSessionRowView(
+                session: session,
+                isViewingCachedData: viewModel.isViewingCachedData
+            )
+        }
+        .buttonStyle(.plain)
+        .id(session.id)
+        .background(
+            session.sessionId == selectedSessionID
+                ? Color.accentColor.opacity(0.12)
+                : Color.clear,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .contextMenu {
+            SessionRowContextMenu(
+                session: session,
+                projects: viewModel.projects,
+                isViewingCachedData: viewModel.isViewingCachedData,
+                isRenamingSession: viewModel.isRenamingSession,
+                isCreatingProject: viewModel.isCreatingProject,
+                isMovingSession: viewModel.isMovingSession,
+                isLoadingProjects: viewModel.isLoadingProjects,
+                isMutating: viewModel.isMutating(session),
+                actions: actions
+            )
+        }
+        .sessionsScreenListRow(insets: EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
     }
 }
 

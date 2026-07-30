@@ -318,6 +318,8 @@ struct SettingsView: View {
                         isOn: $showsSubagentSessions
                     )
 
+                    SettingsFootnote(String(localized: "Delegated runs appear nested under their parent session."))
+
                     if let syncError = cliSessionsSync.syncErrorMessage
                         ?? cliSessionsSync.claudeCodeSyncErrorMessage {
                         SettingsErrorFootnote(syncError)

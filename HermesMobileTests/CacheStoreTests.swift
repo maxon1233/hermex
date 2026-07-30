@@ -97,7 +97,14 @@ final class CacheStoreTests: XCTestCase {
         XCTAssertEqual(cached.relationshipType, "child_session")
         XCTAssertTrue(cached.isDelegatedSubagentSession)
         XCTAssertTrue(cached.isSessionReadOnly)
-        XCTAssertFalse(AutomatedSessionVisibility(showsCron: true, showsCli: true).shows(cached))
+        XCTAssertTrue(cached.isChildSessionRow)
+        XCTAssertFalse(
+            AutomatedSessionVisibility(
+                showsCron: true,
+                showsCli: true,
+                showsSubagents: false
+            ).shows(cached)
+        )
         XCTAssertTrue(AutomatedSessionVisibility.showAll.shows(cached))
     }
 

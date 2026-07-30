@@ -68,7 +68,11 @@ final class SessionListMutationTests: XCTestCase {
             viewModel.visibleSessions(
                 searchText: "",
                 selectedProjectID: "project-1",
-                automatedVisibility: AutomatedSessionVisibility(showsCron: true, showsCli: true)
+                automatedVisibility: AutomatedSessionVisibility(
+                    showsCron: true,
+                    showsCli: true,
+                    showsSubagents: false
+                )
             ).compactMap(\.sessionId),
             ["cached-project-one"]
         )
@@ -2243,6 +2247,132 @@ final class SessionListMutationTests: XCTestCase {
         XCTAssertFalse(SessionSummary(sessionId: "normal").isDelegatedSubagentSession)
     }
 
+    // MARK: - Child-session nesting (desktop sidebar parity)
+
+    private func makeChildSession(
+        _ id: String,
+        parent: String,
+        lastMessageAt: Double? = nil,
+        sourceTag: String? = "subagent"
+    ) -> SessionSummary {
+        SessionSummary(
+            sessionId: id,
+            title: "Subagent Session",
+            lastMessageAt: lastMessageAt,
+            sourceTag: sourceTag,
+            parentSessionId: parent,
+            relationshipType: "child_session"
+        )
+    }
+
+    func testChildSessionRowRequiresParentAndChildRelationship() {
+        XCTAssertTrue(
+            SessionSummary(
+                sessionId: "child",
+                sourceTag: "subagent",
+                parentSessionId: "parent",
+                relationshipType: "child_session"
+            ).isChildSessionRow
+        )
+        // Tolerates server casing/whitespace.
+        XCTAssertTrue(
+            SessionSummary(
+                sessionId: "child-2",
+                parentSessionId: "parent",
+                relationshipType: "  Child_Session "
+            ).isChildSessionRow
+        )
+
+        // Parent linkage alone (forks, compression continuations) never nests.
+        XCTAssertFalse(
+            SessionSummary(
+                sessionId: "fork",
+                parentSessionId: "parent",
+                relationshipType: "fork"
+            ).isChildSessionRow
+        )
+        XCTAssertFalse(
+            SessionSummary(
+                sessionId: "continuation",
+                parentSessionId: "parent",
+                relationshipType: "compression_continuation"
+            ).isChildSessionRow
+        )
+        XCTAssertFalse(
+            SessionSummary(sessionId: "parent-only", parentSessionId: "parent").isChildSessionRow
+        )
+        // The relationship without a resolvable parent link cannot nest either.
+        XCTAssertFalse(
+            SessionSummary(sessionId: "orphan", relationshipType: "child_session").isChildSessionRow
+        )
+        XCTAssertFalse(
+            SessionSummary(
+                sessionId: "blank-parent",
+                parentSessionId: "   ",
+                relationshipType: "child_session"
+            ).isChildSessionRow
+        )
+    }
+
+    func testChildSessionsGroupUnderParentNewestFirst() {
+        let parent = SessionSummary(sessionId: "parent", title: "Audit", lastMessageAt: 100)
+        let older = makeChildSession("older", parent: "parent", lastMessageAt: 10)
+        let newer = makeChildSession("newer", parent: "parent", lastMessageAt: 20)
+        let unrelated = SessionSummary(sessionId: "other")
+
+        let groups = SessionListViewModel.childSessionsByParentID(in: [parent, older, newer, unrelated])
+
+        XCTAssertEqual(groups.keys.sorted(), ["parent"])
+        XCTAssertEqual(groups["parent"]?.compactMap(\.sessionId), ["newer", "older"])
+    }
+
+    func testGrandchildSessionsFlattenUnderTopLevelAncestor() {
+        let root = SessionSummary(sessionId: "root", lastMessageAt: 100)
+        let child = makeChildSession("child", parent: "root", lastMessageAt: 30)
+        let grandchild = makeChildSession("grandchild", parent: "child", lastMessageAt: 40)
+
+        let groups = SessionListViewModel.childSessionsByParentID(in: [root, child, grandchild])
+
+        XCTAssertEqual(groups.keys.sorted(), ["root"])
+        XCTAssertEqual(groups["root"]?.compactMap(\.sessionId), ["grandchild", "child"])
+    }
+
+    func testDanglingCyclicAndSelfParentedChildrenNeverAttach() {
+        let dangling = makeChildSession("dangling", parent: "missing")
+        let cycleA = makeChildSession("cycle-a", parent: "cycle-b")
+        let cycleB = makeChildSession("cycle-b", parent: "cycle-a")
+        let selfParented = makeChildSession("selfie", parent: "selfie")
+
+        XCTAssertTrue(
+            SessionListViewModel.childSessionsByParentID(
+                in: [dangling, cycleA, cycleB, selfParented]
+            ).isEmpty
+        )
+    }
+
+    func testHiddenSubagentChildrenAreDroppedFromGrouping() {
+        let parent = SessionSummary(sessionId: "parent")
+        let child = makeChildSession("child", parent: "parent")
+        let hidden = AutomatedSessionVisibility(
+            showsCron: true,
+            showsCli: true,
+            showsSubagents: false
+        )
+
+        XCTAssertTrue(
+            SessionListViewModel.childSessionsByParentID(
+                in: [parent, child],
+                automatedVisibility: hidden
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            SessionListViewModel.childSessionsByParentID(
+                in: [parent, child]
+            )["parent"]?.compactMap(\.sessionId),
+            ["child"]
+        )
+    }
+
     func testClaudeCodeSessionRequiresExplicitSourceMetadata() {
         XCTAssertTrue(SessionSummary(sessionId: "s1", sourceTag: "claude_code").isClaudeCodeSession)
         XCTAssertTrue(
@@ -2328,14 +2458,17 @@ final class SessionListMutationTests: XCTestCase {
         XCTAssertTrue(visibility.shows(SessionSummary(sessionId: "normal")))
     }
 
-    func testAutomatedVisibilityHidesSubagentsByDefaultAndShowsThemWhenEnabled() {
+    func testAutomatedVisibilityShowsSubagentsByDefaultAndHidesThemWhenDisabled() {
         let child = SessionSummary(sessionId: "subagent", sourceTag: "subagent")
-        XCTAssertFalse(AutomatedSessionVisibility(showsCron: true, showsCli: true).shows(child))
-        XCTAssertTrue(
+        // Subagents are visible by default now that they nest under their
+        // parent row instead of flooding the top level; the toggle remains the
+        // explicit opt-out.
+        XCTAssertTrue(AutomatedSessionVisibility(showsCron: true, showsCli: true).shows(child))
+        XCTAssertFalse(
             AutomatedSessionVisibility(
                 showsCron: true,
                 showsCli: true,
-                showsSubagents: true
+                showsSubagents: false
             ).shows(child)
         )
     }
@@ -2535,7 +2668,11 @@ final class SessionListMutationTests: XCTestCase {
         }
 
         await viewModel.load()
-        let hidden = AutomatedSessionVisibility(showsCron: true, showsCli: true)
+        let hidden = AutomatedSessionVisibility(
+            showsCron: true,
+            showsCli: true,
+            showsSubagents: false
+        )
         let shown = AutomatedSessionVisibility(
             showsCron: true,
             showsCli: true,
@@ -2590,6 +2727,108 @@ final class SessionListMutationTests: XCTestCase {
                 automatedVisibility: shown
             ).compactMap(\.sessionId),
             ["subagent-p1"]
+        )
+    }
+
+    @MainActor
+    func testVisibleSessionsNestAttachedChildrenAndKeepDanglingOnesTopLevel() async throws {
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {"session_id": "parent", "title": "Website Audit", "project_id": "p1", "last_message_at": 100},
+                {"session_id": "child-1", "title": "Subagent Session", "source_tag": "subagent", "read_only": true, "parent_session_id": "parent", "relationship_type": "child_session", "last_message_at": 90},
+                {"session_id": "child-2", "title": "Subagent Session", "source_tag": "subagent", "read_only": true, "parent_session_id": "parent", "relationship_type": "child_session", "last_message_at": 95},
+                {"session_id": "dangling-child", "title": "Orphaned Subagent", "source_tag": "subagent", "parent_session_id": "gone", "relationship_type": "child_session", "last_message_at": 80},
+                {"session_id": "fork", "title": "Branched Session", "parent_session_id": "parent", "relationship_type": "fork", "last_message_at": 70},
+                {"session_id": "other-p2", "title": "Other Project", "project_id": "p2", "last_message_at": 60}
+              ]
+            }
+            """, for: request)
+        }
+
+        await viewModel.load()
+
+        // Attached children leave the top level; a child whose parent is not
+        // in the loaded list stays visible as its own row; forks stay put.
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", selectedProjectID: nil).compactMap(\.sessionId),
+            ["parent", "dangling-child", "fork", "other-p2"]
+        )
+        XCTAssertEqual(
+            viewModel.childSessionsByParentID()["parent"]?.compactMap(\.sessionId),
+            ["child-2", "child-1"]
+        )
+
+        // Children follow their parent's scope: filtering to another project
+        // must not resurface them as top-level rows.
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", selectedProjectID: "p2").compactMap(\.sessionId),
+            ["other-p2"]
+        )
+
+        // Disabling the subagent toggle hides delegated children entirely.
+        let hidden = AutomatedSessionVisibility(
+            showsCron: true,
+            showsCli: true,
+            showsSubagents: false
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                selectedProjectID: nil,
+                automatedVisibility: hidden
+            ).compactMap(\.sessionId),
+            ["parent", "fork", "other-p2"]
+        )
+        XCTAssertNil(viewModel.childSessionsByParentID(automatedVisibility: hidden)["parent"])
+    }
+
+    @MainActor
+    func testSearchSurfacesParentWhenAttachedChildMatches() async throws {
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "parent", "title": "Website Audit", "last_message_at": 100},
+                    {"session_id": "child-1", "title": "Needle research run", "source_tag": "subagent", "parent_session_id": "parent", "relationship_type": "child_session", "last_message_at": 90},
+                    {"session_id": "quiet", "title": "Unrelated", "last_message_at": 50}
+                  ]
+                }
+                """, for: request)
+            case "/api/sessions/search":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "child-1", "title": "Needle research run", "match_type": "content"}
+                  ],
+                  "query": "haystack",
+                  "count": 1
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+
+        // A local title hit on a nested child surfaces its parent row (the
+        // children unfold under it while search is active).
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "needle", selectedProjectID: nil).compactMap(\.sessionId),
+            ["parent"]
+        )
+
+        // A remote content hit on a nested child resolves to the parent too.
+        await viewModel.searchSessions(query: "haystack", debounceNanoseconds: 0)
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "haystack", selectedProjectID: nil).compactMap(\.sessionId),
+            ["parent"]
         )
     }
 

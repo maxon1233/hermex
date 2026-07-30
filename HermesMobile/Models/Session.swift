@@ -358,6 +358,16 @@ extension SessionSummary {
         isDelegatedSubagentSession || readOnly == true || isReadOnly == true
     }
 
+    /// Mirrors hermes-webui's `_isChildSession` (`static/sessions.js`): only the
+    /// explicit server-stamped `child_session` relationship nests a row under
+    /// its parent. `/branch` forks and compression continuations also carry
+    /// `parentSessionId` with other (or no) relationship values and stay
+    /// top-level, so parent linkage alone never classifies a child.
+    var isChildSessionRow: Bool {
+        guard Self.nonEmpty(parentSessionId) != nil else { return false }
+        return Self.normalizedSourceMarker(relationshipType) == "child_session"
+    }
+
     var shouldAppearInSessionList: Bool {
         !isEmptySidebarPlaceholder
     }
@@ -462,7 +472,7 @@ struct AutomatedSessionVisibility: Equatable {
         showsCron: Bool,
         showsCli: Bool,
         showsClaudeCode: Bool = true,
-        showsSubagents: Bool = false
+        showsSubagents: Bool = true
     ) {
         self.showsCron = showsCron
         self.showsCli = showsCli

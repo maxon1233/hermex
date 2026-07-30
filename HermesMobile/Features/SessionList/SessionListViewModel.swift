@@ -156,14 +156,29 @@ final class SessionListViewModel {
         automatedVisibility: AutomatedSessionVisibility = .showAll
     ) -> [SessionSummary] {
         let query = Self.normalizedSearchQuery(rawSearchText)
-        let baseSessions = sessions.filter { automatedVisibility.shows($0) }
+        let childrenByParentID = Self.childSessionsByParentID(
+            in: sessions,
+            automatedVisibility: automatedVisibility
+        )
+        let attachedChildIDs = Set(childrenByParentID.values.joined().compactMap(\.sessionId))
+        let baseSessions = sessions.filter { session in
+            guard automatedVisibility.shows(session) else { return false }
+            guard let sessionID = session.sessionId else { return true }
+            return !attachedChildIDs.contains(sessionID)
+        }
         let projectFilteredSessions = baseSessions.filter { session in
             guard let selectedProjectID else { return true }
             return session.projectId == selectedProjectID
         }
+        // A parent also matches when one of its attached children does, so a
+        // child hit surfaces with its context instead of as a bare orphan row.
         let localMatches = projectFilteredSessions.filter { session in
             guard !query.isEmpty else { return true }
-            return Self.searchableText(for: session).contains(query)
+            if Self.searchableText(for: session).contains(query) { return true }
+            guard let sessionID = session.sessionId else { return false }
+            return childrenByParentID[sessionID]?.contains { child in
+                Self.searchableText(for: child).contains(query)
+            } == true
         }
         let sortedLocalMatches = Self.sortedSessions(localMatches)
 
@@ -179,12 +194,99 @@ final class SessionListViewModel {
             },
             uniquingKeysWith: { first, _ in first }
         )
+        var attachedAncestorByChildID: [String: String] = [:]
+        for (parentID, children) in childrenByParentID {
+            for child in children {
+                guard let childID = child.sessionId else { continue }
+                attachedAncestorByChildID[childID] = parentID
+            }
+        }
+        var seenRemoteIDs = Set<String>()
         let remoteMatches = remoteContentSearchSessionIDs.compactMap { sessionID -> SessionSummary? in
-            guard !localMatchIDs.contains(sessionID) else { return nil }
-            return sessionsByID[sessionID]
+            let resolvedID = attachedAncestorByChildID[sessionID] ?? sessionID
+            guard !localMatchIDs.contains(resolvedID),
+                  seenRemoteIDs.insert(resolvedID).inserted
+            else {
+                return nil
+            }
+            return sessionsByID[resolvedID]
         }
 
         return sortedLocalMatches + Self.sortedSessions(remoteMatches)
+    }
+
+    /// Child sessions attached beneath their top-level ancestor row, keyed by
+    /// that ancestor's session ID — the shape the desktop sidebar builds in
+    /// `_attachChildSessionsToSidebarRows` (`static/sessions.js`).
+    ///
+    /// A child chain (a subagent spawned by another subagent) flattens under its
+    /// nearest non-child ancestor, newest first. Children hidden by the
+    /// automated-visibility toggles are dropped entirely, and a child whose
+    /// parent chain leaves the loaded list is intentionally absent here —
+    /// ``visibleSessions(searchText:selectedProjectID:automatedVisibility:)``
+    /// keeps it top-level instead so a row can never silently disappear.
+    func childSessionsByParentID(
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> [String: [SessionSummary]] {
+        Self.childSessionsByParentID(in: sessions, automatedVisibility: automatedVisibility)
+    }
+
+    nonisolated static func childSessionsByParentID(
+        in sessions: [SessionSummary],
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> [String: [SessionSummary]] {
+        var sessionsByID: [String: SessionSummary] = [:]
+        for session in sessions {
+            guard let sessionID = nonEmpty(session.sessionId) else { continue }
+            if sessionsByID[sessionID] == nil {
+                sessionsByID[sessionID] = session
+            }
+        }
+
+        var childrenByParentID: [String: [SessionSummary]] = [:]
+        for session in sessions {
+            guard session.isChildSessionRow,
+                  automatedVisibility.shows(session),
+                  let ancestorID = attachedAncestorID(for: session, sessionsByID: sessionsByID)
+            else {
+                continue
+            }
+
+            childrenByParentID[ancestorID, default: []].append(session)
+        }
+
+        return childrenByParentID.mapValues { children in
+            children.sorted { timestamp(for: $0) > timestamp(for: $1) }
+        }
+    }
+
+    /// The nearest non-child ancestor `session` nests under, or nil when the
+    /// parent chain leaves the loaded list or degenerates into a cycle — the
+    /// child then stays a top-level row rather than vanishing.
+    nonisolated private static func attachedAncestorID(
+        for session: SessionSummary,
+        sessionsByID: [String: SessionSummary]
+    ) -> String? {
+        guard let sessionID = nonEmpty(session.sessionId) else { return nil }
+
+        var visited: Set<String> = [sessionID]
+        var current = session
+        while current.isChildSessionRow {
+            guard let parentID = nonEmpty(current.parentSessionId),
+                  let parent = sessionsByID[parentID],
+                  visited.insert(parentID).inserted
+            else {
+                return nil
+            }
+
+            if !parent.isChildSessionRow {
+                return parentID
+            }
+
+            current = parent
+        }
+
+        return nil
     }
 
     @discardableResult
@@ -932,7 +1034,7 @@ final class SessionListViewModel {
         Array(Set(rawStreamIDs.compactMap(nonEmpty))).sorted()
     }
 
-    private static func nonEmpty(_ value: String?) -> String? {
+    nonisolated private static func nonEmpty(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
@@ -948,7 +1050,7 @@ final class SessionListViewModel {
         }
     }
 
-    private static func timestamp(for session: SessionSummary) -> Double {
+    nonisolated private static func timestamp(for session: SessionSummary) -> Double {
         session.lastMessageAt ?? session.updatedAt ?? session.createdAt ?? 0
     }
 

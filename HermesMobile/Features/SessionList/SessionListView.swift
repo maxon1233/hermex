@@ -37,6 +37,9 @@ struct SessionListView: View {
     @State private var sidebarScrollPosition: String?
     @State private var didCompleteInitialLoad = false
     @State private var pendingDestinationAfterDismissal: SessionNavigationDestination?
+    /// Parents whose nested child sessions are unfolded. Session-scoped state
+    /// (like the desktop sidebar's expansion set), not a persisted setting.
+    @State private var expandedChildSessionParentIDs: Set<String> = []
     @FocusState private var searchFieldIsFocused: Bool
     @AppStorage(SessionSidebarDisclosureSettings.profilesAreExpandedKey)
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
@@ -210,6 +213,10 @@ struct SessionListView: View {
                 openRequestedNewChatIfNeeded()
             }
             .onChange(of: navigationState.destination) { oldValue, newValue in
+                if case .session(let session) = newValue {
+                    expandChildSessionParentIfNeeded(for: session.sessionId)
+                }
+
                 let shouldRefresh = SessionListRefreshPolicy.shouldRefreshAfterNavigationChange(
                     from: oldValue,
                     to: newValue
@@ -434,7 +441,10 @@ struct SessionListView: View {
                 selectedSessionID: horizontalSizeClass == .regular
                     ? navigationState.selectedSessionID
                     : nil,
-                actions: sessionRowActions
+                actions: sessionRowActions,
+                childSessionsByParentID: childSessionsByParentID,
+                expandedChildSessionParentIDs: expandedChildSessionParentIDs,
+                onToggleChildSessions: toggleChildSessions
             )
 
             if showsArchivedEntry {
@@ -475,6 +485,10 @@ struct SessionListView: View {
         // so insert/remove animates. Value-based so it works with @AppStorage.
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: profilesAreExpanded)
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
+        .animation(
+            SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion),
+            value: expandedChildSessionParentIDs
+        )
     }
 
     private var header: some View {
@@ -670,6 +684,34 @@ struct SessionListView: View {
         )
     }
 
+    private var childSessionsByParentID: [String: [SessionSummary]] {
+        viewModel.childSessionsByParentID(automatedVisibility: automatedSessionVisibility)
+    }
+
+    private func toggleChildSessions(for session: SessionSummary) {
+        guard let sessionID = session.sessionId else { return }
+
+        if expandedChildSessionParentIDs.contains(sessionID) {
+            expandedChildSessionParentIDs.remove(sessionID)
+        } else {
+            expandedChildSessionParentIDs.insert(sessionID)
+        }
+    }
+
+    /// Keeps the fold in sync with navigation the way the desktop sidebar does
+    /// (`_syncSidebarExpansionForActiveSession`): selecting a nested child
+    /// unfolds its parent so the selection highlight is visible, while manual
+    /// collapse afterwards still works.
+    private func expandChildSessionParentIfNeeded(for sessionID: String?) {
+        guard let sessionID else { return }
+
+        for (parentID, childSessions) in childSessionsByParentID
+        where childSessions.contains(where: { $0.sessionId == sessionID }) {
+            expandedChildSessionParentIDs.insert(parentID)
+            return
+        }
+    }
+
     private var automatedSessionVisibility: AutomatedSessionVisibility {
         AutomatedSessionVisibility.sessionsSurface(
             showsCli: showsCliSessions,
@@ -835,7 +877,12 @@ struct SessionListView: View {
     }
 
     private var activeSessionMonitorTaskID: ActiveSessionMonitorTaskID {
-        let activeSessions = visibleSessions.filter(SessionRowView.isActiveStreaming)
+        // Attached children left the top-level list, but a delegated run
+        // finishing must still refresh the sidebar (its live dot bubbles onto
+        // the parent row), so their streams stay monitored alongside it.
+        let attachedChildSessions = childSessionsByParentID.values.joined()
+        let activeSessions = (visibleSessions + attachedChildSessions)
+            .filter(SessionRowView.isActiveStreaming)
         return ActiveSessionMonitorTaskID(
             streamIDs: SessionListViewModel.activeStreamIDs(in: activeSessions),
             hasActiveRows: !activeSessions.isEmpty,

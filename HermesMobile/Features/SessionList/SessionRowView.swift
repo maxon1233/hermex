@@ -4,6 +4,7 @@ struct SessionRowView: View {
     static let relativeDateRefreshInterval: TimeInterval = 1
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ScaledMetric(relativeTo: .caption2) private var pinnedIconSize: CGFloat = 11
     @ScaledMetric(relativeTo: .body) private var verticalPadding: CGFloat = 8
 
@@ -11,6 +12,10 @@ struct SessionRowView: View {
     var showsMessageCount = true
     var showsWorkspace = true
     var isViewingCachedData = false
+    var childSessionCount = 0
+    var childSessionsAreExpanded = false
+    var hasStreamingChildSession = false
+    var onToggleChildSessions: (() -> Void)? = nil
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: Self.relativeDateRefreshInterval)) { context in
@@ -20,7 +25,10 @@ struct SessionRowView: View {
 
     private func row(relativeTo now: Date) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            if Self.isActiveStreaming(session) {
+            // A streaming delegated child bubbles its live state up to the
+            // parent row, mirroring the desktop sidebar, so a collapsed parent
+            // still shows that work is running underneath it.
+            if Self.isActiveStreaming(session) || hasStreamingChildSession {
                 ActiveSessionStreamingIndicator()
                     .padding(.top, streamingIndicatorTopPadding)
             }
@@ -163,7 +171,51 @@ struct SessionRowView: View {
                     .foregroundStyle(Color.accentColor)
                     .accessibilityHidden(true)
             }
+
+            if childSessionCount > 0 {
+                childSessionCountChip
+            }
         }
+    }
+
+    /// The desktop sidebar's tappable "N children" pill: it only folds the
+    /// inline child rows in and out — opening the session stays on the row
+    /// itself. As a nested button it captures its own taps, so a chip tap
+    /// never falls through to the enclosing row button.
+    private var childSessionCountChip: some View {
+        HapticButton {
+            onToggleChildSessions?()
+        } label: {
+            HStack(spacing: 3) {
+                Text(Self.childSessionCountLabel(for: childSessionCount))
+                    .font(AppFont.caption2(weight: .semibold))
+                    .lineLimit(1)
+                    // The pill never compresses — the flexible title truncates
+                    // instead, so the count stays readable (desktop parity).
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .rotationEffect(.degrees(childSessionsAreExpanded ? -180 : 0))
+                    .animation(
+                        SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion),
+                        value: childSessionsAreExpanded
+                    )
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.accentColor.opacity(0.14), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHidden(true)
+    }
+
+    static func childSessionCountLabel(for count: Int) -> String {
+        count == 1
+            ? String(localized: "1 child")
+            : String(localized: "\(count) children")
     }
 
     private func relativeDateText(_ text: String) -> some View {
@@ -270,11 +322,97 @@ struct SessionRowView: View {
 
         parts.append(contentsOf: Self.accessibilityStateLabels(for: session, isViewingCachedData: isViewingCachedData))
 
+        if childSessionCount > 0 {
+            parts.append(
+                childSessionCount == 1
+                    ? String(localized: "1 child session")
+                    : String(localized: "\(childSessionCount) child sessions")
+            )
+            parts.append(
+                childSessionsAreExpanded
+                    ? String(localized: "Expanded")
+                    : String(localized: "Collapsed")
+            )
+        }
+
         if let metadataLabel {
             parts.append(metadataLabel)
         }
 
         if let relativeDate = Self.relativeDate(for: session, relativeTo: now) {
+            parts.append(relativeDate)
+        }
+
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Compact indented row for a child session nested under its parent — the
+/// mobile counterpart of the desktop sidebar's "-> Title - time" child rows.
+struct SessionChildSessionRowView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let session: SessionSummary
+    var isViewingCachedData = false
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: SessionRowView.relativeDateRefreshInterval)) { context in
+            row(relativeTo: context.date)
+        }
+    }
+
+    private func row(relativeTo now: Date) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: "arrow.turn.down.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+
+            if SessionRowView.isActiveStreaming(session) {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
+            }
+
+            Text(SessionRowView.displayTitle(for: session))
+                .font(AppFont.subheadline(weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+
+            Spacer(minLength: 8)
+
+            if let relativeDate = SessionRowView.relativeDate(for: session, relativeTo: now) {
+                Text(relativeDate)
+                    .font(AppFont.caption())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .padding(.leading, 30)
+        .padding(.trailing, 12)
+        .padding(.vertical, 6)
+        .frame(minHeight: 40, alignment: .center)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilitySummary(relativeTo: now))
+    }
+
+    private func accessibilitySummary(relativeTo now: Date) -> String {
+        var parts = [
+            String(localized: "Child session"),
+            SessionRowView.displayTitle(for: session)
+        ]
+
+        parts.append(contentsOf: SessionRowView.accessibilityStateLabels(
+            for: session,
+            isViewingCachedData: isViewingCachedData
+        ))
+
+        if let relativeDate = SessionRowView.relativeDate(for: session, relativeTo: now) {
             parts.append(relativeDate)
         }
 
@@ -372,10 +510,12 @@ private enum SessionRelativeDateFormatter {
 enum SessionRowDisplaySettings {
     static let showMessageCountKey = "sessionRow.showMessageCount"
     static let showWorkspaceKey = "sessionRow.showWorkspace"
-    // CLI sessions default to shown; delegated subagents default to hidden.
+    // CLI sessions default to shown. Delegated subagents default to shown too:
+    // they nest under their parent row behind an "N children" pill (desktop
+    // sidebar parity), so visible-by-default no longer floods the top level.
     // Cron executions are always routed to Tasks instead of Sessions.
     static let showSubagentSessionsKey = "sessionRow.showSubagentSessions"
-    static let defaultShowsSubagentSessions = false
+    static let defaultShowsSubagentSessions = true
     // Legacy global CLI-sessions key. Since #19 the CLI toggle is stored
     // per-server (it mirrors the server's own `show_cli_sessions` setting, and a
     // value adopted from server A must not leak to server B); this key survives
