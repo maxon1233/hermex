@@ -568,21 +568,11 @@ enum SessionRowDisplaySettings {
 
 enum SessionSidebarDisclosureSettings {
     static let profilesAreExpandedKey = "sessionSidebar.profilesAreExpanded"
-    static let projectsAreExpandedKey = "sessionSidebar.projectsAreExpanded"
     static let defaultProfilesAreExpanded = false
-    static let defaultProjectsAreExpanded = false
 
     static func profilesAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
         guard let value = defaults.object(forKey: profilesAreExpandedKey) as? Bool else {
             return defaultProfilesAreExpanded
-        }
-
-        return value
-    }
-
-    static func projectsAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
-        guard let value = defaults.object(forKey: projectsAreExpandedKey) as? Bool else {
-            return defaultProjectsAreExpanded
         }
 
         return value

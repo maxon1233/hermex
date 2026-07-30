@@ -33,7 +33,10 @@ struct SessionListView: View {
     @State private var isSearchVisible = false
     @State private var isSearchFocused = false
     @State private var searchChromeIsExpanded = false
-    @State private var selectedProjectID: String?
+    /// Session-scoped like the desktop's `_activeProject`, but Hermex opens on
+    /// Unassigned: the main list carries only ungrouped conversations, and
+    /// grouped ones appear by picking their project chip.
+    @State private var projectFilter: SessionProjectFilter = .unassigned
     @State private var sidebarScrollPosition: String?
     @State private var didCompleteInitialLoad = false
     @State private var pendingDestinationAfterDismissal: SessionNavigationDestination?
@@ -43,8 +46,6 @@ struct SessionListView: View {
     @FocusState private var searchFieldIsFocused: Bool
     @AppStorage(SessionSidebarDisclosureSettings.profilesAreExpandedKey)
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
-    @AppStorage(SessionSidebarDisclosureSettings.projectsAreExpandedKey)
-    private var projectsAreExpanded = SessionSidebarDisclosureSettings.defaultProjectsAreExpanded
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
     @AppStorage(SessionRowDisplaySettings.showSubagentSessionsKey)
@@ -412,22 +413,41 @@ struct SessionListView: View {
                 SessionSidebarUtilityRows(
                     viewModel: viewModel,
                     topPadding: 10,
-                    automatedVisibility: automatedSessionVisibility,
                     profilesAreExpanded: $profilesAreExpanded,
-                    projectsAreExpanded: $projectsAreExpanded,
-                    selectedProjectID: $selectedProjectID,
-                    projectPendingDeletion: $projectPendingDeletion,
-                    projectPendingRename: $projectPendingRename,
                     openDestination: { destination in
                         navigationState.select(destination)
                     },
                     switchActiveProfile: { profile in
                         Task { await switchActiveProfile(profile) }
+                    }
+                )
+            }
+
+            // Desktop parity: the project bar renders whenever there is
+            // something to scope (projects, or unassigned rows for the
+            // Unassigned chip), search included — search runs inside the
+            // selected scope, so the active chip must stay visible.
+            if showsProjectFilterBar {
+                SessionProjectFilterBar(
+                    projects: viewModel.projects,
+                    activeFilter: effectiveProjectFilter,
+                    showsUnassignedChip: hasUnassignedSessions,
+                    isViewingCachedData: viewModel.isViewingCachedData,
+                    isRenamingProject: viewModel.isRenamingProject,
+                    isDeletingProject: viewModel.isDeletingProject,
+                    select: selectProjectFilter,
+                    renameProject: { project in
+                        projectPendingRename = project
                     },
-                    presentProjectCreation: {
+                    deleteProject: { project in
+                        projectPendingDeletion = project
+                    },
+                    createProject: {
                         isPresentingProjectCreation = true
                     }
                 )
+                .padding(.top, isSearchingSessions ? 14 : 18)
+                .sessionsScreenListRow()
             }
 
             SessionListRowsSection(
@@ -484,7 +504,6 @@ struct SessionListView: View {
         // Disclosure subrows are real List rows; drive their fold from the List
         // so insert/remove animates. Value-based so it works with @AppStorage.
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: profilesAreExpanded)
-        .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
         .animation(
             SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion),
             value: expandedChildSessionParentIDs
@@ -679,13 +698,39 @@ struct SessionListView: View {
     private var visibleSessions: [SessionSummary] {
         viewModel.visibleSessions(
             searchText: searchText,
-            selectedProjectID: selectedProjectID,
+            projectFilter: effectiveProjectFilter,
             automatedVisibility: automatedSessionVisibility
         )
     }
 
     private var childSessionsByParentID: [String: [SessionSummary]] {
         viewModel.childSessionsByParentID(automatedVisibility: automatedSessionVisibility)
+    }
+
+    private var hasUnassignedSessions: Bool {
+        viewModel.hasUnassignedSessions(automatedVisibility: automatedSessionVisibility)
+    }
+
+    /// Desktop parity: the bar renders when there are projects OR unassigned
+    /// rows, i.e. whenever a chip would scope anything.
+    private var showsProjectFilterBar: Bool {
+        !viewModel.projects.isEmpty || hasUnassignedSessions
+    }
+
+    /// The stored choice resolved against current data, so an empty Unassigned
+    /// scope or a deleted project falls back to All instead of a blank list.
+    private var effectiveProjectFilter: SessionProjectFilter {
+        SessionListViewModel.effectiveProjectFilter(
+            projectFilter,
+            hasUnassignedSessions: hasUnassignedSessions,
+            knownProjectIDs: Set(viewModel.projects.compactMap(\.projectId))
+        )
+    }
+
+    private func selectProjectFilter(_ filter: SessionProjectFilter) {
+        withAnimation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion)) {
+            projectFilter = filter
+        }
     }
 
     private func toggleChildSessions(for session: SessionSummary) {
@@ -771,23 +816,33 @@ struct SessionListView: View {
     }
 
     private var emptySessionsTitle: String {
-        if hasActiveSessionFilter {
+        if !normalizedSearchText.isEmpty {
             return String(localized: "No matching sessions")
         }
 
-        return String(localized: "No sessions yet")
+        switch effectiveProjectFilter {
+        case .all:
+            return String(localized: "No sessions yet")
+        case .unassigned:
+            return String(localized: "No unassigned sessions")
+        case .project:
+            return String(localized: "No sessions in this project yet")
+        }
     }
 
     private var emptySessionsDescription: String? {
-        if hasActiveSessionFilter {
+        if !normalizedSearchText.isEmpty {
             return String(localized: "Try another search or project filter.")
         }
 
-        return String(localized: "Tap Chat to start.")
-    }
-
-    private var hasActiveSessionFilter: Bool {
-        selectedProjectID != nil || !normalizedSearchText.isEmpty
+        switch effectiveProjectFilter {
+        case .all:
+            return String(localized: "Tap Chat to start.")
+        case .unassigned:
+            return nil
+        case .project:
+            return String(localized: "Move sessions here from a session's context menu.")
+        }
     }
 
     private var showsSearchClearButton: Bool {
@@ -1122,8 +1177,9 @@ struct SessionListView: View {
         let didDelete = await viewModel.delete(project, modelContext: modelContext)
         handleLastError()
 
-        if didDelete, selectedProjectID == deletedProjectID {
-            selectedProjectID = nil
+        // Desktop parity: deleting the actively filtered project resets to All.
+        if didDelete, let deletedProjectID, projectFilter == .project(deletedProjectID) {
+            projectFilter = .all
         }
     }
 

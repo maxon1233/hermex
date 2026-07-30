@@ -214,25 +214,19 @@ final class SessionSidebarDisclosureSettingsTests: XCTestCase {
         super.tearDown()
     }
 
+    // The Projects disclosure was replaced by the project chip bar, so only
+    // the profiles fold persists here now.
     func testDisclosureStatesDefaultToCollapsedWhenUnset() {
         XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey))
-        XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey))
         XCTAssertFalse(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
-        XCTAssertFalse(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
     }
 
     func testDisclosureStatesRoundTripThroughUserDefaults() {
         defaults.set(true, forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey)
-        defaults.set(false, forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey)
-
         XCTAssertTrue(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
-        XCTAssertFalse(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
 
         defaults.set(false, forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey)
-        defaults.set(true, forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey)
-
         XCTAssertFalse(SessionSidebarDisclosureSettings.profilesAreExpanded(in: defaults))
-        XCTAssertTrue(SessionSidebarDisclosureSettings.projectsAreExpanded(in: defaults))
     }
 }
 

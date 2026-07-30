@@ -49,6 +49,7 @@ final class CachedSession {
     var relationshipType: String?
     var readOnly: Bool?
     var isReadOnly: Bool?
+    var defaultHidden: Bool?
     /// nil identifies rows written before this marker existed, which always
     /// contained ordinary session metadata. false is used by the minimal row
     /// created when a restoration window is cached before the session list.
@@ -123,6 +124,7 @@ final class CachedSession {
         relationshipType = session.relationshipType
         readOnly = session.readOnly
         isReadOnly = session.isReadOnly
+        defaultHidden = session.defaultHidden
         self.cachedAt = cachedAt
         expiresAt = cachedAt.addingTimeInterval(CachePolicy.ttl)
     }

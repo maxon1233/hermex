@@ -2530,7 +2530,7 @@ final class SessionListMutationTests: XCTestCase {
     }
 
     @MainActor
-    func testSessionsSurfaceExcludesCronExecutionsFromListSearchAndProjects() async throws {
+    func testSessionsSurfaceExcludesCronExecutionsExceptExplicitProjectScope() async throws {
         let viewModel = try makeViewModel { request in
             XCTAssertEqual(request.url?.path, "/api/sessions")
             return apiTestJSONResponse("""
@@ -2569,13 +2569,25 @@ final class SessionListMutationTests: XCTestCase {
             ).compactMap(\.sessionId),
             ["ordinary-1"]
         )
+        // Explicitly scoping to the project reveals its cron executions
+        // (desktop project-chip parity, hermes-webui #3134) — recurring jobs
+        // stay out of the default list and search, but a chip whose whole
+        // point is holding them (e.g. a "Cron Jobs" project) shows them.
         XCTAssertEqual(
             viewModel.visibleSessions(
                 searchText: "",
                 selectedProjectID: "project-1",
                 automatedVisibility: visibility
             ).compactMap(\.sessionId),
-            ["ordinary-1"]
+            ["tagged-cron", "cron_2", "cron_1", "ordinary-1"]
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                projectFilter: .unassigned,
+                automatedVisibility: visibility
+            ).compactMap(\.sessionId),
+            []
         )
     }
 
@@ -2829,6 +2841,162 @@ final class SessionListMutationTests: XCTestCase {
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "haystack", selectedProjectID: nil).compactMap(\.sessionId),
             ["parent"]
+        )
+    }
+
+    // MARK: - Project scopes (desktop project-bar parity)
+
+    func testProjectFilterIncludesAndReveals() {
+        let unassigned = SessionSummary(sessionId: "u1")
+        let emptyProjectID = SessionSummary(sessionId: "u2", projectId: "")
+        let assigned = SessionSummary(sessionId: "p1", projectId: "proj-1")
+
+        XCTAssertTrue(SessionProjectFilter.all.includes(unassigned))
+        XCTAssertTrue(SessionProjectFilter.all.includes(assigned))
+
+        XCTAssertTrue(SessionProjectFilter.unassigned.includes(unassigned))
+        XCTAssertTrue(SessionProjectFilter.unassigned.includes(emptyProjectID))
+        XCTAssertFalse(SessionProjectFilter.unassigned.includes(assigned))
+
+        XCTAssertTrue(SessionProjectFilter.project("proj-1").includes(assigned))
+        XCTAssertFalse(SessionProjectFilter.project("proj-2").includes(assigned))
+        XCTAssertFalse(SessionProjectFilter.project("proj-1").includes(unassigned))
+
+        // Only an explicit project selection reveals hidden background rows.
+        XCTAssertTrue(SessionProjectFilter.project("proj-1").explicitlyReveals(assigned))
+        XCTAssertFalse(SessionProjectFilter.project("proj-2").explicitlyReveals(assigned))
+        XCTAssertFalse(SessionProjectFilter.all.explicitlyReveals(assigned))
+        XCTAssertFalse(SessionProjectFilter.unassigned.explicitlyReveals(unassigned))
+    }
+
+    func testEffectiveProjectFilterFallsBackToAllWhenScopeIsMeaningless() {
+        XCTAssertEqual(
+            SessionListViewModel.effectiveProjectFilter(
+                .unassigned,
+                hasUnassignedSessions: true,
+                knownProjectIDs: []
+            ),
+            .unassigned
+        )
+        XCTAssertEqual(
+            SessionListViewModel.effectiveProjectFilter(
+                .unassigned,
+                hasUnassignedSessions: false,
+                knownProjectIDs: ["p"]
+            ),
+            .all
+        )
+        XCTAssertEqual(
+            SessionListViewModel.effectiveProjectFilter(
+                .project("p"),
+                hasUnassignedSessions: true,
+                knownProjectIDs: ["p"]
+            ),
+            .project("p")
+        )
+        XCTAssertEqual(
+            SessionListViewModel.effectiveProjectFilter(
+                .project("deleted"),
+                hasUnassignedSessions: true,
+                knownProjectIDs: ["p"]
+            ),
+            .all
+        )
+        XCTAssertEqual(
+            SessionListViewModel.effectiveProjectFilter(
+                .all,
+                hasUnassignedSessions: false,
+                knownProjectIDs: []
+            ),
+            .all
+        )
+    }
+
+    @MainActor
+    func testProjectScopesSplitUnassignedFromGroupedAndRevealHiddenRows() async throws {
+        let viewModel = try makeViewModel { request in
+            XCTAssertEqual(request.url?.path, "/api/sessions")
+            return apiTestJSONResponse("""
+            {
+              "sessions": [
+                {"session_id": "inbox", "title": "Inbox Review", "last_message_at": 50},
+                {"session_id": "audit", "title": "Website Audit", "project_id": "p1", "last_message_at": 40},
+                {"session_id": "child-1", "title": "Subagent Session", "source_tag": "subagent", "parent_session_id": "audit", "relationship_type": "child_session", "last_message_at": 30},
+                {"session_id": "cron_run", "title": "Nightly Crawl", "project_id": "p1", "source_tag": "cron", "default_hidden": true, "last_message_at": 20}
+              ]
+            }
+            """, for: request)
+        }
+
+        await viewModel.load()
+        let surface = AutomatedSessionVisibility.sessionsSurface(
+            showsCli: true,
+            showsClaudeCode: true,
+            showsSubagents: true
+        )
+
+        XCTAssertTrue(viewModel.hasUnassignedSessions(automatedVisibility: surface))
+
+        // Unassigned scope: grouped sessions and nested children stay out.
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                projectFilter: .unassigned,
+                automatedVisibility: surface
+            ).compactMap(\.sessionId),
+            ["inbox"]
+        )
+
+        // All: grouped rows appear, but server-stamped default_hidden
+        // background rows stay hidden — even under showAll toggles.
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                projectFilter: .all,
+                automatedVisibility: surface
+            ).compactMap(\.sessionId),
+            ["inbox", "audit"]
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                projectFilter: .all,
+                automatedVisibility: .showAll
+            ).compactMap(\.sessionId),
+            ["inbox", "audit"]
+        )
+
+        // The explicit project chip reveals its own rows, including the
+        // hidden cron execution (desktop #3134); children stay nested.
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "",
+                projectFilter: .project("p1"),
+                automatedVisibility: surface
+            ).compactMap(\.sessionId),
+            ["audit", "cron_run"]
+        )
+        XCTAssertEqual(
+            viewModel.childSessionsByParentID(automatedVisibility: surface)["audit"]?
+                .compactMap(\.sessionId),
+            ["child-1"]
+        )
+
+        // Search composes with the scope instead of escaping it.
+        XCTAssertTrue(
+            viewModel.visibleSessions(
+                searchText: "audit",
+                projectFilter: .unassigned,
+                automatedVisibility: surface
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            viewModel.visibleSessions(
+                searchText: "audit",
+                projectFilter: .project("p1"),
+                automatedVisibility: surface
+            ).compactMap(\.sessionId),
+            ["audit"]
         )
     }
 

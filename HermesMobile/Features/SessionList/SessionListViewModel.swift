@@ -25,6 +25,36 @@ enum ActiveSessionStateRefreshResult: Equatable {
     case failed
 }
 
+/// Which project scope the session list shows — the mobile counterpart of the
+/// desktop sidebar's `_activeProject` (`static/sessions.js`): `all` = every
+/// session, `unassigned` = only sessions with no project (`NO_PROJECT_FILTER`),
+/// `project` = one project's sessions.
+enum SessionProjectFilter: Equatable {
+    case all
+    case unassigned
+    case project(String)
+
+    /// Desktop reveal rule (hermes-webui #3134): an explicitly selected
+    /// project chip shows its own rows even when they are server-stamped
+    /// `default_hidden` background executions (cron/webhook).
+    func explicitlyReveals(_ session: SessionSummary) -> Bool {
+        guard case .project(let projectID) = self else { return false }
+        return session.projectId == projectID
+    }
+
+    func includes(_ session: SessionSummary) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .unassigned:
+            guard let projectID = session.projectId else { return true }
+            return projectID.isEmpty
+        case .project(let projectID):
+            return session.projectId == projectID
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class SessionListViewModel {
@@ -150,9 +180,22 @@ final class SessionListViewModel {
         .filter { !$0.sessions.isEmpty }
     }
 
+    /// Compatibility shape for pre-chip call sites: nil = every project.
+    func visibleSessions(
+        searchText: String,
+        selectedProjectID: String?,
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> [SessionSummary] {
+        visibleSessions(
+            searchText: searchText,
+            projectFilter: selectedProjectID.map(SessionProjectFilter.project) ?? .all,
+            automatedVisibility: automatedVisibility
+        )
+    }
+
     func visibleSessions(
         searchText rawSearchText: String,
-        selectedProjectID: String?,
+        projectFilter: SessionProjectFilter,
         automatedVisibility: AutomatedSessionVisibility = .showAll
     ) -> [SessionSummary] {
         let query = Self.normalizedSearchQuery(rawSearchText)
@@ -162,14 +205,23 @@ final class SessionListViewModel {
         )
         let attachedChildIDs = Set(childrenByParentID.values.joined().compactMap(\.sessionId))
         let baseSessions = sessions.filter { session in
-            guard automatedVisibility.shows(session) else { return false }
-            guard let sessionID = session.sessionId else { return true }
-            return !attachedChildIDs.contains(sessionID)
+            if let sessionID = session.sessionId, attachedChildIDs.contains(sessionID) {
+                return false
+            }
+
+            // The explicitly selected project chip reveals its own rows —
+            // `default_hidden` background executions and cron rows included
+            // (desktop parity, #3134) — while the CLI/Claude Code/subagent
+            // preferences keep applying. Nested children stay nested via the
+            // check above.
+            if projectFilter.explicitlyReveals(session) {
+                return automatedVisibility.showsInExplicitlySelectedProject(session)
+            }
+
+            guard session.defaultHidden != true else { return false }
+            return automatedVisibility.shows(session)
         }
-        let projectFilteredSessions = baseSessions.filter { session in
-            guard let selectedProjectID else { return true }
-            return session.projectId == selectedProjectID
-        }
+        let projectFilteredSessions = baseSessions.filter { projectFilter.includes($0) }
         // A parent also matches when one of its attached children does, so a
         // child hit surfaces with its context instead of as a bare orphan row.
         let localMatches = projectFilteredSessions.filter { session in
@@ -213,6 +265,50 @@ final class SessionListViewModel {
         }
 
         return sortedLocalMatches + Self.sortedSessions(remoteMatches)
+    }
+
+    /// Whether any ordinarily-visible top-level row has no project — the
+    /// desktop's `hasUnprojected`, which decides both whether the Unassigned
+    /// chip renders and whether the unassigned scope has anything to show.
+    func hasUnassignedSessions(
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> Bool {
+        let childrenByParentID = Self.childSessionsByParentID(
+            in: sessions,
+            automatedVisibility: automatedVisibility
+        )
+        let attachedChildIDs = Set(childrenByParentID.values.joined().compactMap(\.sessionId))
+
+        return sessions.contains { session in
+            guard SessionProjectFilter.unassigned.includes(session),
+                  session.defaultHidden != true,
+                  automatedVisibility.shows(session)
+            else {
+                return false
+            }
+
+            guard let sessionID = session.sessionId else { return true }
+            return !attachedChildIDs.contains(sessionID)
+        }
+    }
+
+    /// Resolves the chip the UI should treat as active. Falls back to All when
+    /// the stored choice can no longer show anything: Unassigned with every
+    /// session organized (the desktop hides that chip entirely), or a project
+    /// that no longer exists (the desktop resets on delete).
+    nonisolated static func effectiveProjectFilter(
+        _ filter: SessionProjectFilter,
+        hasUnassignedSessions: Bool,
+        knownProjectIDs: Set<String>
+    ) -> SessionProjectFilter {
+        switch filter {
+        case .all:
+            return .all
+        case .unassigned:
+            return hasUnassignedSessions ? .unassigned : .all
+        case .project(let projectID):
+            return knownProjectIDs.contains(projectID) ? filter : .all
+        }
     }
 
     /// Child sessions attached beneath their top-level ancestor row, keyed by
