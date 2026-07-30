@@ -2998,6 +2998,13 @@ final class SessionListMutationTests: XCTestCase {
             ).compactMap(\.sessionId),
             ["audit"]
         )
+
+        // The scope picker's row counts use display semantics: nested
+        // children are excluded, and the project count includes the hidden
+        // rows its own selection would reveal.
+        XCTAssertEqual(viewModel.sessionCount(for: .unassigned, automatedVisibility: surface), 1)
+        XCTAssertEqual(viewModel.sessionCount(for: .all, automatedVisibility: surface), 2)
+        XCTAssertEqual(viewModel.sessionCount(for: .project("p1"), automatedVisibility: surface), 2)
     }
 
     @MainActor

@@ -202,149 +202,303 @@ struct SessionSidebarUtilityRows: View {
     }
 }
 
-/// The desktop sidebar's project bar (`.project-bar` in `static/sessions.js`):
-/// All / Unassigned / one chip per project (with its color dot) / a "+" create
-/// button, in one horizontally scrollable row. Selecting a chip scopes the
-/// session list to that group; long-pressing a project chip offers the rename
-/// and delete actions that previously lived in the Projects disclosure.
-struct SessionProjectFilterBar: View {
+/// Vertical, collapsible successor of the desktop's horizontal project bar
+/// (`.project-bar` in `static/sessions.js`): a "Projects" header row that
+/// shows the active scope while folded, and — unfolded — one row per scope
+/// (All / Unassigned / each project) with its color, live row count, and a
+/// selection checkmark, plus the add-project button beside the header.
+/// Vertical because sideways chip scrolling hides options on a phone;
+/// selecting a scope folds the picker again to give the list back its space.
+struct SessionProjectScopeDisclosure: View {
+    private static let rowSpacing: CGFloat = 2
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let projects: [ProjectSummary]
     let activeFilter: SessionProjectFilter
-    /// The Unassigned chip only renders while unprojected sessions exist —
-    /// desktop parity keeps the bar uncluttered once everything is organized.
-    let showsUnassignedChip: Bool
+    /// The Unassigned row only renders while unprojected sessions exist —
+    /// desktop parity keeps the picker uncluttered once everything is
+    /// organized.
+    let showsUnassignedRow: Bool
     let isViewingCachedData: Bool
     let isRenamingProject: Bool
     let isDeletingProject: Bool
+    let sessionCount: (SessionProjectFilter) -> Int
+    @Binding var isExpanded: Bool
     let select: (SessionProjectFilter) -> Void
     let renameProject: (ProjectSummary) -> Void
     let deleteProject: (ProjectSummary) -> Void
     let createProject: () -> Void
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                filterChip(
+        headerRow
+            .sessionsScreenListRow()
+
+        if isExpanded {
+            scopeSubrow {
+                scopeRow(
                     title: String(localized: "All"),
                     accessibilityLabel: String(localized: "All sessions"),
-                    isActive: activeFilter == .all
-                ) {
-                    select(.all)
-                }
+                    icon: .system("rectangle.stack"),
+                    filter: .all
+                )
+            }
 
-                if showsUnassignedChip {
-                    filterChip(
+            if showsUnassignedRow {
+                scopeSubrow {
+                    scopeRow(
                         title: String(localized: "Unassigned"),
                         accessibilityLabel: String(localized: "Unassigned sessions"),
-                        isActive: activeFilter == .unassigned
-                    ) {
-                        select(.unassigned)
-                    }
-                }
-
-                ForEach(projects) { project in
-                    projectChip(for: project)
-                }
-
-                createButton
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 2)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Project filter")
-    }
-
-    private func filterChip(
-        title: String,
-        accessibilityLabel: String,
-        isActive: Bool,
-        dotColor: Color? = nil,
-        action: @escaping () -> Void
-    ) -> some View {
-        HapticButton(action: action) {
-            HStack(spacing: 6) {
-                if let dotColor {
-                    Circle()
-                        .fill(dotColor)
-                        .frame(width: 8, height: 8)
-                        .accessibilityHidden(true)
-                }
-
-                Text(title)
-                    .font(.footnote.weight(isActive ? .semibold : .medium))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
-            .padding(.horizontal, 12)
-            .frame(minHeight: 32)
-            .background {
-                if isActive {
-                    Capsule()
-                        .fill(Color.accentColor.opacity(0.14))
-                        .overlay {
-                            Capsule().stroke(Color.accentColor.opacity(0.25), lineWidth: 1)
-                        }
-                } else {
-                    // Flat translucent fill rather than Liquid Glass: a glass
-                    // elevation shadow would spill past this tightly-sized List
-                    // row and get clipped by the next row's opaque background.
-                    Capsule().fill(.thinMaterial)
+                        icon: .system("tray"),
+                        filter: .unassigned
+                    )
                 }
             }
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(isActive ? [.isSelected] : [])
-    }
 
-    private func projectChip(for project: ProjectSummary) -> some View {
-        filterChip(
-            title: projectDisplayName(project),
-            accessibilityLabel: String(localized: "Project \(projectDisplayName(project))"),
-            isActive: isActive(project),
-            dotColor: ProjectSummary.displayColor(
-                colorHex: project.color,
-                fallbackSeed: project.projectId ?? projectDisplayName(project)
-            )
-        ) {
-            guard let projectID = project.projectId else { return }
-            select(.project(projectID))
-        }
-        .contextMenu {
-            Button {
-                renameProject(project)
-            } label: {
-                Label("Rename Project", systemImage: "pencil")
+            ForEach(projects) { project in
+                scopeSubrow {
+                    projectRow(for: project)
+                }
             }
-            .disabled(projectActionsAreDisabled(project))
-
-            Button(role: .destructive) {
-                deleteProject(project)
-            } label: {
-                Label("Delete Project", systemImage: "trash")
-            }
-            .disabled(projectActionsAreDisabled(project))
         }
     }
 
-    private var createButton: some View {
-        HapticButton(action: createProject) {
-            Image(systemName: "plus")
+    private var headerRow: some View {
+        HStack(spacing: 8) {
+            SidebarDisclosureButton(
+                title: String(localized: "Projects"),
+                assetImage: "LucideFolder",
+                isExpanded: isExpanded
+            ) {
+                isExpanded.toggle()
+            } accessory: {
+                // While folded, the header itself answers "what am I looking
+                // at" — the active scope stays visible without unfolding.
+                if !isExpanded {
+                    activeScopeSummary
+                }
+            }
+            .accessibilityLabel(isExpanded ? "Collapse project scopes" : "Expand project scopes")
+            .accessibilityValue(activeScopeName)
+
+            // Sibling of the disclosure button (not nested in its label) so
+            // VoiceOver exposes it as its own focusable control.
+            if isExpanded {
+                addProjectButton
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, Self.rowSpacing)
+    }
+
+    private var activeScopeSummary: some View {
+        HStack(spacing: 6) {
+            if case .project(let projectID) = activeFilter,
+               let project = project(withID: projectID) {
+                Circle()
+                    .fill(ProjectSummary.displayColor(
+                        colorHex: project.color,
+                        fallbackSeed: project.projectId ?? projectDisplayName(project)
+                    ))
+                    .frame(width: 8, height: 8)
+            }
+
+            Text(activeScopeName)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 32, height: 32)
-                .background(.thinMaterial, in: Circle())
-                .frame(minWidth: 44, minHeight: 44)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .background(.thinMaterial, in: Capsule())
+        .accessibilityHidden(true)
+    }
+
+    private var addProjectButton: some View {
+        HapticButton(action: createProject) {
+            Image(systemName: "plus")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(isViewingCachedData)
         .accessibilityLabel("Add project")
         .accessibilityHint("Creates a new empty project.")
+    }
+
+    private func scopeSubrow<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 24)
+            .padding(.top, Self.rowSpacing)
+            .sessionsScreenListRow()
+            .transition(SessionListMotion.disclosureContentTransition(reduceMotion: reduceMotion))
+    }
+
+    private enum ScopeRowIcon {
+        case system(String)
+        case folder(Color)
+    }
+
+    @ViewBuilder
+    private func iconView(_ icon: ScopeRowIcon) -> some View {
+        switch icon {
+        case .folder(let tint):
+            SidebarUtilityIcon(assetImage: "LucideFolder", tint: tint)
+        case .system(let name):
+            Image(systemName: name)
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .frame(width: 28)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func scopeRow(
+        title: String,
+        accessibilityLabel: String,
+        icon: ScopeRowIcon,
+        filter: SessionProjectFilter
+    ) -> some View {
+        let isSelected = activeFilter == filter
+        let count = sessionCount(filter)
+
+        return Button {
+            select(filter)
+        } label: {
+            HStack(spacing: 18) {
+                iconView(icon)
+
+                Text(title)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                if count > 0 {
+                    Text("\(count)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+
+                if isSelected {
+                    SidebarSelectedSubrowIndicator()
+                }
+            }
+            .frame(minHeight: 44)
+            .sidebarSubrowSelectionStyle(isSelected: isSelected)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(scopeAccessibilityValue(count: count, isSelected: isSelected))
+        .accessibilityHint(isSelected ? "Already showing this scope." : "Shows this scope's sessions.")
+    }
+
+    private func projectRow(for project: ProjectSummary) -> some View {
+        let isSelected = isActive(project)
+        let count = project.projectId.map { sessionCount(.project($0)) } ?? 0
+
+        return HStack(spacing: 8) {
+            Button {
+                guard let projectID = project.projectId else { return }
+                select(.project(projectID))
+            } label: {
+                HStack(spacing: 18) {
+                    iconView(.folder(ProjectSummary.displayColor(
+                        colorHex: project.color,
+                        fallbackSeed: project.projectId ?? projectDisplayName(project)
+                    )))
+
+                    Text(projectDisplayName(project))
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 8)
+
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if isSelected {
+                        SidebarSelectedSubrowIndicator()
+                    }
+                }
+                .padding(.leading, 18)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(String(localized: "Project \(projectDisplayName(project))"))
+            .accessibilityValue(scopeAccessibilityValue(count: count, isSelected: isSelected))
+            .accessibilityHint(isSelected ? "Already showing this project." : "Shows this project's sessions.")
+
+            Menu {
+                Button {
+                    renameProject(project)
+                } label: {
+                    Label("Rename Project", systemImage: "pencil")
+                }
+                .disabled(projectActionsAreDisabled(project))
+
+                Button(role: .destructive) {
+                    deleteProject(project)
+                } label: {
+                    Label("Delete Project", systemImage: "trash")
+                }
+                .disabled(projectActionsAreDisabled(project))
+            } label: {
+                Label(
+                    String(localized: "Project actions for \(projectDisplayName(project))"),
+                    systemImage: "ellipsis"
+                )
+                .labelStyle(.iconOnly)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(String(localized: "Project actions for \(projectDisplayName(project))"))
+            .accessibilityHint("Shows rename and delete actions for this project.")
+        }
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.accentColor.opacity(0.20), lineWidth: 1)
+                    }
+            }
+        }
+    }
+
+    private var activeScopeName: String {
+        switch activeFilter {
+        case .all:
+            return String(localized: "All")
+        case .unassigned:
+            return String(localized: "Unassigned")
+        case .project(let projectID):
+            guard let project = project(withID: projectID) else {
+                return String(localized: "Project")
+            }
+            return projectDisplayName(project)
+        }
+    }
+
+    private func scopeAccessibilityValue(count: Int, isSelected: Bool) -> String {
+        let countTitle = String(localized: "\(count) sessions")
+        return isSelected ? String(localized: "Selected, \(countTitle)") : countTitle
+    }
+
+    private func project(withID projectID: String) -> ProjectSummary? {
+        projects.first { $0.projectId == projectID }
     }
 
     private func isActive(_ project: ProjectSummary) -> Bool {

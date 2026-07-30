@@ -267,6 +267,21 @@ final class SessionListViewModel {
         return sortedLocalMatches + Self.sortedSessions(remoteMatches)
     }
 
+    /// How many top-level rows `filter` would show, using the exact display
+    /// semantics of ``visibleSessions(searchText:projectFilter:automatedVisibility:)``
+    /// — nested children excluded, hidden background rows counted only for
+    /// their own explicitly selected project.
+    func sessionCount(
+        for filter: SessionProjectFilter,
+        automatedVisibility: AutomatedSessionVisibility = .showAll
+    ) -> Int {
+        visibleSessions(
+            searchText: "",
+            projectFilter: filter,
+            automatedVisibility: automatedVisibility
+        ).count
+    }
+
     /// Whether any ordinarily-visible top-level row has no project — the
     /// desktop's `hasUnprojected`, which decides both whether the Unassigned
     /// chip renders and whether the unassigned scope has anything to show.

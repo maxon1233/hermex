@@ -568,11 +568,24 @@ enum SessionRowDisplaySettings {
 
 enum SessionSidebarDisclosureSettings {
     static let profilesAreExpandedKey = "sessionSidebar.profilesAreExpanded"
+    // Also folds the project-scope picker (the vertical successor of both the
+    // old Projects disclosure and the desktop's horizontal project bar), so a
+    // pre-existing stored preference keeps applying.
+    static let projectsAreExpandedKey = "sessionSidebar.projectsAreExpanded"
     static let defaultProfilesAreExpanded = false
+    static let defaultProjectsAreExpanded = false
 
     static func profilesAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
         guard let value = defaults.object(forKey: profilesAreExpandedKey) as? Bool else {
             return defaultProfilesAreExpanded
+        }
+
+        return value
+    }
+
+    static func projectsAreExpanded(in defaults: UserDefaults = .standard) -> Bool {
+        guard let value = defaults.object(forKey: projectsAreExpandedKey) as? Bool else {
+            return defaultProjectsAreExpanded
         }
 
         return value

@@ -46,6 +46,8 @@ struct SessionListView: View {
     @FocusState private var searchFieldIsFocused: Bool
     @AppStorage(SessionSidebarDisclosureSettings.profilesAreExpandedKey)
     private var profilesAreExpanded = SessionSidebarDisclosureSettings.defaultProfilesAreExpanded
+    @AppStorage(SessionSidebarDisclosureSettings.projectsAreExpandedKey)
+    private var projectsAreExpanded = SessionSidebarDisclosureSettings.defaultProjectsAreExpanded
     @AppStorage(SessionRowDisplaySettings.showMessageCountKey) private var showsSessionMessageCount = true
     @AppStorage(SessionRowDisplaySettings.showWorkspaceKey) private var showsSessionWorkspace = true
     @AppStorage(SessionRowDisplaySettings.showSubagentSessionsKey)
@@ -423,18 +425,26 @@ struct SessionListView: View {
                 )
             }
 
-            // Desktop parity: the project bar renders whenever there is
+            // Desktop parity: the scope picker renders whenever there is
             // something to scope (projects, or unassigned rows for the
-            // Unassigned chip), search included — search runs inside the
-            // selected scope, so the active chip must stay visible.
+            // Unassigned entry), search included — search runs inside the
+            // selected scope, so the folded header keeps the active scope
+            // visible.
             if showsProjectFilterBar {
-                SessionProjectFilterBar(
+                SessionProjectScopeDisclosure(
                     projects: viewModel.projects,
                     activeFilter: effectiveProjectFilter,
-                    showsUnassignedChip: hasUnassignedSessions,
+                    showsUnassignedRow: hasUnassignedSessions,
                     isViewingCachedData: viewModel.isViewingCachedData,
                     isRenamingProject: viewModel.isRenamingProject,
                     isDeletingProject: viewModel.isDeletingProject,
+                    sessionCount: { filter in
+                        viewModel.sessionCount(
+                            for: filter,
+                            automatedVisibility: automatedSessionVisibility
+                        )
+                    },
+                    isExpanded: $projectsAreExpanded,
                     select: selectProjectFilter,
                     renameProject: { project in
                         projectPendingRename = project
@@ -446,8 +456,6 @@ struct SessionListView: View {
                         isPresentingProjectCreation = true
                     }
                 )
-                .padding(.top, isSearchingSessions ? 14 : 18)
-                .sessionsScreenListRow()
             }
 
             SessionListRowsSection(
@@ -504,6 +512,7 @@ struct SessionListView: View {
         // Disclosure subrows are real List rows; drive their fold from the List
         // so insert/remove animates. Value-based so it works with @AppStorage.
         .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: profilesAreExpanded)
+        .animation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion), value: projectsAreExpanded)
         .animation(
             SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion),
             value: expandedChildSessionParentIDs
@@ -730,6 +739,9 @@ struct SessionListView: View {
     private func selectProjectFilter(_ filter: SessionProjectFilter) {
         withAnimation(SessionListMotion.disclosureAnimation(reduceMotion: reduceMotion)) {
             projectFilter = filter
+            // Picking a scope folds the picker again (like the profile
+            // switcher) so the session list gets its space back immediately.
+            projectsAreExpanded = false
         }
     }
 
