@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Collapsible card for context-compaction marker messages, replacing the user
 /// bubble they would otherwise render as. Mirrors the web UI's collapsed cards
-/// and follows the `ReasoningBlockView` disclosure pattern.
+/// and follows the `TurnWorklogView` disclosure pattern.
 struct MarkerMessageCardView: View {
     let kind: ChatMarkerMessageKind
     let content: String?

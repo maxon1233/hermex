@@ -593,6 +593,10 @@ private struct CachedRestorationMessagePayload: Codable {
     let contentParts: [JSONValue]?
     let reasoning: String?
     let attachments: [MessageAttachment]?
+    /// Server control markers. Optional and decoded leniently, so blobs written
+    /// before these existed still restore — they simply carry no marker.
+    let source: String?
+    let isRecoveryControl: Bool?
 
     init(message: ChatMessage) {
         role = message.role
@@ -606,6 +610,8 @@ private struct CachedRestorationMessagePayload: Codable {
         contentParts = message.contentParts
         reasoning = message.reasoning
         attachments = message.attachments
+        source = message.source
+        isRecoveryControl = message.isRecoveryControl
     }
 
     var message: ChatMessage {
@@ -620,7 +626,9 @@ private struct CachedRestorationMessagePayload: Codable {
             toolCalls: toolCalls,
             contentParts: contentParts,
             reasoning: reasoning,
-            attachments: attachments
+            attachments: attachments,
+            source: source,
+            isRecoveryControl: isRecoveryControl
         )
     }
 }
@@ -693,7 +701,9 @@ private extension ChatMessage {
             toolCalls: toolCalls,
             contentParts: contentParts,
             reasoning: cachedMessage.reasoning,
-            attachments: attachments
+            attachments: attachments,
+            source: cachedMessage.source,
+            isRecoveryControl: cachedMessage.isRecoveryControl
         )
     }
 }

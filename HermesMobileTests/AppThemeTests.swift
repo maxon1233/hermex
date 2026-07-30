@@ -14,6 +14,35 @@ final class AppThemeTests: XCTestCase {
         XCTAssertEqual(AppTheme.dark.colorScheme, .dark)
     }
 
+    /// The worklog row is one disclosure over both kinds of detail, so either
+    /// Settings preference is enough to start it open.
+    func testWorklogStartsExpandedWhenEitherCardPreferenceIsOn() {
+        XCTAssertFalse(
+            ChatTranscriptDisplaySettings.worklogStartsExpanded(
+                thinkingCardsStartExpanded: false,
+                toolCardsStartExpanded: false
+            )
+        )
+        XCTAssertTrue(
+            ChatTranscriptDisplaySettings.worklogStartsExpanded(
+                thinkingCardsStartExpanded: true,
+                toolCardsStartExpanded: false
+            )
+        )
+        XCTAssertTrue(
+            ChatTranscriptDisplaySettings.worklogStartsExpanded(
+                thinkingCardsStartExpanded: false,
+                toolCardsStartExpanded: true
+            )
+        )
+        XCTAssertTrue(
+            ChatTranscriptDisplaySettings.worklogStartsExpanded(
+                thinkingCardsStartExpanded: true,
+                toolCardsStartExpanded: true
+            )
+        )
+    }
+
     func testHeaderLogoColorNormalizesStoredHexValues() {
         XCTAssertEqual(HeaderLogoColor.normalizedHex("#5b7cff"), "#5B7CFF")
         XCTAssertEqual(HeaderLogoColor.normalizedHex(" ff3b30 "), "#FF3B30")

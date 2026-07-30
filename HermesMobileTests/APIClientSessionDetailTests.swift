@@ -47,6 +47,41 @@ final class APIClientSessionDetailTests: APIClientTestCase {
         XCTAssertEqual(response.session?.messagesOffset, 25)
     }
 
+    /// `.convertFromSnakeCase` keeps `_source` verbatim (a leading underscore is
+    /// preserved) but camel-cases `recovery_control`, so both spellings are
+    /// decoded and a message carrying neither stays unmarked.
+    func testSessionMessagesDecodeControlMarkers() async throws {
+        let client = makeClient { request in
+            apiTestJSONResponse("""
+            {
+              "session": {
+                "session_id": "abc123",
+                "messages": [
+                  {"role": "user", "content": "Kick off the build", "_ts": 1770000000},
+                  {"role": "user", "content": "[IMPORTANT: Background process 4f2 completed]",
+                   "_ts": 1770000001, "_source": "process_wakeup"},
+                  {"role": "user", "content": "[System: Continue exactly where you left off.]",
+                   "_ts": 1770000002, "recovery_control": true}
+                ]
+              }
+            }
+            """, for: request)
+        }
+
+        let response = try await client.session(id: "abc123", includeMessages: true)
+        let messages = try XCTUnwrap(response.session?.messages)
+
+        XCTAssertEqual(messages.count, 3)
+        XCTAssertNil(messages[0].source)
+        XCTAssertNil(messages[0].isRecoveryControl)
+        XCTAssertEqual(messages[1].source, "process_wakeup")
+        XCTAssertEqual(messages[2].isRecoveryControl, true)
+        XCTAssertEqual(
+            messages.filter { !ChatControlMessageClassifier.isHiddenControlMessage($0) }.count,
+            1
+        )
+    }
+
     func testSessionColdLoadSendsExpandRenderableFlag() async throws {
         let client = makeClient { request in
             let components = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)
@@ -1449,11 +1484,16 @@ final class APIClientSessionDetailTests: APIClientTestCase {
         XCTAssertEqual(groups.first?.activityTitle, "Activity: 2 tools")
         XCTAssertEqual(groups.first?.toolCalls.map(\.id), ["functions.terminal:1", "functions.search_files:2"])
         XCTAssertEqual(groups.first?.toolCalls.map(\.name), ["terminal", "search_files"])
-        XCTAssertEqual(reasoningGroups.map(\.anchorMessageID), ["raw:5", "raw:7", "raw:9"])
-        XCTAssertEqual(reasoningGroups[0].text, "The user wants me to use terminal and search_files. I should run a quick command to show both work.")
-        XCTAssertEqual(reasoningGroups[1].text, "Terminal works. Now run search_files to show that works too.")
-        XCTAssertTrue(reasoningGroups[2].text.contains("Both tools worked. I should give a concise summary."))
-        XCTAssertFalse(reasoningGroups[2].text.contains(finalAnswer))
+        // Reasoning coalesces per turn exactly as the tool group above does, so
+        // both land on `raw:5` and render as one worklog row. The turn-final
+        // message resends the whole turn's thinking, superseding the partials.
+        XCTAssertEqual(reasoningGroups.map(\.anchorMessageID), ["raw:5"])
+        XCTAssertEqual(reasoningGroups[0].text, """
+        The user wants me to use terminal and search_files. I should run a quick command to show both work.
+        Terminal works. Now run search_files to show that works too.
+        Both tools worked. I should give a concise summary.
+        """)
+        XCTAssertFalse(reasoningGroups[0].text.contains(finalAnswer))
     }
 
     func testPartialPersistedToolCallsMergeMissingMessageToolCalls() {

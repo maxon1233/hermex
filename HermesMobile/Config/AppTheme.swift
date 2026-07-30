@@ -250,6 +250,16 @@ enum ChatTranscriptDisplaySettings {
         userToggled ?? startsExpanded
     }
 
+    /// The per-turn worklog row folds thinking and tool activity into one
+    /// disclosure, so it honours either Settings preference: whichever detail the
+    /// reader asked to see by default is behind this single toggle.
+    static func worklogStartsExpanded(
+        thinkingCardsStartExpanded: Bool,
+        toolCardsStartExpanded: Bool
+    ) -> Bool {
+        thinkingCardsStartExpanded || toolCardsStartExpanded
+    }
+
     static func shouldShowAssistantTypingIndicator(
         hasActiveStream: Bool,
         isCancellingStream: Bool,

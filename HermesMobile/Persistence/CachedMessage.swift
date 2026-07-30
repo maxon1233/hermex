@@ -21,6 +21,11 @@ final class CachedMessage {
     var contentPartsData: Data?
     var reasoning: String?
     var attachmentsData: Data?
+    /// Server control markers (`_source`, `recovery_control`). Optional, so rows
+    /// written before these existed migrate lightweight and simply carry none —
+    /// without them a cache-first render resurrects hidden wakeup/recovery turns.
+    var source: String?
+    var isRecoveryControl: Bool?
     var cachedAt: Date
     var expiresAt: Date
 
@@ -93,6 +98,8 @@ final class CachedMessage {
         } else {
             attachmentsData = nil
         }
+        source = message.source
+        isRecoveryControl = message.isRecoveryControl
         self.cachedAt = cachedAt
         expiresAt = cachedAt.addingTimeInterval(CachePolicy.ttl)
     }

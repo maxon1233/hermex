@@ -16,6 +16,13 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
     let contentParts: [JSONValue]?
     let reasoning: String?
     let attachments: [MessageAttachment]?
+    /// Origin marker the server stamps on synthetic user turns it injects itself
+    /// (`_source` in `GET /api/session`). `"process_wakeup"` marks a background
+    /// process / delegated-subagent completion; absent means the human sent it.
+    let source: String?
+    /// `recovery_control` — the server's marker for the synthetic `[System: …]`
+    /// turns it injects to resume an interrupted run. Never a real transcript turn.
+    let isRecoveryControl: Bool?
 
     init(
         role: String?,
@@ -28,7 +35,9 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         toolCalls: [JSONValue]? = nil,
         contentParts: [JSONValue]? = nil,
         reasoning: String? = nil,
-        attachments: [MessageAttachment]? = nil
+        attachments: [MessageAttachment]? = nil,
+        source: String? = nil,
+        isRecoveryControl: Bool? = nil
     ) {
         self.role = role
         self.content = content
@@ -41,6 +50,8 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         self.contentParts = contentParts
         self.reasoning = reasoning
         self.attachments = attachments
+        self.source = source
+        self.isRecoveryControl = isRecoveryControl
     }
 
     enum CodingKeys: String, CodingKey {
@@ -55,6 +66,12 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         case reasoning
         case attachments
         case underscoredTimestamp = "_ts"
+        // `.convertFromSnakeCase` preserves a leading underscore, so `_source`
+        // arrives verbatim while `recovery_control` arrives camel-cased. Both
+        // spellings are accepted so a re-decode without the strategy still works.
+        case source = "_source"
+        case recoveryControl
+        case underscoredRecoveryControl = "recovery_control"
     }
 
     init(from decoder: Decoder) throws {
@@ -73,6 +90,9 @@ struct ChatMessage: Decodable, Equatable, Identifiable {
         reasoning = container.decodeLossyStringIfPresent(forKey: .reasoning)
         let decodedAttachments = Self.decodeAttachmentsTolerantly(from: container)
         attachments = Self.attachments(decodedAttachments, enrichedByMarkerIn: content)
+        source = container.decodeLossyStringIfPresent(forKey: .source)
+        isRecoveryControl = container.decodeLossyBoolIfPresent(forKey: .recoveryControl)
+            ?? container.decodeLossyBoolIfPresent(forKey: .underscoredRecoveryControl)
     }
 
     private static func attachments(

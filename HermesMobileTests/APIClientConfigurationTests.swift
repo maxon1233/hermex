@@ -88,15 +88,18 @@ final class APIClientConfigurationTests: APIClientTestCase {
         let reasoningGroups = ChatViewModel.reasoningDisplayGroups(messages: messages, archivedGroups: [])
         let transcriptMessages = ChatViewModel.transcriptMessages(from: messages)
 
-        XCTAssertEqual(reasoningGroups.map(\.anchorMessageID), [
-            "assistant-tools",
-            "assistant-post-tools",
-            "assistant-final"
-        ])
-        XCTAssertEqual(reasoningGroups[0].text, "The user wants me to use terminal and search_files. I should run a quick command.")
-        XCTAssertEqual(reasoningGroups[1].text, "Terminal works. Now run search_files to show that works too.")
-        XCTAssertTrue(reasoningGroups[2].text.contains("Both tools worked. I should give a concise summary."))
-        XCTAssertFalse(reasoningGroups[2].text.contains("**Terminal:**"))
+        // All three assistant messages belong to one turn (the interleaved
+        // tool-result row is not a user boundary), so they fold into a single
+        // worklog group anchored where the turn starts. The final message resends
+        // the whole turn's thinking, so it supersedes the two partial texts rather
+        // than being concatenated after them.
+        XCTAssertEqual(reasoningGroups.map(\.anchorMessageID), ["assistant-tools"])
+        XCTAssertEqual(reasoningGroups[0].text, """
+        The user wants me to use terminal and search_files. I should run a quick command.
+        Terminal works. Now run search_files to show that works too.
+        Both tools worked. I should give a concise summary.
+        """)
+        XCTAssertFalse(reasoningGroups[0].text.contains("**Terminal:**"))
         XCTAssertFalse(transcriptMessages.contains { $0.message.id == "tool-results" })
     }
 
