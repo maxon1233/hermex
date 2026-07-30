@@ -3362,7 +3362,10 @@ final class ChatViewModel {
                 toolCalls: loadedAssistant.toolCalls ?? snapshotAssistant.toolCalls,
                 contentParts: loadedAssistant.contentParts ?? snapshotAssistant.contentParts,
                 reasoning: loadedAssistant.reasoning ?? snapshotAssistant.reasoning,
-                attachments: loadedAssistant.attachments ?? snapshotAssistant.attachments
+                attachments: loadedAssistant.attachments ?? snapshotAssistant.attachments,
+                source: loadedAssistant.source ?? snapshotAssistant.source,
+                isRecoveryControl: loadedAssistant.isRecoveryControl
+                    ?? snapshotAssistant.isRecoveryControl
             )
             return ActiveStreamMessageMerge(
                 messages: mergedMessages,
@@ -5053,7 +5056,9 @@ final class ChatViewModel {
                 toolCalls: existing.toolCalls,
                 contentParts: existing.contentParts,
                 reasoning: existing.reasoning,
-                attachments: existing.attachments
+                attachments: existing.attachments,
+                source: existing.source,
+                isRecoveryControl: existing.isRecoveryControl
             )
             retainedLatestTranscriptSnapshot = LatestTranscriptSnapshot(
                 messages: retainedMessages,
@@ -5081,7 +5086,9 @@ final class ChatViewModel {
             toolCalls: existing.toolCalls,
             contentParts: existing.contentParts,
             reasoning: existing.reasoning,
-            attachments: existing.attachments
+            attachments: existing.attachments,
+            source: existing.source,
+            isRecoveryControl: existing.isRecoveryControl
         )
         scheduleStreamingScrollTrigger()
     }
@@ -5863,7 +5870,9 @@ final class ChatViewModel {
                 toolCalls: existing.toolCalls,
                 contentParts: existing.contentParts,
                 reasoning: existing.reasoning,
-                attachments: existing.attachments
+                attachments: existing.attachments,
+                source: existing.source,
+                isRecoveryControl: existing.isRecoveryControl
             )
             scheduleStreamingScrollTrigger()
             return true
@@ -6369,7 +6378,9 @@ final class ChatViewModel {
                 toolCalls: existing.toolCalls,
                 contentParts: existing.contentParts,
                 reasoning: existing.reasoning,
-                attachments: existing.attachments
+                attachments: existing.attachments,
+                source: existing.source,
+                isRecoveryControl: existing.isRecoveryControl
             )
             return true
         }
@@ -7282,14 +7293,45 @@ extension ChatViewModel {
             latestCandidateIndexByKey["\(candidate.turnKey)::\(normalizedReasoningKey(candidate.text))"] = index
         }
 
-        return candidates.enumerated().compactMap { index, candidate in
+        // One group per assistant *turn*, not per assistant message. An agentic
+        // turn (think → tool → think → tool → …) otherwise contributes a separate
+        // Thinking card for every hop, stacking ten near-identical rows between
+        // the question and the answer. Tool calls already coalesce this way in
+        // `ToolCallGroup.coalescingByAssistantTurn`, so merging here lets both
+        // land on the same anchor and render as a single worklog row.
+        var turnKeyOrder: [String] = []
+        var mergedTurns: [String: MergedReasoningTurn] = [:]
+
+        for (index, candidate) in candidates.enumerated() {
             let key = "\(candidate.turnKey)::\(normalizedReasoningKey(candidate.text))"
-            guard latestCandidateIndexByKey[key] == index else { return nil }
+            // Unchanged de-duplication: a text repeated within one turn survives
+            // only at its last occurrence, so an archived live group is
+            // superseded by its settled-transcript twin.
+            guard latestCandidateIndexByKey[key] == index else { continue }
+
+            if var merged = mergedTurns[candidate.turnKey] {
+                merged.append(candidate.text, normalizedBy: normalizedReasoningKey)
+                mergedTurns[candidate.turnKey] = merged
+            } else {
+                turnKeyOrder.append(candidate.turnKey)
+                // Anchor and order are pinned to the turn's first candidate and
+                // never move as later texts supersede earlier ones, so the row
+                // stays where the turn starts — beside its tool group.
+                mergedTurns[candidate.turnKey] = MergedReasoningTurn(
+                    anchorMessageID: candidate.anchorMessageID,
+                    order: candidate.order,
+                    texts: [candidate.text]
+                )
+            }
+        }
+
+        return turnKeyOrder.compactMap { turnKey in
+            guard let merged = mergedTurns[turnKey] else { return nil }
 
             return ReasoningGroup(
-                id: "reasoning-\(candidate.anchorMessageID ?? "unanchored")-\(candidate.order)",
-                anchorMessageID: candidate.anchorMessageID,
-                text: candidate.text
+                id: "reasoning-\(merged.anchorMessageID ?? "unanchored")-\(merged.order)",
+                anchorMessageID: merged.anchorMessageID,
+                text: merged.texts.joined(separator: "\n\n")
             )
         }
     }
@@ -7330,6 +7372,7 @@ extension ChatViewModel {
         for (loadedIndex, message) in messages.enumerated() {
             guard message.role != "tool" else { continue }
             guard !TranscriptTurnClassifier.isToolResultOnlyMessage(message) else { continue }
+            guard !ChatControlMessageClassifier.isHiddenControlMessage(message) else { continue }
             if let streamingAssistantID, message.messageId == streamingAssistantID {
                 continue
             }
@@ -7519,6 +7562,40 @@ private struct ReasoningDisplayCandidate {
     let anchorMessageID: String?
     let turnKey: String
     let text: String
+}
+
+/// Every surviving reasoning text of one assistant turn, folded into a single
+/// display group. Anchor and order come from the turn's first surviving
+/// candidate so the merged card renders where the turn starts.
+private struct MergedReasoningTurn {
+    let anchorMessageID: String?
+    let order: Int
+    private(set) var texts: [String]
+
+    init(anchorMessageID: String?, order: Int, texts: [String]) {
+        self.anchorMessageID = anchorMessageID
+        self.order = order
+        self.texts = texts
+    }
+
+    /// Providers commonly resend a turn's whole reasoning on each hop, each time
+    /// with the newest paragraph appended. Concatenating those verbatim would
+    /// repeat the earlier thinking once per hop, so a superset replaces the
+    /// subsets it already contains and a subset of what is kept is dropped.
+    mutating func append(_ text: String, normalizedBy normalize: (String) -> String) {
+        let candidateKey = normalize(text)
+        guard !candidateKey.isEmpty else { return }
+
+        var keptKeys = texts.map(normalize)
+        guard !keptKeys.contains(where: { $0.contains(candidateKey) }) else { return }
+
+        for index in keptKeys.indices.reversed() where candidateKey.contains(keptKeys[index]) {
+            texts.remove(at: index)
+            keptKeys.remove(at: index)
+        }
+
+        texts.append(text)
+    }
 }
 
 private extension ToolCall {

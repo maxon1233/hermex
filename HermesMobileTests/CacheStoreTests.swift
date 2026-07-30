@@ -218,6 +218,52 @@ final class CacheStoreTests: XCTestCase {
         XCTAssertEqual(updatedMessage.expiresAt, secondCachedAt.addingTimeInterval(CachePolicy.ttl))
     }
 
+    /// Without persisting the markers, a cache-first render brings the hidden
+    /// wakeup and recovery-control turns back as ordinary bubbles.
+    func testCachedMessageWindowPreservesServerControlMarkers() throws {
+        let context = try makeContext()
+        let serverURL = URL(string: "https://example.test")!
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let messages = [
+            ChatMessage(role: "user", content: "Kick off the build", timestamp: 1_770_000_000, messageId: "m1"),
+            ChatMessage(
+                role: "user",
+                content: "[IMPORTANT: Background process 4f2 completed]",
+                timestamp: 1_770_000_001,
+                messageId: "m2",
+                source: "process_wakeup"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "[System: Continue exactly where you left off.]",
+                timestamp: 1_770_000_002,
+                messageId: "m3",
+                isRecoveryControl: true
+            )
+        ]
+
+        try CacheStore.cacheMessages(
+            messages,
+            serverURL: serverURL,
+            sessionID: "abc123",
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        let window = try CacheStore.cachedMessageWindow(
+            serverURL: serverURL,
+            sessionID: "abc123",
+            in: context,
+            now: cachedAt.addingTimeInterval(60)
+        )
+
+        XCTAssertEqual(window.messages, messages)
+        XCTAssertEqual(
+            ChatViewModel.transcriptMessages(from: window.messages).map(\.message.messageId),
+            ["m1"]
+        )
+    }
+
     func testCachedMessageWindowPreservesAbsoluteMessageOffset() throws {
         let context = try makeContext()
         let serverURL = URL(string: "https://example.test")!

@@ -43,7 +43,7 @@ struct ToolCallCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         // Tool-call bodies are commands, JSON, file paths, and results — code-like
         // content that must stay left-to-right inside an RTL message (#259). The
-        // group's summary header above (ToolActivityGroupView) still mirrors.
+        // turn's worklog header above (TurnWorklogView) still mirrors.
         .forcedLeftToRight()
     }
 

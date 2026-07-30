@@ -1192,28 +1192,46 @@ struct ChatTranscriptView: View {
 
     @ViewBuilder
     private var transcriptLooseBlocks: some View {
-        reasoningBlocks(anchorMessageID: nil)
-        toolCallGroups(anchorMessageID: nil)
+        let unanchoredReasoningTexts = reasoningGroups
+            .filter { $0.anchorMessageID == nil }
+            .map(\.text)
+        let unanchoredToolGroups = completedToolCallGroupsForAnchor(nil)
+
+        // Gate at the call site, not just inside the row: an always-constructed
+        // empty view would still claim a slot in the enclosing spaced `VStack`.
+        if showsThinkingAndToolCards,
+           !unanchoredReasoningTexts.isEmpty || !unanchoredToolGroups.isEmpty {
+            TurnWorklogView(
+                reasoningTexts: unanchoredReasoningTexts,
+                toolCallGroups: unanchoredToolGroups
+            )
+        }
     }
 
     @ViewBuilder
     private var liveResponseBlocks: some View {
         if activeStreamID != nil {
-            if showsThinkingAndToolCards {
-                if hasLiveReasoningText,
-                   !hasDisplayedTranscriptMessage(anchorID: reasoningAnchorMessageID) {
-                    ReasoningBlockView(text: liveReasoningText)
-                }
+            // Live reasoning and live tools can carry different anchors mid-run;
+            // each contributes to this trailing row only while its own anchor has
+            // no transcript row of its own to hang from.
+            let looseReasoningTexts = hasLiveReasoningText
+                && !hasDisplayedTranscriptMessage(anchorID: reasoningAnchorMessageID)
+                ? [liveReasoningText]
+                : []
+            let looseToolGroups = !liveToolCalls.isEmpty
+                && !hasDisplayedTranscriptMessage(anchorID: toolCallAnchorMessageID)
+                ? [ToolCallGroup.live(
+                    anchorMessageID: toolCallAnchorMessageID,
+                    toolCalls: liveToolCalls
+                  )]
+                : []
 
-                if !liveToolCalls.isEmpty,
-                   !hasDisplayedTranscriptMessage(anchorID: toolCallAnchorMessageID) {
-                    ToolActivityGroupView(
-                        group: ToolCallGroup.live(
-                            anchorMessageID: toolCallAnchorMessageID,
-                            toolCalls: liveToolCalls
-                        )
-                    )
-                }
+            if showsThinkingAndToolCards,
+               !looseReasoningTexts.isEmpty || !looseToolGroups.isEmpty {
+                TurnWorklogView(
+                    reasoningTexts: looseReasoningTexts,
+                    toolCallGroups: looseToolGroups
+                )
             }
 
             if activeStreamRecoveryState != .idle {
@@ -1282,24 +1300,6 @@ struct ChatTranscriptView: View {
         guard let anchorID else { return false }
 
         return displayedTranscriptMessages.contains { $0.anchorID == anchorID }
-    }
-
-    @ViewBuilder
-    private func reasoningBlocks(anchorMessageID: String?) -> some View {
-        if showsThinkingAndToolCards {
-            ForEach(reasoningGroups.filter { $0.anchorMessageID == anchorMessageID }) { group in
-                ReasoningBlockView(text: group.text)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func toolCallGroups(anchorMessageID: String?) -> some View {
-        if showsThinkingAndToolCards {
-            ForEach(completedToolCallGroupsForAnchor(anchorMessageID)) { group in
-                ToolActivityGroupView(group: group)
-            }
-        }
     }
 }
 
@@ -1424,10 +1424,7 @@ private struct ChatTranscriptMessageBlock: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: transcriptBlockSpacing) {
-            reasoningBlocks
-            liveReasoningBlock
-            toolActivityGroups
-            liveToolActivityGroup
+            turnWorklog
 
             if shouldRenderMessageRow(transcriptMessage.message) {
                 ChatTranscriptMessageRow(
@@ -1466,41 +1463,48 @@ private struct ChatTranscriptMessageBlock: View, Equatable {
         .accessibilityHidden(hidesTranscriptMessageAccessibility)
     }
 
+    /// This turn's settled reasoning and tool calls plus whatever is still
+    /// streaming into the same anchor, as one collapsed disclosure row.
     @ViewBuilder
-    private var reasoningBlocks: some View {
-        if showsThinkingAndToolCards {
-            ForEach(reasoningGroups.filter { $0.anchorMessageID == transcriptMessage.anchorID }) { group in
-                ReasoningBlockView(text: group.text)
-            }
+    private var turnWorklog: some View {
+        let reasoningTexts = worklogReasoningTexts
+        let toolGroups = worklogToolCallGroups
+
+        // Gate at the call site, not just inside the row: an always-constructed
+        // empty view would still claim a slot in this spaced `VStack`.
+        if showsThinkingAndToolCards, !reasoningTexts.isEmpty || !toolGroups.isEmpty {
+            TurnWorklogView(
+                reasoningTexts: reasoningTexts,
+                toolCallGroups: toolGroups
+            )
         }
     }
 
-    @ViewBuilder
-    private var liveReasoningBlock: some View {
+    private var worklogReasoningTexts: [String] {
+        var texts = reasoningGroups
+            .filter { $0.anchorMessageID == transcriptMessage.anchorID }
+            .map(\.text)
+
         if shouldRenderLiveReasoningBlock {
-            ReasoningBlockView(text: liveReasoningText)
+            texts.append(liveReasoningText)
         }
+
+        return texts
     }
 
-    @ViewBuilder
-    private var toolActivityGroups: some View {
-        if showsThinkingAndToolCards {
-            ForEach(toolCallGroups) { group in
-                ToolActivityGroupView(group: group)
-            }
-        }
-    }
+    private var worklogToolCallGroups: [ToolCallGroup] {
+        var groups = toolCallGroups
 
-    @ViewBuilder
-    private var liveToolActivityGroup: some View {
         if shouldRenderLiveToolActivityGroup {
-            ToolActivityGroupView(
-                group: ToolCallGroup.live(
+            groups.append(
+                ToolCallGroup.live(
                     anchorMessageID: toolCallAnchorMessageID,
                     toolCalls: liveToolCalls
                 )
             )
         }
+
+        return groups
     }
 
     private var shouldRenderLiveReasoningBlock: Bool {

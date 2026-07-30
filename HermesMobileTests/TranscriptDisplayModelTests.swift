@@ -27,6 +27,73 @@ final class TranscriptMessageTests: XCTestCase {
         XCTAssertEqual(transcriptMessages.map(\.message.id), ["u1", "a1", "a2"])
     }
 
+    /// Background-process and delegated-subagent wakeups arrive as `role: "user"`
+    /// rows carrying raw process output, so without the control-message gate they
+    /// render as bubbles the reader appears to have sent.
+    func testTranscriptMessagesHideServerInjectedControlTurns() {
+        let messages = [
+            ChatMessage(role: "user", content: "Kick off the build", timestamp: 1, messageId: "u1"),
+            ChatMessage(
+                role: "user",
+                content: "[IMPORTANT: Background process 4f2 completed (exit_code=0).\nCommand: make\nOutput:\n…]",
+                timestamp: 2,
+                messageId: "wakeup-1",
+                source: "process_wakeup"
+            ),
+            ChatMessage(
+                role: "user",
+                content: "[System: Continue exactly where you left off.]",
+                timestamp: 3,
+                messageId: "recovery-1",
+                isRecoveryControl: true
+            ),
+            ChatMessage(role: "assistant", content: "Build is green.", timestamp: 4, messageId: "a1")
+        ]
+
+        let transcriptMessages = ChatViewModel.transcriptMessages(from: messages)
+
+        XCTAssertEqual(transcriptMessages.map(\.message.id), ["u1", "a1"])
+        // Loaded indices still address the full array, so fork/edit/truncate
+        // targets are unaffected by hiding rows.
+        XCTAssertEqual(transcriptMessages.map(\.loadedIndex), [0, 3])
+    }
+
+    /// Distinct per-hop thinking still concatenates; only texts that are already
+    /// contained in another hop's text are dropped as supersets.
+    func testReasoningGroupsMergeDistinctPerHopThinkingIntoOneTurnGroup() {
+        let messages = [
+            ChatMessage(role: "user", content: "Ship it", timestamp: 1, messageId: "u1"),
+            ChatMessage(role: "assistant", content: "", timestamp: 2, messageId: "a1", reasoning: "First check the tests."),
+            ChatMessage(role: "assistant", content: "", timestamp: 3, messageId: "a2", reasoning: "Now read the diff."),
+            ChatMessage(role: "assistant", content: "Shipped.", timestamp: 4, messageId: "a3", reasoning: "Everything looks good.")
+        ]
+
+        let groups = ChatViewModel.reasoningDisplayGroups(messages: messages, archivedGroups: [])
+
+        XCTAssertEqual(groups.map(\.anchorMessageID), ["a1"])
+        XCTAssertEqual(groups[0].text, """
+        First check the tests.
+
+        Now read the diff.
+
+        Everything looks good.
+        """)
+    }
+
+    /// A new user turn starts a new worklog row.
+    func testReasoningGroupsSplitAcrossUserTurns() {
+        let messages = [
+            ChatMessage(role: "user", content: "First ask", timestamp: 1, messageId: "u1"),
+            ChatMessage(role: "assistant", content: "One", timestamp: 2, messageId: "a1", reasoning: "Thinking about the first ask."),
+            ChatMessage(role: "user", content: "Second ask", timestamp: 3, messageId: "u2"),
+            ChatMessage(role: "assistant", content: "Two", timestamp: 4, messageId: "a2", reasoning: "Thinking about the second ask.")
+        ]
+
+        let groups = ChatViewModel.reasoningDisplayGroups(messages: messages, archivedGroups: [])
+
+        XCTAssertEqual(groups.map(\.anchorMessageID), ["a1", "a2"])
+    }
+
     func testTranscriptMessagesCanHideActiveStreamingAssistantTurn() {
         let messages = [
             ChatMessage(role: "user", content: "Use tools", timestamp: 1, messageId: "u1"),
