@@ -214,6 +214,8 @@ final class SessionSidebarDisclosureSettingsTests: XCTestCase {
         super.tearDown()
     }
 
+    // The projects key now folds the vertical scope picker that replaced both
+    // the old Projects disclosure and the horizontal chip bar.
     func testDisclosureStatesDefaultToCollapsedWhenUnset() {
         XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.profilesAreExpandedKey))
         XCTAssertNil(defaults.object(forKey: SessionSidebarDisclosureSettings.projectsAreExpandedKey))
@@ -254,14 +256,16 @@ final class SessionRowDisplaySettingsTests: XCTestCase {
         super.tearDown()
     }
 
-    func testSubagentSessionsDefaultHiddenAndPersistStoredChoice() {
-        XCTAssertFalse(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
-
-        defaults.set(true, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
+    // Subagent children default to visible now that they nest under their
+    // parent row (desktop sidebar parity); an explicit stored opt-out wins.
+    func testSubagentSessionsDefaultVisibleAndPersistStoredChoice() {
         XCTAssertTrue(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
 
         defaults.set(false, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
         XCTAssertFalse(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
+
+        defaults.set(true, forKey: SessionRowDisplaySettings.showSubagentSessionsKey)
+        XCTAssertTrue(SessionRowDisplaySettings.showsSubagentSessions(in: defaults))
     }
 }
 

@@ -666,6 +666,7 @@ private extension SessionSummary {
         relationshipType = cachedSession.relationshipType
         readOnly = cachedSession.readOnly
         isReadOnly = cachedSession.isReadOnly
+        defaultHidden = cachedSession.defaultHidden
         matchType = nil
     }
 }

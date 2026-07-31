@@ -183,6 +183,10 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
     let relationshipType: String?
     let readOnly: Bool?
     let isReadOnly: Bool?
+    /// Server-stamped background rows (`default_hidden`, hermes-webui #3134):
+    /// project-assigned cron/webhook executions that stay out of the default
+    /// sidebar but must appear when their own project chip is selected.
+    let defaultHidden: Bool?
     let matchType: String?
 
     init(
@@ -217,6 +221,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         relationshipType: String? = nil,
         readOnly: Bool? = nil,
         isReadOnly: Bool? = nil,
+        defaultHidden: Bool? = nil,
         matchType: String? = nil
     ) {
         self.sessionId = sessionId
@@ -250,6 +255,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         self.relationshipType = relationshipType
         self.readOnly = readOnly
         self.isReadOnly = isReadOnly
+        self.defaultHidden = defaultHidden
         self.matchType = matchType
     }
 
@@ -289,6 +295,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
         relationshipType = detail.relationshipType
         readOnly = detail.readOnly
         isReadOnly = detail.isReadOnly
+        defaultHidden = detail.defaultHidden
         matchType = nil
     }
 
@@ -327,6 +334,7 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
             relationshipType: relationshipType,
             readOnly: readOnly,
             isReadOnly: isReadOnly,
+            defaultHidden: defaultHidden,
             matchType: matchType
         )
     }
@@ -356,6 +364,16 @@ extension SessionSummary {
     /// true value preserves that safety for other imported sessions.
     var isSessionReadOnly: Bool {
         isDelegatedSubagentSession || readOnly == true || isReadOnly == true
+    }
+
+    /// Mirrors hermes-webui's `_isChildSession` (`static/sessions.js`): only the
+    /// explicit server-stamped `child_session` relationship nests a row under
+    /// its parent. `/branch` forks and compression continuations also carry
+    /// `parentSessionId` with other (or no) relationship values and stay
+    /// top-level, so parent linkage alone never classifies a child.
+    var isChildSessionRow: Bool {
+        guard Self.nonEmpty(parentSessionId) != nil else { return false }
+        return Self.normalizedSourceMarker(relationshipType) == "child_session"
     }
 
     var shouldAppearInSessionList: Bool {
@@ -462,7 +480,7 @@ struct AutomatedSessionVisibility: Equatable {
         showsCron: Bool,
         showsCli: Bool,
         showsClaudeCode: Bool = true,
-        showsSubagents: Bool = false
+        showsSubagents: Bool = true
     ) {
         self.showsCron = showsCron
         self.showsCli = showsCli
@@ -478,6 +496,17 @@ struct AutomatedSessionVisibility: Equatable {
     func shows(_ session: SessionSummary) -> Bool {
         if session.isDelegatedSubagentSession, !showsSubagents { return false }
         if session.isCronSession, !showsCron { return false }
+        if session.isCliSession == true, !showsCli { return false }
+        if session.isClaudeCodeSession, !showsClaudeCode { return false }
+        return true
+    }
+
+    /// Whether `session` passes the source toggles when an explicitly selected
+    /// project chip already vouches for it. The chip counteracts cron hiding —
+    /// background executions live under their own project (hermes-webui #3134)
+    /// — but never the CLI/Claude Code/subagent preferences.
+    func showsInExplicitlySelectedProject(_ session: SessionSummary) -> Bool {
+        if session.isDelegatedSubagentSession, !showsSubagents { return false }
         if session.isCliSession == true, !showsCli { return false }
         if session.isClaudeCodeSession, !showsClaudeCode { return false }
         return true
@@ -528,6 +557,7 @@ struct SessionDetail: Decodable, Equatable, Identifiable {
     let relationshipType: String?
     let readOnly: Bool?
     let isReadOnly: Bool?
+    let defaultHidden: Bool?
     let messages: [ChatMessage]?
     let toolCalls: [PersistedToolCall]?
     let messagesTruncated: Bool?
@@ -570,6 +600,7 @@ struct SessionDetail: Decodable, Equatable, Identifiable {
         case relationshipType
         case readOnly
         case isReadOnly
+        case defaultHidden
         case messages
         case toolCalls
         case messagesTruncated
@@ -621,6 +652,7 @@ struct SessionDetail: Decodable, Equatable, Identifiable {
         relationshipType = container.decodeLossyStringIfPresent(forKey: .relationshipType)
         readOnly = container.decodeLossyBoolIfPresent(forKey: .readOnly)
         isReadOnly = container.decodeLossyBoolIfPresent(forKey: .isReadOnly)
+        defaultHidden = container.decodeLossyBoolIfPresent(forKey: .defaultHidden)
         messages = Self.decodeMessagesTolerantly(from: container)
         toolCalls = Self.decodeToolCallsTolerantly(from: container)
         messagesTruncated = container.decodeLossyBoolIfPresent(forKey: .underscoredMessagesTruncated)
