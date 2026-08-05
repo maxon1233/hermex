@@ -49,6 +49,12 @@ extension APIClient {
         try await send(endpoint: .sessionStatus(id: id), method: "GET")
     }
 
+    /// Reads a session's state.db lineage, including its delegated children.
+    /// Used to recover child rows the session-list payload omits.
+    func sessionLineageReport(id: String) async throws -> SessionLineageReportResponse {
+        try await send(endpoint: .sessionLineageReport(sessionID: id), method: "GET")
+    }
+
     func createSession(workspace: String?, model: String?, modelProvider: String?, profile: String?) async throws -> SessionResponse {
         try await send(
             endpoint: .newSession,

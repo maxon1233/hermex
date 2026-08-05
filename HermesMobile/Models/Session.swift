@@ -133,6 +133,86 @@ struct SessionRetryResponse: Decodable, Equatable {
     let error: String?
 }
 
+/// `GET /api/session/lineage/report` — the server's state.db view of a
+/// session's lineage. Its `children` array is authoritative for delegated
+/// subagent runs: the sidebar payload only carries a child row while the
+/// server's sidebar projection happens to include it, but state.db keeps the
+/// parent link permanently, so this is how the app recovers children the
+/// session list omitted.
+struct SessionLineageReportResponse: Decodable, Equatable {
+    let sessionId: String?
+    let found: Bool?
+    let children: [SessionLineageReportRow]?
+    let error: String?
+}
+
+/// One lineage row (`_lineage_report_row` in `api/agent_sessions.py`). Its
+/// field set is deliberately narrower than a sidebar row — enough to render
+/// and open a nested child.
+struct SessionLineageReportRow: Decodable, Equatable {
+    let sessionId: String?
+    let role: String?
+    let title: String?
+    let source: String?
+    let startedAt: Double?
+    let updatedAt: Double?
+    let endReason: String?
+    let active: Bool?
+    let archived: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId
+        case role
+        case title
+        case source
+        case startedAt
+        case updatedAt
+        case endReason
+        case active
+        case archived
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = container.decodeLossyStringIfPresent(forKey: .sessionId)
+        role = container.decodeLossyStringIfPresent(forKey: .role)
+        title = container.decodeLossyStringIfPresent(forKey: .title)
+        source = container.decodeLossyStringIfPresent(forKey: .source)
+        startedAt = container.decodeLossyDoubleIfPresent(forKey: .startedAt)
+        updatedAt = container.decodeLossyDoubleIfPresent(forKey: .updatedAt)
+        endReason = container.decodeLossyStringIfPresent(forKey: .endReason)
+        active = container.decodeLossyBoolIfPresent(forKey: .active)
+        archived = container.decodeLossyBoolIfPresent(forKey: .archived)
+    }
+
+    /// Whether this row is a delegated child (`role == "child_session"`).
+    var isChildSessionRole: Bool {
+        role?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "child_session"
+    }
+
+    /// Projects the lineage row onto a sidebar row shaped exactly like a
+    /// server-sent child: same `child_session` relationship and parent link
+    /// the grouping already understands, so recovered children and payload
+    /// children flow through one code path.
+    func sessionSummary(parentSessionID: String) -> SessionSummary {
+        SessionSummary(
+            sessionId: sessionId,
+            title: title,
+            createdAt: startedAt,
+            updatedAt: updatedAt,
+            lastMessageAt: updatedAt ?? startedAt,
+            archived: archived,
+            // `active` means state.db has no `ended_at` yet — the run is still
+            // going, which the row renders as its live indicator.
+            isStreaming: active == true ? true : nil,
+            sourceTag: source,
+            parentSessionId: parentSessionID,
+            relationshipType: "child_session",
+            readOnly: true
+        )
+    }
+}
+
 struct SessionStatusResponse: Decodable, Equatable {
     let sessionId: String?
     let activeStreamId: String?

@@ -1104,6 +1104,11 @@ struct SessionListView: View {
         if !viewModel.isViewingCachedData {
             await viewModel.loadProjects()
             handleLastError()
+
+            // Runs after the rows are already on screen: the list renders from
+            // the payload immediately, and any child sessions it omitted fold
+            // in under their parents once the lineage lookups return.
+            await viewModel.recoverMissingChildSessions()
         }
     }
 
