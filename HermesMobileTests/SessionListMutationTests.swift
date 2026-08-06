@@ -2844,6 +2844,128 @@ final class SessionListMutationTests: XCTestCase {
         )
     }
 
+    // MARK: - Lineage-backed child recovery
+
+    @MainActor
+    func testChildSessionsAreRecoveredWhenTheListPayloadOmitsThem() async throws {
+        var lineageRequestIDs: [String] = []
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                // The live regression: a parent with delegated children whose
+                // child rows the server's sidebar projection never emitted.
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "parent", "title": "Website Audit", "last_message_at": 100},
+                    {"session_id": "solo", "title": "No children here", "last_message_at": 90}
+                  ]
+                }
+                """, for: request)
+            case "/api/session/lineage/report":
+                let sessionID = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                    .queryItems?.first { $0.name == "session_id" }?.value ?? ""
+                lineageRequestIDs.append(sessionID)
+
+                guard sessionID == "parent" else {
+                    return apiTestJSONResponse("""
+                    {"found": true, "session_id": "\(sessionID)", "children": []}
+                    """, for: request)
+                }
+
+                return apiTestJSONResponse("""
+                {
+                  "found": true,
+                  "session_id": "parent",
+                  "children": [
+                    {"session_id": "child-old", "role": "child_session", "title": "Subagent Session", "source": "subagent", "started_at": 10, "updated_at": 20, "active": false, "archived": false},
+                    {"session_id": "child-new", "role": "child_session", "title": "Subagent Session", "source": "subagent", "started_at": 30, "updated_at": 40, "active": true, "archived": false},
+                    {"session_id": "archived-child", "role": "child_session", "title": "Old run", "source": "subagent", "started_at": 5, "updated_at": 6, "archived": true},
+                    {"session_id": "segment", "role": "hidden_segment", "title": "Compression segment", "started_at": 50, "updated_at": 60}
+                  ]
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+        XCTAssertNil(viewModel.childSessionsByParentID()["parent"])
+
+        await viewModel.recoverMissingChildSessions()
+
+        // Newest first, archived children and non-child lineage roles excluded.
+        let recovered = try XCTUnwrap(viewModel.childSessionsByParentID()["parent"])
+        XCTAssertEqual(recovered.compactMap(\.sessionId), ["child-new", "child-old"])
+        XCTAssertTrue(recovered.allSatisfy(\.isChildSessionRow))
+        XCTAssertTrue(recovered.allSatisfy(\.isSessionReadOnly))
+        // `active` marks the still-running child so its row shows as live.
+        XCTAssertTrue(SessionRowView.isActiveStreaming(try XCTUnwrap(recovered.first)))
+
+        // Recovered children never surface as their own top-level rows.
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", projectFilter: .all).compactMap(\.sessionId),
+            ["parent", "solo"]
+        )
+        XCTAssertTrue(lineageRequestIDs.contains("parent"))
+    }
+
+    @MainActor
+    func testChildRecoverySkipsCoveredParentsAndToleratesFailures() async throws {
+        var lineageRequestIDs: [String] = []
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "covered", "title": "Has payload children", "last_message_at": 100},
+                    {"session_id": "payload-child", "title": "Subagent Session", "source_tag": "subagent", "parent_session_id": "covered", "relationship_type": "child_session", "last_message_at": 95},
+                    {"session_id": "unknown", "title": "Server errors for this one", "last_message_at": 90}
+                  ]
+                }
+                """, for: request)
+            case "/api/session/lineage/report":
+                let sessionID = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                    .queryItems?.first { $0.name == "session_id" }?.value ?? ""
+                lineageRequestIDs.append(sessionID)
+                // Older servers 404 this route; recovery must degrade quietly.
+                return (
+                    try XCTUnwrap(HTTPURLResponse(
+                        url: try XCTUnwrap(request.url),
+                        statusCode: 404,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )),
+                    Data("{\"error\": \"Session not found\"}".utf8)
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+        await viewModel.recoverMissingChildSessions()
+
+        // The payload already nests `covered`, so it is never queried.
+        XCTAssertFalse(lineageRequestIDs.contains("covered"))
+        XCTAssertTrue(lineageRequestIDs.contains("unknown"))
+        // A failing lookup leaves the list exactly as the payload described.
+        XCTAssertEqual(
+            viewModel.childSessionsByParentID()["covered"]?.compactMap(\.sessionId),
+            ["payload-child"]
+        )
+        XCTAssertNil(viewModel.childSessionsByParentID()["unknown"])
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", projectFilter: .all).compactMap(\.sessionId),
+            ["covered", "unknown"]
+        )
+        XCTAssertNil(viewModel.actionErrorMessage)
+    }
+
     // MARK: - Project scopes (desktop project-bar parity)
 
     func testProjectFilterIncludesAndReveals() {

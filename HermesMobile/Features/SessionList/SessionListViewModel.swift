@@ -339,7 +339,117 @@ final class SessionListViewModel {
     func childSessionsByParentID(
         automatedVisibility: AutomatedSessionVisibility = .showAll
     ) -> [String: [SessionSummary]] {
-        Self.childSessionsByParentID(in: sessions, automatedVisibility: automatedVisibility)
+        Self.childSessionsByParentID(
+            in: sessions + recoveredChildSessions,
+            automatedVisibility: automatedVisibility
+        )
+    }
+
+    /// Children recovered from `/api/session/lineage/report`, keyed by the
+    /// parent that was queried. Shaped exactly like server-sent child rows, so
+    /// every consumer — grouping, pills, nested rows, stream monitoring —
+    /// treats them identically.
+    private(set) var recoveredChildSessionsByParentID: [String: [SessionSummary]] = [:]
+
+    /// Parents queried at least once, so sessions with genuinely no children
+    /// aren't re-asked on every refresh.
+    private var lineageQueriedParentIDs: Set<String> = []
+
+    /// Per-refresh query budget. The list can hold hundreds of rows, so a
+    /// refresh walks the newest slice — where delegated work realistically
+    /// appears — rather than the whole history.
+    private static let lineageRecoveryParentLimit = 30
+
+    /// The newest parents are re-queried on every refresh even once seen, so a
+    /// child delegated after the last check still shows up.
+    private static let lineageRecoveryRefreshLimit = 8
+
+    /// Children flattened out of ``recoveredChildSessionsByParentID``, minus
+    /// any the session-list payload now carries itself (the server row wins —
+    /// it has the full sidebar metadata).
+    private var recoveredChildSessions: [SessionSummary] {
+        let payloadSessionIDs = Set(sessions.compactMap(\.sessionId))
+        return recoveredChildSessionsByParentID.values
+            .joined()
+            .filter { child in
+                guard let childID = child.sessionId else { return false }
+                return !payloadSessionIDs.contains(childID)
+            }
+    }
+
+    /// Fills in child rows the session list payload omitted.
+    ///
+    /// `/api/sessions` is the primary source: when it carries child rows this
+    /// finds nothing new. When the server's sidebar projection drops them —
+    /// which it does for delegated subagent runs — state.db still records the
+    /// parent link, so the lineage report restores the nesting the desktop
+    /// shows.
+    ///
+    /// Ordinary failures (older servers without the route, 404s, offline) are
+    /// swallowed: recovery is additive, so its absence just leaves the list
+    /// exactly as the payload described it.
+    @discardableResult
+    func recoverMissingChildSessions() async -> Bool {
+        guard !isViewingCachedData else { return false }
+
+        let payloadChildParentIDs = Set(Self.childSessionsByParentID(in: sessions).keys)
+        let orderedParentIDs = Self.sortedSessions(sessions)
+            .filter { !$0.isChildSessionRow }
+            .compactMap { Self.nonEmpty($0.sessionId) }
+            .filter { !payloadChildParentIDs.contains($0) }
+
+        // Always refresh the newest few; otherwise query only what has never
+        // been asked, so old sessions cost one request for the whole session.
+        var candidates = Array(orderedParentIDs.prefix(Self.lineageRecoveryRefreshLimit))
+        let candidateSet = Set(candidates)
+        candidates += orderedParentIDs
+            .filter { !candidateSet.contains($0) && !lineageQueriedParentIDs.contains($0) }
+            .prefix(Self.lineageRecoveryParentLimit - candidates.count)
+
+        guard !candidates.isEmpty else { return false }
+
+        let client = self.client
+        let results = await withTaskGroup(
+            of: (String, [SessionSummary]).self
+        ) { group in
+            for parentID in candidates {
+                group.addTask {
+                    guard let report = try? await client.sessionLineageReport(id: parentID) else {
+                        return (parentID, [])
+                    }
+
+                    let children = (report.children ?? [])
+                        .filter(\.isChildSessionRole)
+                        .filter { $0.archived != true }
+                        .compactMap { child -> SessionSummary? in
+                            guard child.sessionId?.isEmpty == false else { return nil }
+                            return child.sessionSummary(parentSessionID: parentID)
+                        }
+                    return (parentID, children)
+                }
+            }
+
+            var collected: [String: [SessionSummary]] = [:]
+            for await (parentID, children) in group {
+                collected[parentID] = children
+            }
+            return collected
+        }
+
+        lineageQueriedParentIDs.formUnion(candidates)
+
+        var updated = recoveredChildSessionsByParentID
+        for (parentID, children) in results {
+            if children.isEmpty {
+                updated.removeValue(forKey: parentID)
+            } else {
+                updated[parentID] = children
+            }
+        }
+
+        guard updated != recoveredChildSessionsByParentID else { return false }
+        recoveredChildSessionsByParentID = updated
+        return true
     }
 
     nonisolated static func childSessionsByParentID(

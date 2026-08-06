@@ -9,6 +9,7 @@ enum Endpoint {
     case sessionsSearch(query: String, content: Bool, depth: Int)
     case session(id: String, includeMessages: Bool, messageLimit: Int?, messageBefore: Int?, expandRenderable: Bool = false)
     case sessionStatus(id: String)
+    case sessionLineageReport(sessionID: String)
     case newSession
     case renameSession
     case deleteSession
@@ -143,6 +144,8 @@ enum Endpoint {
             return "/api/session"
         case .sessionStatus:
             return "/api/session/status"
+        case .sessionLineageReport:
+            return "/api/session/lineage/report"
         case .newSession:
             return "/api/session/new"
         case .renameSession:
@@ -416,6 +419,8 @@ enum Endpoint {
             }
 
             return items
+        case let .sessionLineageReport(sessionID):
+            return [URLQueryItem(name: "session_id", value: sessionID)]
         case let .sessionStatus(id):
             return [URLQueryItem(name: "session_id", value: id)]
         case let .chatStream(streamID),
