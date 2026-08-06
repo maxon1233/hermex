@@ -200,11 +200,23 @@ final class SessionListViewModel {
     ) -> [SessionSummary] {
         let query = Self.normalizedSearchQuery(rawSearchText)
         let childrenByParentID = Self.childSessionsByParentID(
-            in: sessions,
+            in: sessionsWithRecoveredLineage,
             automatedVisibility: automatedVisibility
         )
         let attachedChildIDs = Set(childrenByParentID.values.joined().compactMap(\.sessionId))
+        // Top-level candidates stay payload-only: a recovered child that fails
+        // to resolve an ancestor must simply not nest, never surface as a bare
+        // lineage stand-in stripped of its sidebar metadata.
         let baseSessions = sessions.filter { session in
+            // A server-stamped child never stands on its own, even when its
+            // parent is archived or paged out of this response. Desktop drops
+            // every `_isChildSession` row from the sidebar before nesting
+            // (`_attachChildSessionsToSidebarRows`, static/sessions.js), so a
+            // delegated run whose parent is missing disappears with it instead
+            // of piling up as unactionable "Subagent Session" rows — the server
+            // refuses to archive or delete them, so a visible row would be a
+            // dead end.
+            if session.isChildSessionRow { return false }
             if let sessionID = session.sessionId, attachedChildIDs.contains(sessionID) {
                 return false
             }
@@ -289,13 +301,14 @@ final class SessionListViewModel {
         automatedVisibility: AutomatedSessionVisibility = .showAll
     ) -> Bool {
         let childrenByParentID = Self.childSessionsByParentID(
-            in: sessions,
+            in: sessionsWithRecoveredLineage,
             automatedVisibility: automatedVisibility
         )
         let attachedChildIDs = Set(childrenByParentID.values.joined().compactMap(\.sessionId))
 
         return sessions.contains { session in
-            guard SessionProjectFilter.unassigned.includes(session),
+            guard !session.isChildSessionRow,
+                  SessionProjectFilter.unassigned.includes(session),
                   session.defaultHidden != true,
                   automatedVisibility.shows(session)
             else {
@@ -340,7 +353,7 @@ final class SessionListViewModel {
         automatedVisibility: AutomatedSessionVisibility = .showAll
     ) -> [String: [SessionSummary]] {
         Self.childSessionsByParentID(
-            in: sessions + recoveredChildSessions,
+            in: sessionsWithRecoveredLineage,
             automatedVisibility: automatedVisibility
         )
     }
@@ -364,17 +377,67 @@ final class SessionListViewModel {
     /// child delegated after the last check still shows up.
     private static let lineageRecoveryRefreshLimit = 8
 
-    /// Children flattened out of ``recoveredChildSessionsByParentID``, minus
-    /// any the session-list payload now carries itself (the server row wins —
-    /// it has the full sidebar metadata).
+    /// Children flattened out of ``recoveredChildSessionsByParentID``, each
+    /// projected onto the best row available for it.
+    ///
+    /// When the payload carries the child as its own row — which it does for
+    /// delegated runs — that row wins and is re-stamped with the recovered
+    /// parent, so it nests carrying its own sidebar metadata.
+    ///
+    /// The payload's own `parent_session_id` takes precedence whenever it
+    /// resolves to a loaded row. It often doesn't: the server stamps the child
+    /// with the lineage segment that spawned it, and that segment is not itself
+    /// a sidebar row, so the link dangles. The lineage report names the session
+    /// the segment now belongs to, which is the row the desktop nests under
+    /// (`visibleBySegmentSid` in `_attachChildSessionsToSidebarRows`).
     private var recoveredChildSessions: [SessionSummary] {
-        let payloadSessionIDs = Set(sessions.compactMap(\.sessionId))
-        return recoveredChildSessionsByParentID.values
-            .joined()
-            .filter { child in
-                guard let childID = child.sessionId else { return false }
-                return !payloadSessionIDs.contains(childID)
+        let payloadByID = Dictionary(
+            sessions.compactMap { session -> (String, SessionSummary)? in
+                guard let sessionID = Self.nonEmpty(session.sessionId) else { return nil }
+                return (sessionID, session)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        var attached: [SessionSummary] = []
+        var seenChildIDs: Set<String> = []
+        // Sorted so a child reported under two parents resolves the same way
+        // on every render rather than following dictionary order.
+        for parentID in recoveredChildSessionsByParentID.keys.sorted() {
+            for child in recoveredChildSessionsByParentID[parentID] ?? [] {
+                guard let childID = Self.nonEmpty(child.sessionId),
+                      seenChildIDs.insert(childID).inserted
+                else {
+                    continue
+                }
+
+                guard let payloadRow = payloadByID[childID] else {
+                    attached.append(child)
+                    continue
+                }
+
+                // The payload already nests this row on its own — don't
+                // second-guess a link that resolves.
+                guard Self.attachedAncestorID(
+                    for: payloadRow,
+                    sessionsByID: payloadByID
+                ) == nil else {
+                    continue
+                }
+
+                attached.append(payloadRow.attachedAsChild(of: parentID))
             }
+        }
+
+        return attached
+    }
+
+    /// Every session row the list reasons about: the payload plus the lineage
+    /// the payload omitted. Nesting, pills and top-level suppression all read
+    /// this, so a recovered child can never be nested by one and missed by
+    /// another.
+    private var sessionsWithRecoveredLineage: [SessionSummary] {
+        sessions + recoveredChildSessions
     }
 
     /// Fills in child rows the session list payload omitted.
@@ -395,6 +458,13 @@ final class SessionListViewModel {
         let payloadChildParentIDs = Set(Self.childSessionsByParentID(in: sessions).keys)
         let orderedParentIDs = Self.sortedSessions(sessions)
             .filter { !$0.isChildSessionRow }
+            // Only rows that can actually render a children pill are worth a
+            // request. Cron executions belong to Tasks and never appear on this
+            // surface, and `default_hidden` background rows only surface under
+            // their own project chip — but a busy server can hold hundreds of
+            // them, and querying them consumed the entire budget before it
+            // reached a single real conversation.
+            .filter { !$0.isCronSession && $0.defaultHidden != true }
             .compactMap { Self.nonEmpty($0.sessionId) }
             .filter { !payloadChildParentIDs.contains($0) }
 
@@ -482,8 +552,10 @@ final class SessionListViewModel {
     }
 
     /// The nearest non-child ancestor `session` nests under, or nil when the
-    /// parent chain leaves the loaded list or degenerates into a cycle — the
-    /// child then stays a top-level row rather than vanishing.
+    /// parent chain leaves the loaded list or degenerates into a cycle. A nil
+    /// result means the row cannot nest here; ``recoveredChildSessions`` then
+    /// re-parents it from the lineage report, and anything still unresolved
+    /// drops out of the list rather than floating at the top level.
     nonisolated private static func attachedAncestorID(
         for session: SessionSummary,
         sessionsByID: [String: SessionSummary]

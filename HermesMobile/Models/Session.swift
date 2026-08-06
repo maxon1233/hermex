@@ -418,6 +418,49 @@ struct SessionSummary: Decodable, Equatable, Hashable, Identifiable {
             matchType: matchType
         )
     }
+
+    /// Mirrors all stored fields while stamping the delegated-child lineage the
+    /// sidebar payload omitted, so the row nests under `parentID` carrying its
+    /// own metadata (message count, workspace, streaming and archived state)
+    /// instead of the sparse lineage-report stand-in.
+    /// Update this when `SessionSummary` gains a new stored property.
+    func attachedAsChild(of parentID: String) -> SessionSummary {
+        SessionSummary(
+            sessionId: sessionId,
+            title: title,
+            workspace: workspace,
+            model: model,
+            modelProvider: modelProvider,
+            messageCount: messageCount,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            lastMessageAt: lastMessageAt,
+            pinned: pinned,
+            archived: archived,
+            projectId: projectId,
+            profile: profile,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            estimatedCost: estimatedCost,
+            activeStreamId: activeStreamId,
+            isStreaming: isStreaming,
+            isCliSession: isCliSession,
+            userMessageCount: userMessageCount,
+            hasPendingUserMessage: hasPendingUserMessage,
+            pendingStartedAt: pendingStartedAt,
+            worktreePath: worktreePath,
+            sourceTag: sourceTag,
+            rawSource: rawSource,
+            sessionSource: sessionSource,
+            sourceLabel: sourceLabel,
+            parentSessionId: parentID,
+            relationshipType: "child_session",
+            readOnly: readOnly,
+            isReadOnly: isReadOnly,
+            defaultHidden: defaultHidden,
+            matchType: matchType
+        )
+    }
 }
 
 extension SessionSummary {
