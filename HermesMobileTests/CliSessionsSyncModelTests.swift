@@ -146,7 +146,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
     // MARK: - Adopt on load
 
     @MainActor
-    func testAdoptServerValueWinsOverLocalAndPersistsPerServer() {
+    func testAdoptServerFalseWinsOverLocalAndPersistsPerServer() {
         defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         let model = makeModel(server: serverA)
         XCTAssertTrue(model.showsCliSessions)
@@ -159,6 +159,29 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
             defaults.object(forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA)) as? Bool,
             false
         )
+    }
+
+    /// Server `true` means the CLI sessions are *available* (desktop shows a
+    /// separate tab; its main sidebar still excludes them), so adoption must
+    /// enable write-back without forcing the rows into mobile's list.
+    @MainActor
+    func testAdoptServerTrueEnablesWriteBackWithoutForcingRowsVisible() {
+        let model = makeModel(server: serverA)
+        XCTAssertFalse(model.showsCliSessions, "CLI imports are hidden by default")
+
+        model.adopt(serverValue: true)
+
+        XCTAssertFalse(model.showsCliSessions)
+        XCTAssertTrue(model.serverSyncsCliSessions)
+        XCTAssertNil(
+            defaults.object(forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA)),
+            "Adopting `true` must not overwrite the local preference"
+        )
+
+        // An explicit local opt-in survives later adoptions of `true`.
+        model.setShowsCliSessions(true)
+        model.adopt(serverValue: true)
+        XCTAssertTrue(model.showsCliSessions)
     }
 
     @MainActor
@@ -191,6 +214,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
 
     @MainActor
     func testToggleWritesTheNewValueToTheServer() async {
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         var writtenValues: [Bool] = []
         let model = makeModel(
             server: serverA,
@@ -208,6 +232,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
 
     @MainActor
     func testFailedWriteRevertsTheToggleAndSurfacesAnError() async {
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         let model = makeModel(
             server: serverA,
             writeToServer: { _ in throw URLError(.notConnectedToInternet) }
@@ -233,6 +258,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
         // The write for `false` fails; the follow-up write for `true` succeeds.
         // The stale failure must neither revert the newer value nor surface an
         // error.
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         let model = makeModel(
             server: serverA,
             writeToServer: { value in
@@ -264,6 +290,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
         // user toggles twice more: no second request may be sent while the
         // first is in flight, and after it completes only the *final* value is
         // written (the intermediate toggle is coalesced away).
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         var writtenValues: [Bool] = []
         var releaseFirstWrite: CheckedContinuation<Void, Never>?
         let model = makeModel(
@@ -324,26 +351,56 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
     }
 
     func testShowsCliSessionsFallsBackToLegacyGlobalValueThenDefault() {
-        // No per-server or legacy value: shown by default, exactly as today.
-        XCTAssertTrue(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
-
-        // A pre-#19 global value seeds servers that have no per-server value yet.
-        defaults.set(false, forKey: SessionRowDisplaySettings.showCliSessionsKey)
+        // No per-server or legacy value: hidden by default — the desktop's
+        // default sidebar keeps CLI-bucket imports out of the main list too.
         XCTAssertFalse(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
 
-        // A per-server value always wins over the legacy seed.
-        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
+        // A pre-#19 global value seeds servers that have no per-server value yet.
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey)
         XCTAssertTrue(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
-        XCTAssertFalse(
+
+        // A per-server value always wins over the legacy seed.
+        defaults.set(false, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
+        XCTAssertFalse(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
+        XCTAssertTrue(
             SessionRowDisplaySettings.showsCliSessions(for: serverB, in: defaults),
             "Another server still reads the legacy seed until it stores its own value"
         )
     }
 
+    // MARK: - Hidden-by-default migration
+
+    func testMigrationClearsForceAdoptedTrueValuesButKeepsFalseAndUserReOptIn() {
+        // Artifacts of the old force-adoption: per-server `true` on both keys,
+        // plus a legacy global `true`.
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey)
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
+        defaults.set(
+            true,
+            forKey: SessionRowDisplaySettings.showClaudeCodeSessionsKey(for: serverA)
+        )
+        // A stored `false` means hidden either way and must survive.
+        defaults.set(false, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverB))
+
+        SessionRowDisplaySettings.migrateCliVisibilityToHiddenDefault(in: defaults)
+
+        XCTAssertFalse(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
+        XCTAssertFalse(
+            SessionRowDisplaySettings.showsClaudeCodeSessions(for: serverA, in: defaults)
+        )
+        XCTAssertFalse(SessionRowDisplaySettings.showsCliSessions(for: serverB, in: defaults))
+        XCTAssertNil(defaults.object(forKey: SessionRowDisplaySettings.showCliSessionsKey))
+
+        // The migration runs once: a later explicit opt-in survives relaunches.
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
+        SessionRowDisplaySettings.migrateCliVisibilityToHiddenDefault(in: defaults)
+        XCTAssertTrue(SessionRowDisplaySettings.showsCliSessions(for: serverA, in: defaults))
+    }
+
     // MARK: - Claude Code child setting
 
     @MainActor
-    func testClaudeCodeSettingAdoptsServerValueAndPersistsPerServer() {
+    func testClaudeCodeSettingAdoptsServerFalseAndPersistsPerServer() {
         defaults.set(
             true,
             forKey: SessionRowDisplaySettings.showClaudeCodeSessionsKey(for: serverA)
@@ -357,31 +414,54 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
         XCTAssertFalse(
             SessionRowDisplaySettings.showsClaudeCodeSessions(for: serverA, in: defaults)
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             SessionRowDisplaySettings.showsClaudeCodeSessions(for: serverB, in: defaults),
-            "A newly seen server must retain the shown-by-default preference"
+            "A newly seen server starts from the hidden-by-default preference"
         )
     }
 
     @MainActor
-    func testClaudeCodeSettingOmissionStaysLocalAndDefaultsShown() async {
+    func testClaudeCodeSettingAdoptsServerTrueWithoutForcingRowsVisible() {
+        let model = makeModel(server: serverA)
+        XCTAssertFalse(model.showsClaudeCodeSessions, "Claude Code imports are hidden by default")
+
+        model.adoptClaudeCode(serverValue: true)
+
+        XCTAssertFalse(model.showsClaudeCodeSessions)
+        XCTAssertTrue(model.serverSyncsClaudeCodeSessions)
+        XCTAssertNil(
+            defaults.object(
+                forKey: SessionRowDisplaySettings.showClaudeCodeSessionsKey(for: serverA)
+            ),
+            "Adopting `true` must not overwrite the local preference"
+        )
+    }
+
+    @MainActor
+    func testClaudeCodeSettingOmissionStaysLocalAndDefaultsHidden() async {
         var writtenValues: [Bool] = []
         let model = makeModel(
             server: serverA,
             writeClaudeCodeToServer: { writtenValues.append($0) }
         )
 
+        XCTAssertFalse(model.showsClaudeCodeSessions)
+
         model.adoptClaudeCode(serverValue: nil)
-        model.setShowsClaudeCodeSessions(false)
+        model.setShowsClaudeCodeSessions(true)
         await model.pendingClaudeCodeWrite?.value
 
-        XCTAssertFalse(model.showsClaudeCodeSessions)
+        XCTAssertTrue(model.showsClaudeCodeSessions)
         XCTAssertFalse(model.serverSyncsClaudeCodeSessions)
-        XCTAssertEqual(writtenValues, [])
+        XCTAssertEqual(writtenValues, [], "Local-only toggles never write to the server")
     }
 
     @MainActor
     func testClaudeCodeSettingWritesAndFailedWriteReverts() async {
+        defaults.set(
+            true,
+            forKey: SessionRowDisplaySettings.showClaudeCodeSessionsKey(for: serverA)
+        )
         var shouldFail = false
         var writtenValues: [Bool] = []
         let model = makeModel(
@@ -411,6 +491,7 @@ final class CliSessionsSyncModelTests: APIClientTestCase {
 
     @MainActor
     func testChangingCliParentDoesNotOverwriteClaudeCodePreference() {
+        defaults.set(true, forKey: SessionRowDisplaySettings.showCliSessionsKey(for: serverA))
         let model = makeModel(server: serverA)
         model.adopt(serverValue: true)
         model.adoptClaudeCode(serverValue: false)
