@@ -3,13 +3,16 @@ import Observation
 
 /// Server-synced "Show CLI sessions" toggle (#19).
 ///
-/// The server's `show_cli_sessions` setting is the cross-device source of
-/// truth: on every Settings load the server value is adopted into the
-/// per-server local cache (server wins on conflict), and flipping the toggle
-/// writes `POST /api/settings {"show_cli_sessions": <bool>}` back. The local
-/// value doubles as an offline cache — servers that never report the key keep
-/// today's purely local behavior (no adoption, no write). On a failed write
-/// the toggle reverts and the error is surfaced.
+/// The server's `show_cli_sessions` maps onto desktop as *availability*: with
+/// it off the desktop hides CLI sessions everywhere, with it on the desktop
+/// offers a separate CLI tab while the main sidebar still shows only the
+/// webui bucket. Mobile mirrors that split: an adopted `false` hides the rows
+/// here too, but an adopted `true` only enables write-back — whether CLI rows
+/// are *mixed into* mobile's single list stays a local display preference
+/// (hidden by default, like the desktop's default tab). Flipping the toggle
+/// writes `POST /api/settings {"show_cli_sessions": <bool>}` back. Servers
+/// that never report the key keep purely local behavior (no adoption, no
+/// write). On a failed write the toggle reverts and the error is surfaced.
 ///
 /// Storage is per-server (`SessionRowDisplaySettings.showCliSessionsKey(for:)`)
 /// so an adopted value on server A can never leak into server B
@@ -57,7 +60,11 @@ final class CliSessionsSyncModel {
 
     /// Adopts the server-reported value on settings load. `nil` (server omitted
     /// the key) leaves the local toggle exactly as it was and disables
-    /// write-back. Adoption never writes back to the server.
+    /// write-back. `false` hides the rows here as it does everywhere on
+    /// desktop. `true` only means the sessions are *available* — desktop's
+    /// main sidebar still excludes the CLI bucket then — so it must never
+    /// force imported rows into mobile's single list; the local preference
+    /// keeps governing that. Adoption never writes back to the server.
     func adopt(serverValue: Bool?) {
         guard let serverValue else {
             serverSyncsCliSessions = false
@@ -66,11 +73,13 @@ final class CliSessionsSyncModel {
 
         serverSyncsCliSessions = true
         syncErrorMessage = nil
-        persist(serverValue)
+        if !serverValue {
+            persist(false)
+        }
     }
 
-    /// Mirrors `adopt(serverValue:)` for the subordinate Claude Code setting.
-    /// Older servers omit the key, retaining the shown-by-default local value.
+    /// Mirrors `adopt(serverValue:)` for the subordinate Claude Code setting,
+    /// including the availability-vs-mixing split: only `false` is persisted.
     func adoptClaudeCode(serverValue: Bool?) {
         guard let serverValue else {
             serverSyncsClaudeCodeSessions = false
@@ -79,7 +88,9 @@ final class CliSessionsSyncModel {
 
         serverSyncsClaudeCodeSessions = true
         claudeCodeSyncErrorMessage = nil
-        persistClaudeCode(serverValue)
+        if !serverValue {
+            persistClaudeCode(false)
+        }
     }
 
     /// Applies a user toggle: optimistic local update, then the server write.

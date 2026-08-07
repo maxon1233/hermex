@@ -510,10 +510,14 @@ private enum SessionRelativeDateFormatter {
 enum SessionRowDisplaySettings {
     static let showMessageCountKey = "sessionRow.showMessageCount"
     static let showWorkspaceKey = "sessionRow.showWorkspace"
-    // CLI sessions default to shown. Delegated subagents default to shown too:
-    // they nest under their parent row behind an "N children" pill (desktop
-    // sidebar parity), so visible-by-default no longer floods the top level.
-    // Cron executions are always routed to Tasks instead of Sessions.
+    // CLI-bucket imports (hermes CLI, Claude Code) default to hidden: the
+    // desktop's default sidebar renders only the webui bucket and keeps CLI
+    // rows behind a separate tab, so mixing them into mobile's single list by
+    // default showed read-only rows desktop never surfaces. The toggles below
+    // opt them in. Delegated subagents default to shown: they nest under their
+    // parent row behind an "N children" pill (desktop sidebar parity), so
+    // visible-by-default no longer floods the top level. Cron executions are
+    // always routed to Tasks instead of Sessions.
     static let showSubagentSessionsKey = "sessionRow.showSubagentSessions"
     static let defaultShowsSubagentSessions = true
     // Legacy global CLI-sessions key. Since #19 the CLI toggle is stored
@@ -534,8 +538,9 @@ enum SessionRowDisplaySettings {
     }
 
     /// Effective CLI-sessions visibility for `server`: the per-server value if
-    /// one was ever stored, else the pre-#19 global value, else shown-by-default
-    /// like every other session-row toggle.
+    /// one was ever stored, else the pre-#19 global value, else hidden — the
+    /// desktop's default sidebar never mixes CLI-bucket rows into the main
+    /// list, so neither does mobile until the user opts in.
     static func showsCliSessions(for server: URL, in defaults: UserDefaults = .standard) -> Bool {
         if let perServer = defaults.object(forKey: showCliSessionsKey(for: server)) as? Bool {
             return perServer
@@ -545,16 +550,16 @@ enum SessionRowDisplaySettings {
             return legacy
         }
 
-        return true
+        return false
     }
 
-    /// Claude Code visibility is new and per-server, with no legacy global
-    /// value. Omission defaults to shown for compatibility with older servers.
+    /// Claude Code visibility is per-server with no legacy global value.
+    /// Omission defaults to hidden, matching the CLI-bucket default above.
     static func showsClaudeCodeSessions(
         for server: URL,
         in defaults: UserDefaults = .standard
     ) -> Bool {
-        defaults.object(forKey: showClaudeCodeSessionsKey(for: server)) as? Bool ?? true
+        defaults.object(forKey: showClaudeCodeSessionsKey(for: server)) as? Bool ?? false
     }
 
     static func showsSubagentSessions(in defaults: UserDefaults = .standard) -> Bool {
@@ -563,6 +568,31 @@ enum SessionRowDisplaySettings {
         }
 
         return stored
+    }
+
+    /// One-time reset to the hidden-by-default CLI visibility above.
+    ///
+    /// Earlier builds force-persisted the server's `show_cli_sessions=true`
+    /// into the per-server keys on every Settings load, so existing installs
+    /// carry `true` values the user never chose — indistinguishable from a
+    /// real opt-in. The migration clears stored `true` values once (`false`,
+    /// whether user- or server-chosen, still means hidden and is kept); anyone
+    /// who genuinely wants imports mixed in re-enables the toggle once.
+    static let cliVisibilityMigrationKey = "sessionRow.cliVisibilityHiddenDefaultMigration"
+
+    static func migrateCliVisibilityToHiddenDefault(in defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: cliVisibilityMigrationKey) else { return }
+
+        for (key, value) in defaults.dictionaryRepresentation() {
+            let isCliVisibilityKey = key == showCliSessionsKey
+                || key.hasPrefix("\(showCliSessionsKey)|")
+                || key.hasPrefix("\(showClaudeCodeSessionsKey)|")
+            if isCliVisibilityKey, value as? Bool == true {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        defaults.set(true, forKey: cliVisibilityMigrationKey)
     }
 }
 

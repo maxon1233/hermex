@@ -19,9 +19,11 @@ struct SettingsView: View {
         self.authManager = authManager
         self.server = server
         self.initialScrollTarget = initialScrollTarget
-        // The CLI-sessions toggle is server-synced (#19): loads adopt the
-        // server's `show_cli_sessions`, toggles POST it back, failures revert.
-        // Stored per-server so one server's value never leaks into another.
+        // The CLI-sessions toggle is server-synced (#19): loads adopt a server
+        // `false` (hidden everywhere, as on desktop) while `true` only enables
+        // write-back — mixing rows into the list stays a local preference.
+        // Toggles POST changes back, failures revert. Stored per-server so one
+        // server's value never leaks into another.
         _cliSessionsSync = State(initialValue: CliSessionsSyncModel(server: server) { value in
             let client = APIClient(baseURL: server)
             _ = try await client.updateSettings(showCliSessions: value)

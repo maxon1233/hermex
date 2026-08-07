@@ -2743,7 +2743,7 @@ final class SessionListMutationTests: XCTestCase {
     }
 
     @MainActor
-    func testVisibleSessionsNestAttachedChildrenAndKeepDanglingOnesTopLevel() async throws {
+    func testVisibleSessionsNestAttachedChildrenAndDropDanglingOnes() async throws {
         let viewModel = try makeViewModel { request in
             XCTAssertEqual(request.url?.path, "/api/sessions")
             return apiTestJSONResponse("""
@@ -2762,11 +2762,13 @@ final class SessionListMutationTests: XCTestCase {
 
         await viewModel.load()
 
-        // Attached children leave the top level; a child whose parent is not
-        // in the loaded list stays visible as its own row; forks stay put.
+        // Attached children leave the top level, and so does a child whose
+        // parent is missing from the response — desktop drops every stamped
+        // child row before nesting, so an orphan disappears with its parent
+        // rather than lingering as a row nothing can act on. Forks stay put.
         XCTAssertEqual(
             viewModel.visibleSessions(searchText: "", selectedProjectID: nil).compactMap(\.sessionId),
-            ["parent", "dangling-child", "fork", "other-p2"]
+            ["parent", "fork", "other-p2"]
         )
         XCTAssertEqual(
             viewModel.childSessionsByParentID()["parent"]?.compactMap(\.sessionId),
@@ -2910,6 +2912,131 @@ final class SessionListMutationTests: XCTestCase {
             ["parent", "solo"]
         )
         XCTAssertTrue(lineageRequestIDs.contains("parent"))
+    }
+
+    /// The live shape this server emits: delegated children DO arrive in
+    /// `/api/sessions`, stamped with the lineage segment that spawned them
+    /// rather than with a session the sidebar renders. That link dangles, so
+    /// the rows never nested and piled up as loose "Subagent Session" entries
+    /// the server refuses to archive. The lineage report names the session the
+    /// segment belongs to, and the payload row is re-parented onto it.
+    @MainActor
+    func testDanglingPayloadChildrenReParentOntoTheLineageReportsAncestor() async throws {
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "parent", "title": "Website Launch Audit", "message_count": 130, "last_message_at": 100},
+                    {"session_id": "segment-child", "title": "Subagent Session", "source_tag": "subagent", "read_only": true, "workspace": "home", "message_count": 72, "parent_session_id": "old-segment", "relationship_type": "child_session", "last_message_at": 95},
+                    {"session_id": "unlinked-child", "title": "Subagent Session", "source_tag": "subagent", "workspace": "home", "message_count": 34, "last_message_at": 94},
+                    {"session_id": "solo", "title": "Unrelated", "last_message_at": 90}
+                  ]
+                }
+                """, for: request)
+            case "/api/session/lineage/report":
+                let sessionID = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                    .queryItems?.first { $0.name == "session_id" }?.value ?? ""
+
+                guard sessionID == "parent" else {
+                    return apiTestJSONResponse("""
+                    {"found": true, "session_id": "\(sessionID)", "children": []}
+                    """, for: request)
+                }
+
+                return apiTestJSONResponse("""
+                {
+                  "found": true,
+                  "session_id": "parent",
+                  "children": [
+                    {"session_id": "segment-child", "role": "child_session", "title": "Subagent Session", "source": "subagent", "started_at": 10, "updated_at": 20},
+                    {"session_id": "unlinked-child", "role": "child_session", "title": "Subagent Session", "source": "subagent", "started_at": 5, "updated_at": 15}
+                  ]
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+        // A stamped child with an unresolvable parent leaves the top level even
+        // before recovery — desktop drops every child row from the sidebar.
+        // The unlinked one is not a child row yet, so it still shows.
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", projectFilter: .all).compactMap(\.sessionId),
+            ["parent", "unlinked-child", "solo"]
+        )
+
+        await viewModel.recoverMissingChildSessions()
+
+        XCTAssertEqual(
+            viewModel.visibleSessions(searchText: "", projectFilter: .all).compactMap(\.sessionId),
+            ["parent", "solo"],
+            "Re-parented children must stop rendering as their own top-level rows"
+        )
+
+        // Nested using the payload's own rows, so sidebar metadata survives the
+        // re-parenting instead of collapsing to the sparse lineage stand-in.
+        let children = try XCTUnwrap(viewModel.childSessionsByParentID()["parent"])
+        XCTAssertEqual(children.compactMap(\.sessionId), ["segment-child", "unlinked-child"])
+        XCTAssertEqual(children.compactMap(\.messageCount), [72, 34])
+        XCTAssertTrue(children.allSatisfy { $0.workspace == "home" })
+        XCTAssertTrue(children.allSatisfy(\.isChildSessionRow))
+    }
+
+    /// A payload child whose own parent is present keeps that parent: the
+    /// lineage report must not re-home a row that already nests correctly.
+    @MainActor
+    func testPayloadLineageWinsOverTheLineageReportWhenItResolves() async throws {
+        let viewModel = try makeViewModel { request in
+            switch request.url?.path {
+            case "/api/sessions":
+                return apiTestJSONResponse("""
+                {
+                  "sessions": [
+                    {"session_id": "real-parent", "title": "Real Parent", "last_message_at": 100},
+                    {"session_id": "other", "title": "Other Session", "last_message_at": 99},
+                    {"session_id": "child", "title": "Subagent Session", "source_tag": "subagent", "parent_session_id": "real-parent", "relationship_type": "child_session", "last_message_at": 95}
+                  ]
+                }
+                """, for: request)
+            case "/api/session/lineage/report":
+                let sessionID = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                    .queryItems?.first { $0.name == "session_id" }?.value ?? ""
+
+                // A stale/overlapping report claiming the child for "other".
+                guard sessionID == "other" else {
+                    return apiTestJSONResponse("""
+                    {"found": true, "session_id": "\(sessionID)", "children": []}
+                    """, for: request)
+                }
+
+                return apiTestJSONResponse("""
+                {
+                  "found": true,
+                  "session_id": "other",
+                  "children": [
+                    {"session_id": "child", "role": "child_session", "title": "Subagent Session", "source": "subagent", "started_at": 10, "updated_at": 20}
+                  ]
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        await viewModel.load()
+        await viewModel.recoverMissingChildSessions()
+
+        XCTAssertEqual(
+            viewModel.childSessionsByParentID()["real-parent"]?.compactMap(\.sessionId),
+            ["child"]
+        )
+        XCTAssertNil(viewModel.childSessionsByParentID()["other"])
     }
 
     @MainActor

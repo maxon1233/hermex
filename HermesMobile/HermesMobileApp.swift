@@ -45,6 +45,13 @@ struct HermesMobileApp: App {
     @State private var authManager = AuthManager()
     @AppStorage(AppTheme.storageKey) private var appThemeRawValue = AppTheme.system.rawValue
 
+    init() {
+        // Clears `show_cli_sessions=true` values older builds force-adopted
+        // from the server, so existing installs land on the hidden-by-default
+        // CLI visibility. Runs before any view reads the toggles.
+        SessionRowDisplaySettings.migrateCliVisibilityToHiddenDefault()
+    }
+
     var body: some Scene {
         WindowGroup {
             #if DEBUG
